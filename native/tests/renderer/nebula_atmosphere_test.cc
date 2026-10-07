@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <renderer/nebula_atmosphere.h>
 #include <cmath>
+#include <numbers>
 
 using namespace renderer::atmosphere;
 
@@ -57,7 +58,7 @@ TEST(NebulaAtmosphere, HgIsNormalised) {
     const int n = 20000;
     for (int i = 0; i < n; ++i) {
         const float c = -1.0f + 2.0f * (i + 0.5f) / n;
-        sum += hg(0.6f, c) * (2.0f / n) * 2.0 * M_PI;
+        sum += hg(0.6f, c) * (2.0f / n) * 2.0 * std::numbers::pi;
     }
     EXPECT_NEAR(sum, 1.0, 1e-3);
 }
