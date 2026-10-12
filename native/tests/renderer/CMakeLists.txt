@@ -4,6 +4,7 @@ add_executable(renderer_tests
     shader_test.cc
     pipeline_test.cc
     frame_test.cc
+    frame_timer_test.cc
     geosphere_draw_test.cc
     atmosphere_pass_test.cc
     atmosphere_surface_test.cc
@@ -37,6 +38,12 @@ add_executable(renderer_tests
     impostor_blend_gl_test.cc
     nebula_atmosphere_test.cc
     atmosphere_math_test.cc
+    planet_detail_noise_test.cc
+    planet_clipmap_schedule_test.cc
+    planet_clipmap_atlas_test.cc
+    planet_surface_draw_test.cc
+    planet_detail_pass_test.cc
+    planet_detail_bench_test.cc
     system_nebula_pass_test.cc
     motion_blur_shutter_test.cc
     letterbox_pass_test.cc
@@ -59,6 +66,12 @@ add_executable(renderer_tests
     skin_shield_test.cc
     lens_flare_pass_test.cc
     bridge_pass_test.cc
+    bridge_lighting_test.cc
+    bridge_pbr_test.cc
+    bridge_ao_test.cc
+    bridge_highlight_test.cc
+    bridge_pbr_frame_test.cc
+    bridge_probe_test.cc
     skinned_bridge_test.cc
     head_weld_seam_test.cc
     officer_jaw_test.cc

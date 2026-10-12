@@ -35,6 +35,7 @@
 #include <renderer/backdrop_pass.h>
 #include <renderer/sun_pass.h>
 #include <renderer/atmosphere_pass.h>
+#include <renderer/planet_detail_pass.h>
 #include <renderer/dust_pass.h>
 #include <renderer/minor_field.h>
 #include <renderer/minor_pass.h>
@@ -71,6 +72,7 @@
 #include <renderer/starmap_pass.h>
 #include <renderer/letterbox_pass.h>
 #include <renderer/bridge_pass.h>
+#include <renderer/bridge_quality.h>
 #include <renderer/viewscreen_static_pass.h>
 #include <renderer/hdr_target.h>
 #include <renderer/hdr_msaa_target.h>
@@ -114,7 +116,9 @@
 #include <array>
 #include <cstdio>
 #include <unordered_set>
+#include "bridge_highlight.h"
 #include "developer_mode.h"
+#include "model_identity_maps.h"
 
 #ifdef DAUNTLESS_ENABLE_CEF
 #include "ui_cef/cef_lifecycle.h"
@@ -252,11 +256,46 @@ renderer::Lighting g_lighting;
 // ambient is authored on its own SetClass and is typically much
 // brighter than the space scene's.
 renderer::Lighting g_bridge_lighting;
-// Ambient multiplier for the bridge INTERIOR only (red-alert dim). Applied
+// Ambient multiplier for the bridge INTERIOR only: the alert-level scale
+// (engine/bridge_lighting.py -- green x1.5, yellow/red x1.0). Applied
 // where the main bridge pass renders, never to the comm-set RTT feed — the
 // viewscreen shows another ship's room, whose lighting must not follow our
 // alert level.
 float g_bridge_ambient_scale = 1.0f;
+// Player alert level (0 green, 1 yellow, 2 red) choosing the bridge's
+// emissive sibling-map variant (BridgePass::set_alert_level). Per-frame
+// state like g_bridge_ambient_scale: pushed every frame by host_loop, reset
+// to green by reset_frame_state() (init and shutdown).
+int g_bridge_alert_level = 0;
+// Bridge AO quality preset (Low/Medium/High), set via set_bridge_quality().
+// Applied to g_bridge_pass's AO settings both where it is constructed and on
+// every set_bridge_quality() call, so a quality change takes effect even
+// mid-mission without waiting for the next init().
+renderer::BridgeQuality g_bridge_quality = renderer::kDefaultBridgeQuality;
+// Developer Options -> Lighting tab "Bridge Debug View" (see
+// renderer::BridgeDebugView). set_bridge_debug_view is a no-op without
+// --developer, so this stays 0 (Off) in production regardless of what
+// Python sends.
+int g_bridge_debug_view = 0;
+// Developer-only bridge editor selection tint (set_bridge_highlight). Held
+// here, not only on the pass, so it survives the pass being (re)created and
+// is readable headless (bridge_highlight()). model 0 = none.
+dauntless::BridgeHighlight g_bridge_highlight;
+// Bridge reflection probes (set_bridge_probe_*; production, NOT developer-
+// gated). Held here as well as on the pass, so values set before init() --
+// or across a pass re-creation -- are applied when the pass is constructed
+// (the g_bridge_highlight pattern). `capture_pending` is a request made while
+// no pass existed; init() hands it on and clears it. reset_frame_state() does
+// NOT touch this stash -- it runs at the start of init(), and clearing here
+// would drop exactly the values init() exists to apply.
+struct BridgeProbeSettings {
+    glm::vec3 origin{0.0f};
+    float green = 1.0f;
+    float yellow_red = 1.0f;
+    float mix = 0.0f;
+    bool capture_pending = false;
+};
+BridgeProbeSettings g_bridge_probe;
 std::vector<renderer::Backdrop> g_backdrops;
 bool g_sky_dirty = true;            // cubemap needs (re)baking
 bool g_sky_last_procedural = false; // procedural-toggle state at the last frame
@@ -267,6 +306,9 @@ float g_dust_profile = 0.0f;   // radial-profile `dust` column at the camera, 0-
 std::unique_ptr<renderer::SunPass> g_sun_pass;
 // Planet atmosphere shells (docs/superpowers/specs/2026-10-07-planet-atmosphere-design.md §5).
 std::unique_ptr<renderer::AtmospherePass> g_atmosphere_pass;
+// Planet surface detail (spec 2026-10-08 §5.5): one target planet's clipmap,
+// baked once per frame from g_camera; sampled by every space render.
+std::unique_ptr<renderer::planet_detail::PlanetDetailPass> g_planet_detail;
 std::unique_ptr<renderer::DustPass> g_dust_pass;
 // Minor rocks (docs/superpowers/specs/2026-10-01-minor-rocks-design.md). The
 // field is pure CPU state stepped in frame()'s xform_sync block; the pass owns
@@ -657,7 +699,9 @@ scenegraph::ModelHandle load_model_impl(
     const py::object& texture_replacements,
     const py::object& decals,
     float scale,
-    bool geosphere) {
+    bool geosphere,
+    bool interior,
+    const std::vector<std::string>& sibling_overlay_dirs) {
     if (!g_window) {
         throw std::runtime_error("load_model: init must be called first (asset upload needs a GL context)");
     }
@@ -740,6 +784,24 @@ scenegraph::ModelHandle load_model_impl(
         rep_key += "|geosphere";
     }
 
+    // Interior load flag (spec 2026-10-08-bridge-lighting-baseline-design.md
+    // §3): folded into rep_key like geosphere, so a plain and an interior
+    // load of the same NIF are distinct cached handles.
+    if (interior) {
+        rep_key += "|interior";
+    }
+
+    // Sibling-overlay search list for the bridge PBR roughness/metalness/
+    // normal maps (spec 2026-10-09-bridge-pbr §9.2/§9.3): folded into rep_key
+    // like interior, so two loads differing only in this list are distinct
+    // cached entries.
+    std::vector<std::filesystem::path> overlay_dirs;
+    overlay_dirs.reserve(sibling_overlay_dirs.size());
+    for (const auto& d : sibling_overlay_dirs) {
+        overlay_dirs.emplace_back(d);
+        rep_key += "|overlay:" + d;
+    }
+
     // Dedupe by (nif_path, replacements, decals): callers that load the same
     // NIF + registry + decal set for multiple ships get the same handle and
     // the underlying assets::AssetCache::load isn't even called a second
@@ -767,7 +829,7 @@ scenegraph::ModelHandle load_model_impl(
         };
         g_cache = std::make_unique<assets::AssetCache>(std::move(cfg));
     }
-    auto handle = g_cache->load(nif_path, search_paths, replacements, decal_requests, scale, geosphere);
+    auto handle = g_cache->load(nif_path, search_paths, replacements, decal_requests, scale, geosphere, interior, overlay_dirs);
     LoadedModel lm;
     lm.nif_path         = std::move(canonical);
     lm.handle           = std::move(handle);
@@ -819,6 +881,8 @@ void reset_frame_state() {
     g_lighting = renderer::Lighting{};
     g_bridge_lighting = renderer::Lighting{};
     g_bridge_ambient_scale = 1.0f;
+    g_bridge_alert_level = 0;
+    g_bridge_quality = renderer::kDefaultBridgeQuality;
     g_bridge_pass_enabled = false;
     g_viewscreen_enabled = false;
     g_backdrops.clear();
@@ -857,6 +921,16 @@ void reset_frame_state() {
 
     g_target_reticle = renderer::TargetReticle{};
     g_starmap_scene = renderer::StarMapScene{};
+
+    // Bridge editor tint: its model handle dies with this session's models.
+    g_bridge_highlight = dauntless::BridgeHighlight{};
+    // Bridge PBR state (material overrides, spots, probe captures) lives in
+    // g_bridge_pass, which is null at BOTH call sites: shutdown() destroys it
+    // before calling this, and init() calls this before building a fresh one.
+    // So nothing here resets it -- a new session gets a new BridgePass, and
+    // a mid-session bridge swap is BridgeRuntime.attach()'s job (it clears
+    // and re-pushes). The g_bridge_probe stash is deliberately kept -- see
+    // its declaration.
 
     // Motion blur reprojects against the previous exterior frame's viewproj.
     // Left set, frame 1 of a new session smears against the OLD camera.
@@ -969,6 +1043,7 @@ void init(int width, int height, const std::string& title) {
     g_backdrop_pass = std::make_unique<renderer::BackdropPass>();
     g_sun_pass = std::make_unique<renderer::SunPass>();
     g_atmosphere_pass = std::make_unique<renderer::AtmospherePass>();
+    g_planet_detail = std::make_unique<renderer::planet_detail::PlanetDetailPass>();
     g_dust_pass = std::make_unique<renderer::DustPass>();
     g_minor_pass = std::make_unique<renderer::MinorPass>();
     g_far_pass = std::make_unique<renderer::FarPass>();
@@ -999,6 +1074,17 @@ void init(int width, int height, const std::string& title) {
     g_target_reticle_pass = std::make_unique<renderer::TargetReticlePass>();
     g_starmap_pass        = std::make_unique<renderer::StarMapPass>();
     g_bridge_pass         = std::make_unique<renderer::BridgePass>();
+    g_bridge_pass->set_ao_settings(renderer::ao_settings_for(g_bridge_quality));
+    g_bridge_pass->set_highlight(g_bridge_highlight.model,
+                                 g_bridge_highlight.selected,
+                                 g_bridge_highlight.hover);
+    g_bridge_pass->set_alert_ambient_scale(g_bridge_ambient_scale);
+    g_bridge_pass->set_alert_level(g_bridge_alert_level);
+    g_bridge_pass->set_probe_origin(g_bridge_probe.origin);
+    g_bridge_pass->set_probe_scales(g_bridge_probe.green, g_bridge_probe.yellow_red);
+    g_bridge_pass->set_probe_mix(g_bridge_probe.mix);
+    if (g_bridge_probe.capture_pending) g_bridge_pass->request_probe_capture();
+    g_bridge_probe.capture_pending = false;
     g_viewscreen_static_pass = std::make_unique<renderer::ViewscreenStaticPass>();
     g_hdr_target      = std::make_unique<renderer::HdrTarget>();
     g_msaa_target     = std::make_unique<renderer::HdrMsaaTarget>();
@@ -1052,6 +1138,7 @@ void shutdown() {
                               // GL context is still alive.
     g_sun_pass.reset();
     g_atmosphere_pass.reset();   // releases the shell mesh (GL alive)
+    g_planet_detail.reset();     // releases the clipmap atlas (GL alive)
     g_dust_pass.reset();
     g_minor_pass.reset();     // releases VAOs + instance buffer (GL alive)
     g_far_pass.reset();       // releases atlases + VAOs + buffers (GL alive)
@@ -1428,7 +1515,8 @@ void frame() {
             g_submitter->submit_opaque_in_pass(
                 g_world, cam, *g_pipeline, lookup, g_lighting,
                 scenegraph::Pass::Space, g_decal_game_time, g_carve_cache.get(),
-                ambient_scale, dyn_lights, g_instance_field_cache.get(), &g_suns);
+                ambient_scale, dyn_lights, g_instance_field_cache.get(), &g_suns,
+                g_planet_detail.get());
         }
         // Minor rocks. The step culled against g_camera; this target may be
         // the bridge viewscreen RTT (its own camera, kViewscreenRttH tall) --
@@ -1794,6 +1882,16 @@ void frame() {
         renderer::set_active_shadow({}, 0, false);
     }
 
+    // ── Planet surface detail (spec 2026-10-08 §5.5) ───────────────────────
+    // Top-level (GPU-timed), main camera only: pick the target planet and bake
+    // this frame's budgeted strips BEFORE any space render samples them. Every
+    // space render (main view, viewscreen RTT) samples the same clipmap; none
+    // of them bakes. Skipped when no space scene is drawn at all.
+    if (g_planet_detail && !viewer_mode && (!bridge_active || viewscreen_on)) {
+        DAUNTLESS_FRAME_SCOPE("planet_detail");
+        g_planet_detail->update(g_world, g_camera, fh, lookup);
+    }
+
     // ── Viewscreen render-to-texture (bridge view, screen on) ──────────────
     // The forward space view (g_camera is already forward-from-ship in bridge
     // mode — see host_loop._compute_camera) renders into an offscreen HDR
@@ -1966,13 +2064,13 @@ void frame() {
         // surrounding interior must not flash); the main resolve-pass flash is
         // suppressed below when bridge_active. 0 when not warping.
         g_bridge_pass->set_viewscreen_flash(dauntless_warp_vfx::flash_intensity());
-        // Red-alert dim applies to the interior render only; the comm-set
-        // RTT above uses the unscaled g_bridge_lighting so the viewscreen
+        // The alert-level ambient scale applies to the interior render only;
+        // the comm-set RTT above uses the unscaled g_bridge_lighting so the viewscreen
         // feed's brightness stays constant across alert levels.
-        renderer::Lighting interior = g_bridge_lighting;
-        interior.ambient *= g_bridge_ambient_scale;
+        // UNSCALED: the pass applies the alert scale to the main view itself
+        // (set_alert_ambient_scale), so its probe captures stay unscaled.
         g_bridge_pass->render(g_world, g_bridge_camera, *g_pipeline,
-                              lookup, interior);
+                              lookup, g_bridge_lighting);
     }
 
     // ── Non-finite probe (developer diagnostic) ────────────────────────────
@@ -2377,6 +2475,19 @@ std::string nif_shapes_basename(const std::string& path) {
     return pos == std::string::npos ? path : path.substr(pos + 1);
 }
 
+/// Block-array index of the NiNode whose child_links resolves to `idx`, or
+/// npos if `idx` is unparented. Mirrors mesh_fix.cc's local parent_of (not
+/// exported); nif_shapes needs its own copy for the ancestor texture walk.
+std::size_t nif_shapes_parent_of(const nif::File& file, std::size_t idx) {
+    for (std::size_t i = 0; i < file.blocks.size(); ++i) {
+        const auto* node = std::get_if<nif::NiNode>(&file.blocks[i]);
+        if (!node) continue;
+        for (std::uint32_t link : node->child_links)
+            if (nif_shapes_index_of(file, link) == idx) return i;
+    }
+    return std::string::npos;
+}
+
 /// Append the basename of the NiImage `img_link` resolves to, if any, to
 /// `out` -- only for external (on-disk) images; embedded images have no
 /// filename to report.
@@ -2389,13 +2500,28 @@ void nif_shapes_collect_image(const nif::File& file, std::uint32_t img_link,
     out->push_back(nif_shapes_basename(img->file_name));
 }
 
+
+/// The NiImage link `tp` draws as its static Base: its own image_link, or --
+/// when that is 0 and its controller is a NiFlipController (BC's stock
+/// EBridge authoring, and the mesh-fix flipbook op) -- the controller's
+/// source 0, mirroring model_build.cc's flip_image_override_for_prop.
+std::uint32_t nif_shapes_property_image(const nif::File& file,
+                                        const nif::NiTextureProperty& tp) {
+    if (tp.image_link != 0 || tp.obj.controller_link == 0) return tp.image_link;
+    std::size_t idx = nif_shapes_index_of(file, tp.obj.controller_link);
+    if (idx == std::string::npos || idx >= file.blocks.size()) return 0;
+    const auto* ctrl = std::get_if<nif::NiFlipController>(&file.blocks[idx]);
+    return ctrl && !ctrl->image_links.empty() ? ctrl->image_links[0] : 0;
+}
+
 }  // namespace
 
 // Read-only geometry dump for the mesh-fix generator (tools/gen_mesh_fixes.py):
 // one dict per NiTriShape, in block order, with world-space vertices/normals,
 // UV set 0, triangles, texture basenames and the hidden flag. Parse-only, no
 // GL context, and applies no mesh fix -- callers see the raw stock geometry.
-py::object nif_shapes_impl(const std::string& nif_abs_path) {
+py::object nif_shapes_impl(const std::string& nif_abs_path,
+                           const std::optional<std::string>& fix_json) {
     std::filesystem::path path = nif_abs_path;
     if (!std::filesystem::exists(path)) return py::none();
     nif::File f;
@@ -2403,6 +2529,15 @@ py::object nif_shapes_impl(const std::string& nif_abs_path) {
         f = nif::load(path);
     } catch (const std::exception&) {
         return py::none();
+    }
+    if (fix_json) {
+        // The loader's own path (AssetCache::load), in memory: lets the
+        // shape-diff tool verify a fix before it is written.
+        std::string err;
+        auto fix = assets::parse_mesh_fix(*fix_json, &err);
+        if (!fix) throw std::runtime_error("mesh fix parse failed: " + err);
+        err = assets::apply_mesh_fix(f, *fix);
+        if (!err.empty()) throw std::runtime_error("mesh fix refused: " + err);
     }
 
     py::list out;
@@ -2420,11 +2555,41 @@ py::object nif_shapes_impl(const std::string& nif_abs_path) {
             if (idx == std::string::npos || idx >= f.blocks.size()) continue;
             const auto& b = f.blocks[idx];
             if (const auto* tp = std::get_if<nif::NiTextureProperty>(&b)) {
-                nif_shapes_collect_image(f, tp->image_link, &textures);
+                nif_shapes_collect_image(f, nif_shapes_property_image(f, *tp), &textures);
             } else if (const auto* mtp = std::get_if<nif::NiMultiTextureProperty>(&b)) {
                 for (const auto& elem : mtp->elements) {
                     if (elem.has_image) nif_shapes_collect_image(f, elem.image_link, &textures);
                 }
+            }
+        }
+        // DBridge's NiTextureProperty sits on an ancestor NiNode, inherited
+        // rather than owned by the shape (final-review F1). Mirror the
+        // renderer's own ancestor walk (model_build.cc:gather_material_inputs):
+        // walk up, nearest ancestor with any texture wins. Never touches
+        // `textures` when the shape already has its own (gen_mesh_fixes.py's
+        // "ID" lookup and its drift test depend on that).
+        if (textures.empty()) {
+            std::size_t cur = i;
+            while (true) {
+                const std::size_t parent_idx = nif_shapes_parent_of(f, cur);
+                if (parent_idx == std::string::npos || parent_idx >= f.blocks.size()) break;
+                const auto* parent_node = std::get_if<nif::NiNode>(&f.blocks[parent_idx]);
+                if (!parent_node) break;
+                std::vector<std::string> ancestor_textures;
+                for (std::uint32_t link : parent_node->av.property_links) {
+                    std::size_t idx = nif_shapes_index_of(f, link);
+                    if (idx == std::string::npos || idx >= f.blocks.size()) continue;
+                    const auto& b = f.blocks[idx];
+                    if (const auto* tp = std::get_if<nif::NiTextureProperty>(&b)) {
+                        nif_shapes_collect_image(f, nif_shapes_property_image(f, *tp), &ancestor_textures);
+                    } else if (const auto* mtp = std::get_if<nif::NiMultiTextureProperty>(&b)) {
+                        for (const auto& elem : mtp->elements) {
+                            if (elem.has_image) nif_shapes_collect_image(f, elem.image_link, &ancestor_textures);
+                        }
+                    }
+                }
+                if (!ancestor_textures.empty()) { textures = std::move(ancestor_textures); break; }
+                cur = parent_idx;
             }
         }
         d["textures"] = textures;
@@ -2434,7 +2599,26 @@ py::object nif_shapes_impl(const std::string& nif_abs_path) {
         if (data_idx != std::string::npos && data_idx < f.blocks.size())
             data = std::get_if<nif::NiTriShapeData>(&f.blocks[data_idx]);
 
-        py::list vertices, normals, uvs, triangles;
+        // Parent NiNode name (label only; identity is the block index).
+        std::string parent_name;
+        for (std::size_t p = 0; p < f.blocks.size() && parent_name.empty(); ++p) {
+            const auto* node = std::get_if<nif::NiNode>(&f.blocks[p]);
+            if (!node) continue;
+            for (std::uint32_t link : node->child_links)
+                if (nif_shapes_index_of(f, link) == i) { parent_name = node->av.obj.name; break; }
+        }
+        d["parent"] = parent_name;
+        d["data_block"] = (data_idx != std::string::npos && data_idx < f.blocks.size())
+                              ? static_cast<int>(data_idx) : -1;
+        {
+            const glm::mat4 w = assets::nif_block_world(f, i);
+            py::list wl;
+            for (int c = 0; c < 4; ++c)
+                for (int r = 0; r < 4; ++r) wl.append(w[c][r]);
+            d["world"] = wl;
+        }
+
+        py::list vertices, normals, uvs, triangles, colors, uvs1;
         if (data) {
             const glm::mat4 world = assets::nif_block_world(f, i);
             const glm::mat3 normal_mat = glm::mat3(world);
@@ -2454,11 +2638,20 @@ py::object nif_shapes_impl(const std::string& nif_abs_path) {
             for (const auto& t : data->triangles) {
                 triangles.append(py::make_tuple(t[0], t[1], t[2]));
             }
+            if (data->has_vertex_colors) {
+                for (const auto& c : data->vertex_colors)
+                    colors.append(py::make_tuple(c.r, c.g, c.b, c.a));
+            }
+            if (data->uv_sets.size() >= 2) {
+                for (const auto& uv : data->uv_sets[1]) uvs1.append(py::make_tuple(uv.u, uv.v));
+            }
         }
         d["vertices"] = vertices;
         d["normals"] = normals;
         d["uvs"] = uvs;
         d["triangles"] = triangles;
+        d["colors"] = colors;
+        d["uvs1"] = uvs1;
         d["hidden"] = (shape->av.flags & 0x0001u) != 0;
 
         out.append(d);
@@ -2791,6 +2984,59 @@ py::dict stats_dict(const mr::Stats& s) {
     return d;
 }
 
+// ── Planet surface-detail type table: Python <-> TypeParams (spec 2026-10-08
+// §7 dev tuning). get/set each hand-list the same 16 field names side by
+// side, in the same order -- NOT one genuinely shared table, so nothing
+// here stops them drifting apart on their own; what actually guards that is
+// tests/unit/test_planet_surface_type_params_binding.py's
+// test_get_set_round_trip_for_every_type (fix round 1, M1).
+// `ridged` is included (the binding is a generic struct accessor) even
+// though the "surface" dial group never dials it.
+py::dict type_params_to_dict(const renderer::planet_detail::TypeParams& p) {
+    py::dict d;
+    d["base_wavelength_gu"] = p.base_wavelength_gu;
+    d["max_octaves"] = p.max_octaves;
+    d["gain"] = p.gain;
+    d["ridged"] = p.ridged;
+    d["amplitude"] = p.amplitude;
+    d["bump"] = p.bump;
+    d["albedo"] = p.albedo;
+    d["roughness"] = p.roughness;
+    d["roughness_var"] = p.roughness_var;
+    d["crack_width"] = p.crack_width;
+    d["stretch"] = p.stretch;
+    d["warp"] = p.warp;
+    d["gas_rate_gups"] = p.gas_rate_gups;
+    d["gas_period_s"] = p.gas_period_s;
+    d["coast_k"] = p.coast_k;
+    d["coast_a"] = p.coast_a;
+    return d;
+}
+
+void apply_type_params_from_dict(renderer::planet_detail::TypeParams& p, const py::dict& params) {
+    for (auto item : params) {
+        const std::string key = item.first.cast<std::string>();
+        const float v = item.second.cast<float>();
+        if (key == "base_wavelength_gu") p.base_wavelength_gu = v;
+        else if (key == "max_octaves") p.max_octaves = static_cast<int>(v);
+        else if (key == "gain") p.gain = v;
+        else if (key == "ridged") p.ridged = v;
+        else if (key == "amplitude") p.amplitude = v;
+        else if (key == "bump") p.bump = v;
+        else if (key == "albedo") p.albedo = v;
+        else if (key == "roughness") p.roughness = v;
+        else if (key == "roughness_var") p.roughness_var = v;
+        else if (key == "crack_width") p.crack_width = v;
+        else if (key == "stretch") p.stretch = v;
+        else if (key == "warp") p.warp = v;
+        else if (key == "gas_rate_gups") p.gas_rate_gups = v;
+        else if (key == "gas_period_s") p.gas_period_s = v;
+        else if (key == "coast_k") p.coast_k = v;
+        else if (key == "coast_a") p.coast_a = v;
+        else throw py::value_error("set_surface_type_params: unknown field '" + key + "'");
+    }
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_dauntless_host, m) {
@@ -2914,17 +3160,23 @@ PYBIND11_MODULE(_dauntless_host, m) {
           py::arg("texture_replacements") = py::none(),
           py::arg("decals") = py::none(),
           py::arg("scale") = 1.0f,
-          py::arg("geosphere") = false);
+          py::arg("geosphere") = false,
+          py::arg("interior") = false,
+          py::arg("sibling_overlay_dirs") = std::vector<std::string>{});
     m.def("parse_set_camera", &parse_set_camera_impl,
           "Extract the embedded camera (frustum + world transform) from a set "
           "NIF, or None. Parse-only; no GL context required.");
     m.def("nif_shapes", &nif_shapes_impl,
-          py::arg("abs_path"),
+          py::arg("abs_path"), py::arg("fix_json") = py::none(),
           "Every NiTriShape in a NIF, in block order: block index, name, "
           "texture basenames, world-space vertices/normals, UV set 0, "
           "triangles, hidden flag. None if the file is missing or fails to "
           "parse. Parse-only, no GL context; applies no mesh fix. Feeds "
-          "tools/gen_mesh_fixes.py.");
+          "tools/gen_mesh_fixes.py. Also: world (16 floats, column-major, "
+          "data frame -> model), parent node name, data_block, per-vertex "
+          "colors (or []), UV set 1 (or []). With fix_json (a mesh-fix file's "
+          "text), the fix is parsed and applied in memory first, exactly as the "
+          "loader does; a parse failure or refusal raises RuntimeError.");
 
     py::class_<scenegraph::InstanceId>(m, "InstanceId")
         .def(py::init<>())
@@ -3693,6 +3945,72 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "(color, sunset_color, thickness, density, limb[, intensity[, mie]]), "
           "colours linear RGB; intensity defaults to 20.0 and mie to 0.2 "
           "when omitted.");
+    m.def("set_instance_surface",
+          [](scenegraph::InstanceId id, py::object params) {
+              scenegraph::Instance::Surface s;
+              if (!params.is_none()) {
+                  auto t = params.cast<py::tuple>();
+                  if (t.size() != 8) throw py::value_error("set_instance_surface: expected an 8-tuple");
+                  s.type = t[0].cast<int>();
+                  // type indexes the 6-entry live-params table (0 none .. 5 ocean).
+                  if (s.type < 0 || s.type > 5)
+                      throw py::value_error("set_instance_surface: type must be in [0, 5]");
+                  auto o = t[1].cast<std::array<float, 3>>();
+                  s.ocean = {o[0], o[1], o[2]};
+                  s.has_ocean = t[2].cast<bool>();
+                  s.ocean_tol = t[3].cast<float>();
+                  s.strength = t[4].cast<float>();
+                  s.albedo = t[5].cast<float>();
+                  s.scale = t[6].cast<float>();
+                  s.seed = t[7].cast<std::uint32_t>();
+              }
+              g_world.set_surface(id, s);
+          },
+          py::arg("id"), py::arg("params"),
+          "Planet surface detail (spec 2026-10-08): None disables; else "
+          "(type, ocean_rgb, has_ocean, ocean_tolerance, strength, albedo, scale, seed).");
+
+    // ── Planet surface-detail developer tuning (spec 2026-10-08 §7) ────────
+    m.def("planet_detail_target_type",
+          []() -> int {
+              if (!g_planet_detail) return 0;
+              auto target = g_planet_detail->target();
+              if (!target) return 0;
+              const scenegraph::Instance* inst = g_world.get(*target);
+              return inst ? inst->surface.type : 0;
+          },
+          "The planet surface-detail clipmap's current target's Surface.type, "
+          "or 0 (none) with no target.");
+    m.def("get_surface_type_params",
+          [](int type) {
+              if (type < 0 || type > 5)
+                  throw py::value_error("get_surface_type_params: type out of range");
+              return type_params_to_dict(renderer::planet_detail::live_params(
+                  static_cast<renderer::planet_detail::SurfaceType>(type)));
+          },
+          py::arg("type"),
+          "The live (dev-tunable) TypeParams for one surface type, as a dict.");
+    m.def("set_surface_type_params",
+          [](int type, py::dict params) {
+              if (type < 0 || type > 5)
+                  throw py::value_error("set_surface_type_params: type out of range");
+              apply_type_params_from_dict(renderer::planet_detail::live_params(
+                  static_cast<renderer::planet_detail::SurfaceType>(type)), params);
+          },
+          py::arg("type"), py::arg("params"),
+          "Write named fields into live_params(type); unknown keys raise. Shape "
+          "fields (base_wavelength_gu, max_octaves, gain, ridged, amplitude, "
+          "crack_width, stretch, warp) change the baked field's shape_hash, "
+          "which PlanetDetailPass detects and cold-refills; the other fields "
+          "apply at the next bake with no extra wiring.");
+    m.def("set_planet_detail_budget",
+          [](long long cost) { if (g_planet_detail) g_planet_detail->set_budget(cost); },
+          py::arg("cost"),
+          "Per-frame bake cost budget for the planet surface-detail clipmap "
+          "(spec default 65536*8).");
+    m.def("set_planet_detail_debug",
+          [](bool on) { if (g_planet_detail) g_planet_detail->set_debug(on); },
+          py::arg("on"), "Tint the sampled clipmap level (debug visualisation).");
 
     m.def("create_bridge_instance",
           [](scenegraph::ModelHandle h) {
@@ -3730,7 +4048,8 @@ PYBIND11_MODULE(_dauntless_host, m) {
               std::filesystem::path tex_dir =
                   std::filesystem::path(nif_path).parent_path();
               auto handle = load_model_impl(nif_path, py::cast(tex_dir.string()),
-                                            py::none(), py::none(), 1.0f, false);
+                                            py::none(), py::none(), 1.0f, false, false,
+                                            {});
               auto id = g_world.create_instance(handle);
 
               // The host owns the cameras + pass state, so it places the
@@ -4089,12 +4408,308 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "feeds the space scene).");
 
     m.def("set_bridge_ambient_scale",
-          [](float s) { g_bridge_ambient_scale = s; },
+          [](float s) {
+              g_bridge_ambient_scale = s;
+              if (g_bridge_pass) g_bridge_pass->set_alert_ambient_scale(s);
+          },
           py::arg("scale"),
-          "Ambient multiplier for the bridge INTERIOR render only (red-alert "
-          "dim). The comm-set viewscreen feed always renders with the "
+          "Ambient multiplier for the bridge INTERIOR render only: the "
+          "alert-level scale (engine/bridge_lighting.py: green x1.5, "
+          "yellow/red x1.0). The comm-set viewscreen feed always renders with the "
           "unscaled bridge lighting, so viewscreen brightness stays constant "
           "across alert levels. Default 1.0.");
+
+    m.def("set_bridge_alert_level",
+          [](int level) {
+              g_bridge_alert_level = level;
+              if (g_bridge_pass) g_bridge_pass->set_alert_level(level);
+          },
+          py::arg("level"),
+          "Bridge state (0 green, 1 yellow, 2 red, 3 offline, 4 special; anything else reads as "
+          "green) choosing each bridge material's emissive sibling map "
+          "(<stem>_emissive / _emissive_y / _emissive_r, falling back to the "
+          "default). Main bridge view only; comm sets show the default. Hard "
+          "switch. Default 0; init() and shutdown() reset it.");
+
+    m.def("set_bridge_quality",
+          [](int q) {
+              g_bridge_quality = renderer::clamp_bridge_quality(q);
+              if (g_bridge_pass)
+                  g_bridge_pass->set_ao_settings(renderer::ao_settings_for(g_bridge_quality));
+          },
+          py::arg("level"),
+          "Bridge rendering quality: 0 Low, 1 Medium (default), 2 High. "
+          "Out-of-range clamps. Drives the bridge AO's sample count and "
+          "target resolution scale.");
+
+    m.def("bridge_quality",
+          [] { return static_cast<int>(g_bridge_quality); },
+          "Current bridge rendering quality level (see set_bridge_quality).");
+
+    m.def("set_bridge_debug_view",
+          [](int v) {
+              if (!dauntless::is_developer_mode()) return;
+              v = std::clamp(v, 0, 10);
+              g_bridge_debug_view = v;
+              if (g_bridge_pass)
+                  g_bridge_pass->set_debug_view(
+                      static_cast<renderer::BridgeDebugView>(v));
+          },
+          py::arg("view"),
+          "DEV ONLY (--developer; no-op otherwise): Developer Options -> "
+          "Lighting tab's Bridge Debug View row. 0 Off, 1 Normals, "
+          "2 Light Only, 3 AO Only, 4 Triangle ID, 5 Mesh ID, 6 Roughness, "
+          "7 Metalness, 8 Specular Only, 9 Probe Mirror, 10 Map Normals "
+          "(6-10 show only where bridge PBR runs).");
+
+    // Bridge PBR per-shape material overrides (spec 2026-10-08-bridge-emitters
+    // §9.2 source B). Production data: NOT developer-gated. None / stale clears.
+    m.def("set_bridge_material_overrides",
+          [](py::object instance_id, std::vector<std::tuple<int, float, float>> overrides) {
+              if (!g_bridge_pass) return;
+              if (instance_id.is_none()) { g_bridge_pass->clear_material_overrides(); return; }
+              scenegraph::Instance* inst = nullptr;
+              try {
+                  inst = g_world.get(instance_id.cast<scenegraph::InstanceId>());
+              } catch (const py::cast_error&) {
+                  inst = nullptr;   // not an InstanceId: treated as stale
+              }
+              if (inst == nullptr) { g_bridge_pass->clear_material_overrides(); return; }
+              std::vector<renderer::BridgeMaterialOverride> v;
+              v.reserve(overrides.size());
+              for (const auto& [mesh, r, mt] : overrides) v.push_back({mesh, r, mt});
+              g_bridge_pass->set_material_overrides(inst->model_handle, std::move(v));
+          },
+          py::arg("instance_id"), py::arg("overrides"),
+          "Per-mesh roughness/metalness overrides for the bridge (mesh, rough, metal; "
+          "< 0 = none). None or a stale id clears. Never raises.");
+
+    // Bridge static spot lights (spec 2026-10-08-bridge-emitters §9.6, plan
+    // 2026-10-09-bridge-pbr Task 7). Production: NOT developer-gated. Each
+    // spot is (pos3, dir3, inner_deg, outer_deg, range, (r, g, b), intensity);
+    // inner_deg / outer_deg are HALF-angles from the axis. Degrees ->
+    // cosines, direction normalised, colour x intensity -> radiance. A spot
+    // with ANY non-finite input (position, direction before normalising,
+    // angles, range, colour, intensity) is dropped -- a NaN reaching the
+    // shader becomes a NaN bloom square. Returns the dropped count: invalid
+    // spots PLUS valid ones beyond kBridgeMaxSpots (also before init(), when
+    // nothing is stored: the spots are pushed at bridge load, after the pass
+    // exists). BridgePass::set_spots marks the probes dirty itself when the
+    // list changed. Never raises for a stale/empty state.
+    m.def("set_bridge_spots",
+          [](const std::vector<std::tuple<std::tuple<float, float, float>,
+                                          std::tuple<float, float, float>,
+                                          float, float, float,
+                                          std::tuple<float, float, float>,
+                                          float>>& spots,
+             py::object captures) -> std::size_t {
+              auto v3 = [](const std::tuple<float, float, float>& t) {
+                  return glm::vec3(std::get<0>(t), std::get<1>(t), std::get<2>(t));
+              };
+              auto finite3 = [](const glm::vec3& a) {
+                  return std::isfinite(a.x) && std::isfinite(a.y) && std::isfinite(a.z);
+              };
+              // Spec 2026-10-08-bridge-emitters §11.4: per-spot probe-capture
+              // colours (green, yellow/red), in input order, x that spot's
+              // intensity. A length mismatch ignores them (the PBR-step rule:
+              // the captures see the radiance).
+              std::vector<std::pair<glm::vec3, glm::vec3>> caps;
+              if (!captures.is_none()) {
+                  try {
+                      for (auto item : captures) {
+                          auto pr = item.cast<std::tuple<std::tuple<float, float, float>,
+                                                         std::tuple<float, float, float>>>();
+                          caps.emplace_back(v3(std::get<0>(pr)), v3(std::get<1>(pr)));
+                      }
+                  } catch (const py::cast_error&) {
+                      caps.clear();
+                  }
+                  if (caps.size() != spots.size()) caps.clear();
+              }
+              std::vector<renderer::BridgeSpot> v;
+              v.reserve(spots.size());
+              std::size_t invalid = 0;
+              std::size_t index = 0;
+              for (const auto& s : spots) {
+                  const std::size_t i = index++;
+                  const auto& [pos, dir, inner_deg, outer_deg, range, rgb, intensity] = s;
+                  if (!finite3(v3(pos)) || !finite3(v3(dir)) || !finite3(v3(rgb)) ||
+                      !std::isfinite(inner_deg) || !std::isfinite(outer_deg) ||
+                      !std::isfinite(range) || !std::isfinite(intensity) ||
+                      !finite3(v3(rgb) * intensity) ||
+                      (!caps.empty() && (!finite3(caps[i].first * intensity) ||
+                                         !finite3(caps[i].second * intensity)))) {
+                      ++invalid;
+                      continue;
+                  }
+                  renderer::BridgeSpot sp;
+                  sp.position = v3(pos);
+                  const glm::vec3 d = v3(dir);
+                  const float len = glm::length(d);
+                  // A zero / non-finite axis points straight down (-Z, the
+                  // bridge's floor) rather than feeding NaN to the shader.
+                  sp.direction = (std::isfinite(len) && len > 1e-6f)
+                      ? d / len : glm::vec3(0.0f, 0.0f, -1.0f);
+                  // The outer edge is never inside the inner one.
+                  const float inner = std::clamp(inner_deg, 0.0f, 180.0f);
+                  const float outer = std::clamp(std::max(outer_deg, inner), 0.0f, 180.0f);
+                  sp.cos_inner = std::cos(glm::radians(inner));
+                  sp.cos_outer = std::cos(glm::radians(outer));
+                  sp.range = std::max(range, 0.0f);
+                  sp.radiance = v3(rgb) * intensity;
+                  if (!caps.empty()) {
+                      sp.has_capture = true;
+                      sp.capture_radiance[0] = caps[i].first * intensity;
+                      sp.capture_radiance[1] = caps[i].second * intensity;
+                  }
+                  v.push_back(sp);
+              }
+              const std::size_t cap = static_cast<std::size_t>(renderer::kBridgeMaxSpots);
+              if (!g_bridge_pass) return invalid + (v.size() > cap ? v.size() - cap : 0);
+              return invalid + g_bridge_pass->set_spots(std::move(v));
+          },
+          py::arg("spots"), py::arg("captures") = py::none(),
+          "Static bridge spot lights: [(pos3, dir3, inner_deg, outer_deg, range, "
+          "(r, g, b), intensity)]; inner_deg/outer_deg are HALF-angles from the "
+          "axis. Spots with any non-finite value are dropped; the rest keep the "
+          "first 32. Returns the dropped count (invalid + over the cap). Marks "
+          "the reflection probes dirty when the list differs from the current "
+          "one (never for an identical list). Never raises for a stale state. "
+          "captures (optional): [((r,g,b) green, (r,g,b) yellow/red)] per spot, x "
+          "its intensity: what each probe capture sees; the live colour "
+          "(set_bridge_spot_colours) then never recaptures (spec "
+          "2026-10-08-bridge-emitters §11.4). A length mismatch ignores them.");
+
+    m.def("set_bridge_spot_colours",
+          [](const std::vector<std::tuple<float, float, float>>& radiance) {
+              if (!g_bridge_pass) return;
+              std::vector<glm::vec3> v;
+              v.reserve(radiance.size());
+              for (const auto& [r, g, b] : radiance) v.emplace_back(r, g, b);
+              g_bridge_pass->set_spot_radiance(v);
+          },
+          py::arg("radiance"),
+          "Live LINEAR radiance per bridge spot, in set_bridge_spots order (spec "
+          "2026-10-08-bridge-emitters §11.4). Extra entries ignored, missing kept, "
+          "non-finite -> 0. Never dirties the probes; no-op before init.");
+
+    m.def("set_bridge_glow",
+          [](py::object instance_id,
+             const std::vector<std::tuple<int, int, std::tuple<float, float, float>, float>>& glow) {
+              if (!g_bridge_pass) return;
+              scenegraph::Instance* inst = nullptr;
+              if (!instance_id.is_none()) {
+                  try {
+                      inst = g_world.get(instance_id.cast<scenegraph::InstanceId>());
+                  } catch (const py::cast_error&) {
+                      inst = nullptr;   // not an InstanceId: treated as stale
+                  }
+              }
+              if (inst == nullptr) { g_bridge_pass->clear_glow(); return; }
+              std::vector<renderer::BridgeGlow> v;
+              v.reserve(glow.size());
+              for (const auto& [mesh, src, rgb, level] : glow) {
+                  const glm::vec3 c(std::get<0>(rgb), std::get<1>(rgb), std::get<2>(rgb));
+                  if (src < 0 || src > 2 || !std::isfinite(c.x) || !std::isfinite(c.y) ||
+                      !std::isfinite(c.z) || !std::isfinite(level))
+                      continue;
+                  v.push_back({mesh, src, c, level});
+              }
+              g_bridge_pass->set_glow(inst->model_handle, std::move(v));
+          },
+          py::arg("instance_id"), py::arg("glow"),
+          "Per-mesh emitter glow for the bridge (spec 2026-10-08-bridge-emitters "
+          "§11.2): [(mesh, src 0 emissive map / 1 albedo / 2 flat, (r,g,b) display "
+          "space, level)]. None or a stale id clears; invalid entries are dropped. "
+          "Never dirties the probes; never raises.");
+
+    m.def("set_bridge_pbr_enabled",
+          [](bool on) {
+              if (!dauntless::is_developer_mode() || !g_bridge_pass) return;
+              g_bridge_pass->set_pbr_enabled(on);
+          },
+          py::arg("on"), "Developer-only A/B: bridge PBR on/off (default on).");
+
+    // Bridge reflection probes (spec 2026-10-08-bridge-emitters §9.3, plan
+    // 2026-10-09-bridge-pbr Task 6). Production: NOT developer-gated. Before
+    // init() they only stash their values, which init() applies.
+    m.def("set_bridge_probe_origin",
+          [](std::tuple<float, float, float> p) {
+              g_bridge_probe.origin = glm::vec3(std::get<0>(p), std::get<1>(p),
+                                                std::get<2>(p));
+              if (g_bridge_pass) g_bridge_pass->set_probe_origin(g_bridge_probe.origin);
+          },
+          py::arg("origin"),
+          "Bridge reflection probe capture point (x, y, z), bridge world space "
+          "(the captain's-chair eye). Takes effect at the next capture.");
+
+    m.def("set_bridge_probe_scales",
+          [](float green, float yellow_red) {
+              g_bridge_probe.green = green;
+              g_bridge_probe.yellow_red = yellow_red;
+              if (g_bridge_pass) g_bridge_pass->set_probe_scales(green, yellow_red);
+          },
+          py::arg("green"), py::arg("yellow_red"),
+          "Ambient multipliers the green and yellow/red probes are captured "
+          "with (x the bridge lighting's ambient). Take effect at the next "
+          "capture.");
+
+    m.def("set_bridge_probe_mix",
+          [](float t) {
+              g_bridge_probe.mix = std::isfinite(t) ? std::clamp(t, 0.0f, 1.0f) : 0.0f;
+              if (g_bridge_pass) g_bridge_pass->set_probe_mix(g_bridge_probe.mix);
+          },
+          py::arg("t"),
+          "Reflection cross-fade: 0 = the green probe, 1 = the yellow/red "
+          "probe. Clamped to [0, 1].");
+
+    m.def("bridge_probe_stash",
+          [] {
+              py::dict d;
+              const glm::vec3 o = g_bridge_probe.origin;
+              d["origin"] = py::make_tuple(o.x, o.y, o.z);
+              d["scales"] = py::make_tuple(g_bridge_probe.green, g_bridge_probe.yellow_red);
+              d["mix"] = g_bridge_probe.mix;
+              d["capture_pending"] = g_bridge_probe.capture_pending;
+              return d;
+          },
+          "Read-only test snapshot of the process-wide probe stash the "
+          "set_bridge_probe_* bindings write (it survives shutdown()/init() by "
+          "design): origin, scales, mix, capture_pending.");
+
+    m.def("bridge_probe_state",
+          []() -> py::object {
+              if (!g_bridge_pass) return py::none();
+              py::dict d;
+              const glm::vec3 o = g_bridge_pass->probe_origin();
+              d["origin"] = py::make_tuple(o.x, o.y, o.z);
+              d["scales"] = py::make_tuple(g_bridge_pass->probe_scale_green(),
+                                           g_bridge_pass->probe_scale_yellow_red());
+              d["mix"] = g_bridge_pass->probe_mix();
+              d["capture_pending"] = g_bridge_pass->probe_capture_pending();
+              d["probes_valid"] = g_bridge_pass->probes_valid();
+              d["alert_ambient_scale"] = g_bridge_pass->alert_ambient_scale();
+              d["alert_level"] = g_bridge_pass->alert_level();
+              return d;
+          },
+          "Test/diagnostic snapshot of the bridge pass's probe state (origin, "
+          "scales, mix, capture_pending, probes_valid, alert_ambient_scale, "
+          "alert_level); "
+          "None before init().");
+
+    m.def("request_bridge_probe_capture",
+          [] {
+              if (g_bridge_pass) g_bridge_pass->request_probe_capture();
+              else g_bridge_probe.capture_pending = true;
+          },
+          "Recapture both bridge reflection probes inside the next main-bridge "
+          "frame (bridge load). Override and spot changes dirty the probes by "
+          "themselves. Never per frame.");
+
+    m.def("bridge_debug_view",
+          [] { return g_bridge_debug_view; },
+          "Active bridge debug view (see set_bridge_debug_view); 0 when "
+          "not under --developer.");
 
     m.def("set_bridge_wall_time",
           [](double t) { if (g_bridge_pass) g_bridge_pass->set_wall_time(t); },
@@ -5920,6 +6535,9 @@ PYBIND11_MODULE(_dauntless_host, m) {
                   d["name"]   = r.name;
                   d["cpu_ms"] = r.cpu_ms;
                   d["gpu_ms"] = r.gpu_ms;
+                  // False: no GPU query covered this scope (nested under
+                  // GL_TIME_ELAPSED, or no timer). gpu_ms is then NOT MEASURED.
+                  d["gpu_measured"] = r.gpu_measured;
                   d["calls"]  = r.calls;
                   d["depth"]  = r.depth;
                   out.append(std::move(d));
@@ -5932,9 +6550,21 @@ PYBIND11_MODULE(_dauntless_host, m) {
               py::dict d;
               const auto& t = renderer::frame_timer();
               d["cpu_ms"] = t.frame_cpu_ms();
-              // Whole-frame GPU is first-timestamp-to-last, not the sum of the
-              // scopes: scopes nest, so a sum would double-count.
+              // Whole-frame GPU: first-timestamp-to-last under GL_TIMESTAMP
+              // (scopes nest, so a sum would double-count); the sum of the
+              // sequential top-level spans under GL_TIME_ELAPSED.
               d["gpu_ms"] = t.frame_gpu_ms();
+              using GpuTimer = renderer::FrameTimer::GpuTimer;
+              const GpuTimer timer = t.gpu_timer();
+              d["gpu_timer"] = timer == GpuTimer::Timestamp ? "timestamp"
+                             : timer == GpuTimer::Elapsed   ? "elapsed"
+                                                            : "none";
+              d["gpu_queries"] = t.gpu_queries_active();
+              // What the driver declared (GL_QUERY_COUNTER_BITS), -1 until the
+              // first enabled frame has read it.
+              d["timestamp_bits"] = t.timestamp_bits();
+              d["elapsed_bits"] = t.elapsed_bits();
+              d["timestamp_queries"] = t.timestamp_queries_issued();
               d["frames"] = t.frames_resolved();
               d["enabled"] = t.enabled();
               // Reported, not assumed: a hidden window already runs uncapped,
@@ -6198,6 +6828,145 @@ PYBIND11_MODULE(_dauntless_host, m) {
           "((point), (normal), t) on hit or None on miss; point is "
           "instance-relative too (add instance_translation back). t is the "
           "world-space distance from origin.");
+
+    // Bridge editor pick (spec 2026-10-08-bridge-emitters §4): ray_trace_mesh
+    // plus WHICH mesh and triangle were hit, with meshes to see through (the
+    // "pick the surface behind" click). Same instance-relative convention.
+    m.def("ray_trace_mesh_pick",
+          [](scenegraph::InstanceId id,
+             std::tuple<float, float, float> origin,
+             std::tuple<float, float, float> direction,
+             float max_dist,
+             std::vector<int> exclude_meshes) -> py::object {
+              auto* inst = g_world.get(id);
+              if (inst == nullptr) return py::none();
+              const assets::Model* model = resolve_model(inst->model_handle);
+              if (model == nullptr) return py::none();
+              const glm::vec3 o(std::get<0>(origin), std::get<1>(origin),
+                                std::get<2>(origin));
+              glm::vec3 d(std::get<0>(direction), std::get<1>(direction),
+                          std::get<2>(direction));
+              const float dlen = glm::length(d);
+              if (dlen < 1e-9f) return py::none();
+              d /= dlen;
+              if (!std::isfinite(max_dist) || max_dist <= 0.0f) return py::none();
+              auto hit = renderer::ray_trace_instance_linear(
+                  *model, inst->world_linear, o, d, max_dist,
+                  &inst->node_overrides, &exclude_meshes);
+              if (!hit) return py::none();
+              return py::make_tuple(
+                  py::make_tuple(hit->point.x, hit->point.y, hit->point.z),
+                  py::make_tuple(hit->normal.x, hit->normal.y, hit->normal.z),
+                  hit->t, hit->mesh_index, hit->triangle);
+          },
+          py::arg("instance_id"), py::arg("origin"), py::arg("direction"),
+          py::arg("max_dist"), py::arg("exclude_meshes") = std::vector<int>{},
+          "ray_trace_mesh plus (mesh_index, triangle) of the hit; triangles of "
+          "exclude_meshes are never hit. Instance-relative origin/point. None "
+          "on a miss or a stale id (never raises: the editor polls it).");
+
+    // Per-mesh shape identity of an instance's model (spec
+    // 2026-10-08-bridge-emitters §4): NIF block, shape name, node chain
+    // (root -> owning node), material index; plus the model's source path and
+    // content hash (empty unless loaded as an interior).
+    m.def("model_identity",
+          [](scenegraph::InstanceId id) -> py::object {
+              auto* inst = g_world.get(id);
+              if (inst == nullptr) return py::none();
+              const assets::Model* model = resolve_model(inst->model_handle);
+              if (model == nullptr) return py::none();
+              std::vector<int> owner(model->meshes.size(), -1);
+              for (std::size_t n = 0; n < model->nodes.size(); ++n)
+                  for (int mi : model->nodes[n].meshes)
+                      if (mi >= 0 && mi < static_cast<int>(owner.size()))
+                          owner[mi] = static_cast<int>(n);
+              py::list meshes;
+              for (std::size_t i = 0; i < model->meshes.size(); ++i) {
+                  const auto& mesh = model->meshes[i];
+                  std::vector<std::string> chain;
+                  for (int n = owner[i]; n >= 0 &&
+                       n < static_cast<int>(model->nodes.size());
+                       n = model->nodes[n].parent_index) {
+                      chain.push_back(model->nodes[n].name);
+                      if (chain.size() > model->nodes.size()) break;  // cycle guard
+                  }
+                  std::reverse(chain.begin(), chain.end());
+                  // Names cross as BYTES: a NIF name is whatever the exporter
+                  // wrote, and pybind's str conversion raises on non-UTF-8.
+                  // host_io.model_identity decodes with errors="replace".
+                  py::list chain_b;
+                  for (const auto& c : chain) chain_b.append(py::bytes(c));
+                  // The Base-stage texture as BUILT (property inheritance
+                  // resolved), not nif_shapes' per-shape property walk.
+                  py::list textures;
+                  const int mi = mesh.material_index();
+                  // safe_material_index is the SAME bounds check
+                  // mesh_identity_maps uses below -- material_or_default
+                  // requires a non-negative index to already be in range (it
+                  // indexes with operator[], no bounds check of its own), so
+                  // both lookups here must agree on what counts as safe.
+                  const int safe_mi = dauntless::safe_material_index(*model, mi);
+                  if (safe_mi >= 0 &&
+                      !model->materials[safe_mi].base_texture_name.empty())
+                      textures.append(py::bytes(model->materials[safe_mi].base_texture_name));
+                  py::dict d;
+                  d["mesh"] = static_cast<int>(i);
+                  d["block"] = mesh.source_block();
+                  d["name"] = py::bytes(mesh.shape_name());
+                  d["node_chain"] = std::move(chain_b);
+                  d["textures"] = std::move(textures);
+                  d["material"] = mi;
+                  const dauntless::MeshMaps mm = dauntless::mesh_identity_maps(*model, mi);
+                  py::dict maps;
+                  maps["roughness"] = mm.roughness;
+                  maps["metalness"] = mm.metalness;
+                  maps["normal"]    = mm.normal;
+                  maps["emissive"]  = mm.emissive;
+                  d["maps"] = std::move(maps);
+                  meshes.append(std::move(d));
+              }
+              py::dict out;
+              out["source"] = model->source.string();
+              out["content_hash"] = model->content_hash;
+              out["meshes"] = std::move(meshes);
+              return out;
+          },
+          py::arg("instance_id"),
+          "{source, content_hash, meshes:[{mesh, block, name, node_chain, "
+          "textures, material, maps}]} for an instance's model, or None for a "
+          "stale id. name / node_chain / textures are BYTES (decode with "
+          "errors='replace'; host_io.model_identity does). maps is "
+          "{roughness, metalness, normal, emissive}: whether the mesh's material has "
+          "that texture stage populated (spec 2026-10-09-bridge-pbr).");
+
+    // Developer-only selection tint on the bridge (spec
+    // 2026-10-08-bridge-emitters §4).
+    m.def("set_bridge_highlight",
+          [](py::object instance_id, int selected, int hover) {
+              if (!dauntless::is_developer_mode()) return;
+              scenegraph::Instance* inst = nullptr;
+              if (!instance_id.is_none())
+                  inst = g_world.get(instance_id.cast<scenegraph::InstanceId>());
+              // None or a stale id -> handle 0, which clears.
+              dauntless::apply_bridge_highlight(
+                  g_bridge_highlight, g_bridge_pass.get(),
+                  inst ? inst->model_handle : 0ull, selected, hover);
+          },
+          py::arg("instance_id"), py::arg("selected"), py::arg("hover"),
+          "Developer-only bridge editor selection tint: mesh indices into the "
+          "instance's model, -1 = none; None or a stale id clears. No-op "
+          "without --developer.");
+
+    // Read-only: lets the pytest host tests observe that set_bridge_highlight
+    // is a no-op without --developer. Exposes no way to change anything.
+    m.def("bridge_highlight",
+          [] {
+              return py::make_tuple(g_bridge_highlight.model != 0,
+                                    g_bridge_highlight.selected,
+                                    g_bridge_highlight.hover);
+          },
+          "(active, selected_mesh, hover_mesh) of the bridge editor tint "
+          "(see set_bridge_highlight); (False, -1, -1) when none.");
 
     m.def("damage_decal_add",
           [](scenegraph::InstanceId id,

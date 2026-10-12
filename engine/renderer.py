@@ -32,7 +32,7 @@ InstanceId = _h.InstanceId
 _REQUIRED_BINDINGS = frozenset({
     "add_box_region", "add_cylinder_region", "add_sphere_region",
     "ambient_gradient_get", "ambient_gradient_set", "ambient_gradient_set_enabled",
-    "assemble_officer", "bridge_pass_set_enabled",
+    "assemble_officer", "bridge_pass_set_enabled", "bridge_quality",
     "cef_composite", "cef_devtools_open", "cef_initialize", "cef_pump",
     "cef_reload", "cef_shutdown",
     "cef_toggle_devtools", "clear_glow_regions", "clear_hologram_ship",
@@ -64,11 +64,13 @@ _REQUIRED_BINDINGS = frozenset({
     "procedural_sky_enabled", "procedural_sky_set_enabled", "restore_rest_pose",
     "rim_set_enabled", "set_asset_overrides", "set_backdrops",
     "set_bridge_ambient_scale",
-    "set_bridge_camera", "set_bridge_lighting",
+    "set_bridge_camera", "set_bridge_debug_view", "set_bridge_lighting",
+    "set_bridge_quality",
     "set_bridge_wall_time", "set_camera", "set_comm_set_id", "set_cursor_locked",
     "set_dash_intensity", "set_render_origin", "reset_render_origin",
     "set_dust_planets", "set_dust_profile", "set_emissive_scale", "set_game_root", "set_glow_region_dim",
     "set_instance_atmosphere",
+    "set_instance_surface",
     "set_project_asset_root",
     "set_glow_region_gain",
     "set_hologram_only_mode", "set_hologram_ship", "set_hull_discharges",
@@ -123,6 +125,8 @@ _OPTIONAL_BINDINGS = frozenset({
     "set_officer_jaw", "set_spv_overlay_beams",
     "set_target_reticle", "set_transform_gizmo",
     "spawn_test_character", "stop_instance_node_anim",
+    "planet_detail_target_type", "get_surface_type_params", "set_surface_type_params",
+    "set_planet_detail_budget", "set_planet_detail_debug",
 })
 
 
@@ -186,7 +190,8 @@ def frame() -> None:
 
 def load_model(nif_path: str, texture_search_path,
                texture_replacements=None, decals=None,
-               scale: float = 1.0, geosphere: bool = False) -> int:
+               scale: float = 1.0, geosphere: bool = False,
+               interior: bool = False, sibling_overlay_dirs=None) -> int:
     """Load (and cache) a NIF model. `texture_replacements`, when given, is a
     list of (old_substring, new_abs_path) pairs baking BC ReplaceTexture swaps
     into a distinct per-registry model variant (Federation hull names). None /
@@ -202,8 +207,17 @@ def load_model(nif_path: str, texture_search_path,
 
     `geosphere` loads the planet variant (spec
     docs/superpowers/specs/2026-10-06-planet-geosphere-design.md); a
-    non-sphere NIF loads unchanged."""
-    return _h.load_model(nif_path, texture_search_path, texture_replacements, decals, scale, geosphere)
+    non-sphere NIF loads unchanged.
+
+    `interior` loads as an interior set: shapes authored without normals get
+    generated ones (spec 2026-10-08-bridge-lighting-baseline-design.md).
+
+    `sibling_overlay_dirs` is the replacements-overlay search list for the
+    bridge PBR roughness/metalness/normal sibling maps (spec
+    2026-10-09-bridge-pbr §9.2/§9.3): used only when `interior` is True. None
+    / empty is byte-identical to the plain interior load."""
+    return _h.load_model(nif_path, texture_search_path, texture_replacements, decals, scale, geosphere, interior,
+                          list(sibling_overlay_dirs or []))
 
 
 def create_instance(model: int) -> InstanceId:
@@ -312,8 +326,9 @@ def set_bridge_lighting(ambient: Tuple[float, float, float],
 
 
 def set_bridge_ambient_scale(scale: float) -> None:
-    """Ambient multiplier for the bridge interior render only (red-alert
-    dim). The comm-set viewscreen feed always renders with the unscaled
+    """Ambient multiplier for the bridge interior render only: the
+    alert-level scale from engine/bridge_lighting.py (green x1.5,
+    yellow/red x1.0). The comm-set viewscreen feed always renders with the unscaled
     bridge lighting, so viewscreen brightness stays constant across alert
     levels."""
     _h.set_bridge_ambient_scale(float(scale))
@@ -326,6 +341,25 @@ def set_bridge_wall_time(t: float) -> None:
     this to compute the current animation frame per material.
     """
     _h.set_bridge_wall_time(t)
+
+
+def set_bridge_quality(level: int) -> None:
+    """Bridge rendering quality: 0 Low, 1 Medium (default), 2 High. Drives
+    the bridge AO's sample count and target resolution scale. Out-of-range
+    values clamp."""
+    _h.set_bridge_quality(int(level))
+
+
+def bridge_quality() -> int:
+    """Current bridge rendering quality level (see set_bridge_quality)."""
+    return _h.bridge_quality()
+
+
+def set_bridge_debug_view(view: int) -> None:
+    """Developer Options -> Lighting tab's Bridge Debug View row: 0 Off,
+    1 Normals, 2 Light Only, 3 AO Only, 4 Triangle ID, 5 Mesh ID. A no-op
+    unless the binary was launched with --developer."""
+    _h.set_bridge_debug_view(int(view))
 
 
 def damage_decals_tick(game_time: float) -> None:
@@ -1023,6 +1057,53 @@ def set_instance_atmosphere(instance_id: InstanceId, params) -> None:
     _h.set_instance_atmosphere(instance_id, (tuple(params.color), tuple(params.sunset_color),
                                              params.thickness, params.density, params.limb,
                                              params.intensity, params.mie))
+
+
+def set_instance_surface(instance_id: InstanceId, params) -> None:
+    """Planet surface detail (spec 2026-10-08). `params` is None (no detail)
+    or the 8-tuple engine.planets.surface.to_binding produces -- already
+    shaped for the native binding, unlike set_instance_atmosphere above."""
+    _h.set_instance_surface(instance_id, params)
+
+
+def planet_detail_target_type() -> int:
+    """The planet surface-detail clipmap's current target's Surface.type, or
+    0 (none) with no target or no native binding (spec 2026-10-08 §7 dev
+    tuning; the "surface" dial group's type-table target)."""
+    fn = getattr(_h, "planet_detail_target_type", None)
+    return int(fn()) if fn is not None else 0
+
+
+def get_surface_type_params(surface_type: int) -> dict:
+    """The live (dev-tunable) TypeParams for one surface type, as a dict, or
+    {} with no native binding."""
+    fn = getattr(_h, "get_surface_type_params", None)
+    return dict(fn(int(surface_type))) if fn is not None else {}
+
+
+def set_surface_type_params(surface_type: int, params: dict) -> None:
+    """Write named TypeParams fields for one surface type into
+    `live_params(type)`; unknown keys raise ValueError. No-op with no native
+    binding."""
+    fn = getattr(_h, "set_surface_type_params", None)
+    if fn is not None:
+        fn(int(surface_type), dict(params))
+
+
+def set_planet_detail_budget(cost: int) -> None:
+    """Per-frame bake cost budget for the planet surface-detail clipmap
+    (spec default 65536*8). No-op with no native binding."""
+    fn = getattr(_h, "set_planet_detail_budget", None)
+    if fn is not None:
+        fn(int(cost))
+
+
+def set_planet_detail_debug(on: bool) -> None:
+    """Tint the sampled clipmap level (debug visualisation). No-op with no
+    native binding."""
+    fn = getattr(_h, "set_planet_detail_debug", None)
+    if fn is not None:
+        fn(bool(on))
 
 
 def add_sphere_region(instance_id: InstanceId, center, radius: float) -> int:

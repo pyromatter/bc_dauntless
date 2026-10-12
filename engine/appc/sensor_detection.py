@@ -31,11 +31,6 @@ from engine.appc.subsystems import _is_offline, _get_xyz
 from engine.appc import nebula_density as _nd
 from engine.core.ids import implements
 
-# Range used when a ship models no sensor subsystem or carries no
-# BaseSensorRange hardpoint data. Preserves the player target list's
-# historical 30000 GU reach and keeps sensor-less fixtures fully sighted.
-FALLBACK_RANGE_GU = 30000.0
-
 # ── Concealment constants ─────────────────────────────────────────────────────
 CONCEAL_K = 0.9      # effective-range reduction at full density (0→no effect, 1→blind)
 LOCK_BREAK_T = 0.28  # density above which detection fails outright. Matched to the
@@ -57,6 +52,11 @@ HYSTERESIS = 0.08    # target must drop to T-HYSTERESIS (0.20) before re-detecti
 PROFILE_LOCK_MARGIN = 0.01
 PROFILE_CONCEALMENT_CAP = LOCK_BREAK_T - HYSTERESIS - PROFILE_LOCK_MARGIN
 
+# One probe level (2026-10-07-sensor-probes-design.md, Rule 3): while a probe's
+# own sensors are being asked, its probe list is not walked. Also guards a
+# pathological AddProbe cycle.
+_walking_probes = False
+
 # ── The stage-4 sensing toggle (INTENTIONAL divergence from stock BC) ─────────
 # ONE flag covering BOTH stage-4 sensing changes as a set. It does NOT mean
 # "cloak"; it means "sensing is a contest of degrees rather than a set of
@@ -65,13 +65,16 @@ PROFILE_CONCEALMENT_CAP = LOCK_BREAK_T - HYSTERESIS - PROFILE_LOCK_MARGIN
 #   (1) CLOAK IS A RANGE CONTEST, not an absolute. In BC a cloaked ship is
 #       undetectable at any range. Here the cloak bubble is
 #           CLOAK_DETECTION_BASE_GU + effective_sensor_range * CLOAK_RANGE_FACTOR
-#       — a flat floor plus a fraction of the observer's *effective* range,
+#       capped at the cloak_bubble_cap_gu dial (sensor_dials) so no observer --
+#       in practice the big stations -- out-reaches a phaser. Below the cap
+#       it is a flat floor plus a fraction of the observer's *effective* range,
 #       which lands a Galaxy well inside its own 60 GU phaser reach: you must be
 #       effectively on top of a cloaked ship to see it. Because the percentage
 #       term scales *effective* range (post condition and power), boosting
-#       sensor power widens the bubble; wrecked sensors remove it entirely (the
-#       flat floor never applies past the `r <= 0.0` guard below). See the
-#       constants for the current dial settings — deliberately not restated here.
+#       sensor power widens the bubble (up to the cap); wrecked sensors remove
+#       it entirely (the flat floor never applies past the `r <= 0.0` guard
+#       below). See the constants for the current dial settings — deliberately
+#       not restated here.
 #
 #   (2) NEBULA CONCEALMENT REACHES THE UI. perception.perceived_by (target list,
 #       radar) routes through can_detect, so nebula-hidden contacts leave the
@@ -84,8 +87,8 @@ PROFILE_CONCEALMENT_CAP = LOCK_BREAK_T - HYSTERESIS - PROFILE_LOCK_MARGIN
 # reaches the candidate filter with no cloak skip of its own, so a station
 # picks up a cloaked ship inside its (large) bubble. See the ⚠️ note above
 # `_observing_ship` in engine/appc/ai_sensor_gate.py for the paths and the
-# numbers, which scale with CLOAK_RANGE_FACTOR — cutting the factor is the lever
-# that shrinks the oversized station bubbles.
+# numbers, which scale with CLOAK_RANGE_FACTOR; the cap is what bounds the
+# station bubbles.
 #
 # ⚠️ KNOWN WART IN THE OFF STATE — this is deliberate, do not "fix" it.
 # With the flag False the UI ignores nebulae but can_detect keeps applying
@@ -115,7 +118,8 @@ CLOAK_DETECTION_BASE_GU = 5.0   # Flat bubble floor, added atop the percentage t
                                  # every past retune left stale "the bubble is N GU"
                                  # sentences scattered across the tests, and correcting
                                  # them dwarfed the actual change. Compute it:
-                                 #     bubble = BASE + effective_sensor_range * FACTOR
+                                 #     bubble = min(cap, BASE + effective_sensor_range * FACTOR)
+                                 # where cap is the cloak_bubble_cap_gu dial (sensor_dials).
                                  # Sanity-pinned by test_cloak_detection_contest.py's
                                  # formula + magnitude tests, which read these names
                                  # instead of hardcoding results, so a retune needs no
@@ -209,30 +213,40 @@ def _game_time() -> float:
         return 0.0
 
 
+def _sensorless_range() -> float:
+    """Range for an observer that models no sensor subsystem or carries no
+    BaseSensorRange: the `sensorless_range_gu` dial (Mark's ruling,
+    2026-10-08). Only CommArray and CommLight (plus rocks, which never
+    observe) author no sensors; the 7 other stock hardpoints without a
+    SetBaseSensorRange inherit their parent's."""
+    from engine.appc import sensor_dials
+    return sensor_dials.get("sensorless_range_gu")
+
+
 def effective_sensor_range(ship) -> float:
     """Detection range (game units) for *ship* given its sensor condition.
 
     Full BaseSensorRange when undamaged, scaled linearly by condition
     percentage, and 0.0 once the sensor subsystem is offline (disabled or
-    destroyed). Returns FALLBACK_RANGE_GU for ships that don't model a
-    sensor subsystem or carry no BaseSensorRange.
+    destroyed). Returns the `sensorless_range_gu` dial for ships that don't
+    model a sensor subsystem or carry no BaseSensorRange.
 
     The capability probe is ``ids.implements``, NOT ``hasattr``:
     ``TGObject.__getattr__`` vends a truthy ``_Stub`` for any undefined method,
     so ``hasattr`` is vacuously True for every engine object and a non-ship
     used to get a ``_Stub`` back — which ``_is_offline`` then read as offline,
-    silently answering 0.0 ("blind") instead of the documented fallback.
+    silently answering 0.0 ("blind") instead of the `sensorless_range_gu` dial.
     """
     sensors = (ship.GetSensorSubsystem()
                if (ship is not None and implements(ship, "GetSensorSubsystem"))
                else None)
     if sensors is None:
-        return FALLBACK_RANGE_GU
+        return _sensorless_range()
     if _is_offline(sensors):
         return 0.0
     base = sensors.GetBaseSensorRange()
     if base <= 0.0:
-        return FALLBACK_RANGE_GU
+        return _sensorless_range()
     return base * sensors.GetConditionPercentage() * sensors.GetNormalPowerPercentage()
 
 
@@ -365,19 +379,30 @@ def can_detect(observer, target, *, dist_sq_gu=None,
     range, accounting for nebula tactical concealment and major-rock
     occlusion.
 
-    Detection fails outright when the target's concealment exceeds
+    Detection fails for the OBSERVER when the target's concealment exceeds
     LOCK_BREAK_T. A broken lock latches (per-pair hysteresis) until
     concealment drops to LOCK_BREAK_T - HYSTERESIS. When below the
     threshold, effective range is reduced by (1 - CONCEAL_K * concealment).
 
-    Detection also fails outright when a major rock sits on the line of
-    sight between observer and target (``sensor_occlusion.blocked``), gated
-    by ``ENHANCED_SENSOR_CONTEST`` like the rest of this contest.
+    Detection also fails for the OBSERVER when a major rock sits on the line
+    of sight between observer and target (``sensor_occlusion.blocked``),
+    gated by ``ENHANCED_SENSOR_CONTEST`` like the rest of this contest.
+
+    ⚠️ Neither of those two gates is a hard ``return False`` (fix round 1,
+    sub-project 4): both fall through to ``_probe_reach`` instead, because a
+    rock or nebula core on the OBSERVER's line does not hide the target from
+    a probe sitting somewhere else (design Rule 3: rocks/nebula apply from
+    the PROBE's position; Rule 5: a contact is concealed only when hidden
+    from every probe AND the player). Memory and over-boost are unaffected --
+    they are reached only through the range test below, never from here, so
+    a rock on the observer's line still cancels them with no probe present.
 
     Beyond range, BC's sensor MEMORY and OVER-BOOST still reach the target
     (``_beyond_range_reach``; sub-project 3): a known contact, or any contact
     when sensors run above ``overboost_threshold`` normal power -- same set,
-    not fully cloaked, and not ``jammed``.
+    not fully cloaked, and not ``jammed``; or, failing those, a live
+    same-set probe of the observer whose own sensors detect it
+    (``_probe_reach``; sub-project 4, not jam-gated).
 
     ALL THREE optional parameters are KEYWORD-ONLY, deliberately. ``bool`` is
     a subclass of ``int``, so the natural misreading ``can_detect(a, b, False)``
@@ -428,7 +453,8 @@ def can_detect(observer, target, *, dist_sq_gu=None,
     # cloak instead shrinks effective range to CLOAK_DETECTION_BASE_GU (a flat
     # floor) plus CLOAK_RANGE_FACTOR of it, applied after
     # effective_sensor_range so the percentage term scales with condition and
-    # power while the flat term does not. Mid-cloak (CLOAKING) stays fully
+    # power while the flat term does not, and the result is capped by the
+    # cloak_bubble_cap_gu dial. Mid-cloak (CLOAKING) stays fully
     # visible until the transition finishes, so gate on IsCloaked(), not
     # IsTryingToCloak().
     cloak = _cloak_subsystem(target)
@@ -440,7 +466,12 @@ def can_detect(observer, target, *, dist_sq_gu=None,
     if r <= 0.0:
         return False
     if cloaked:
-        r = CLOAK_DETECTION_BASE_GU + r * CLOAK_RANGE_FACTOR
+        # Capped (sub-project 5, Mark's ruling 2026-10-08): a station must
+        # not out-reach your phasers. Applied after condition/power scaling,
+        # so over-boost cannot exceed it either.
+        from engine.appc import sensor_dials
+        r = min(sensor_dials.get("cloak_bubble_cap_gu"),
+                CLOAK_DETECTION_BASE_GU + r * CLOAK_RANGE_FACTOR)
 
     # ── Occlusion gate (sub-project 2) ────────────────────────────────────
     # A major rock on the line of sight hides the target from everyone --
@@ -449,16 +480,29 @@ def can_detect(observer, target, *, dist_sq_gu=None,
     if ENHANCED_SENSOR_CONTEST:
         from engine.appc import sensor_occlusion
         if sensor_occlusion.blocked(observer, target):
-            return False
+            # A rock on the OBSERVER's line does not block a probe sitting
+            # somewhere else (Rule 3: rocks apply from the probe's position;
+            # Rule 5: concealed only when hidden from every probe AND the
+            # player) -- fall through to the probe walk instead of a hard
+            # False. Memory/over-boost keep SP3's behaviour unchanged: they
+            # are reached only via the range test below, never from here.
+            return _probe_reach(observer, target, apply_concealment,
+                                concealment)
 
     # ── Nebula concealment gate ───────────────────────────────────────────
     if apply_concealment:
         conceal = concealment_at(target) if concealment is None else concealment
+        concealment = conceal          # sampled once; the probe walk reuses it
         thresh = LOCK_BREAK_T - (HYSTERESIS if _latched(observer, target)
                                  else 0.0)
         if conceal >= thresh:
             _set_latched(observer, target, True)
-            return False
+            # Concealment depends only on the TARGET, so a probe sees the
+            # same value: it can differ from the observer only inside the
+            # hysteresis band [LOCK_BREAK_T - HYSTERESIS, LOCK_BREAK_T), where
+            # the observer's pair is latched and the probe's is not.
+            return _probe_reach(observer, target, apply_concealment,
+                                concealment)
         _set_latched(observer, target, False)
         # Scale range by the concealment factor (no-op when conceal == 0).
         r = r * (1.0 - CONCEAL_K * conceal)
@@ -470,8 +514,10 @@ def can_detect(observer, target, *, dist_sq_gu=None,
         dist_sq_gu = dx * dx + dy * dy + dz * dz
     if dist_sq_gu <= (r * r):
         return True
-    # ── Beyond range (sub-project 3): BC's memory and over-boost ──────────
-    return _beyond_range_reach(observer, target, cloaked)
+    # ── Beyond range: BC's memory and over-boost (sub-project 3), then the
+    # probe walk (sub-project 4) ─────────────────────────────────────────
+    return (_beyond_range_reach(observer, target, cloaked)
+            or _probe_reach(observer, target, apply_concealment, concealment))
 
 
 def _beyond_range_reach(observer, target, cloaked) -> bool:
@@ -504,12 +550,81 @@ def _beyond_range_reach(observer, target, cloaked) -> bool:
     return not jammed(observer, target)
 
 
+def _live_probes(observer) -> list:
+    """The observer's live probe ships (``SensorSubsystem.probes()``), or []."""
+    sensors = (observer.GetSensorSubsystem()
+               if implements(observer, "GetSensorSubsystem") else None)
+    if sensors is None or not implements(sensors, "probes"):
+        return []
+    return sensors.probes()
+
+
+def _probe_reach(observer, target, apply_concealment=True,
+                 concealment=None) -> bool:
+    """BC's probe walk (IsObjectVisible @0x005671D0, step 7): a live probe of
+    the observer, in the observer's set, whose own sensors detect the target
+    (the one rule, from the probe's position -- rocks, cloak bubble, nebula
+    core, the probe's power and condition all apply). Runs after the range
+    test and is NOT cancelled by `jammed` (BC's probe walk precedes the jam
+    fallback). One level only: `_walking_probes`.
+
+    *apply_concealment* and *concealment* are the caller's ``can_detect``
+    keywords, forwarded to every probe: a probe-reached contact obeys
+    ``apply_concealment=False`` like a directly seen one, and since
+    ``concealment_at`` depends only on the target it is sampled at most once
+    per walk, not once per probe."""
+    global _walking_probes
+    if _walking_probes or not _same_set(observer, target):
+        return False
+    probes = _live_probes(observer)
+    if not probes:
+        return False
+    if apply_concealment and concealment is None:
+        concealment = concealment_at(target)
+    oset = observer.GetContainingSet()
+    _walking_probes = True
+    try:
+        for probe in probes:
+            if (implements(probe, "GetContainingSet")
+                    and probe.GetContainingSet() is oset
+                    and can_detect(probe, target,
+                                   apply_concealment=apply_concealment,
+                                   concealment=concealment)):
+                return True
+        return False
+    finally:
+        _walking_probes = False
+
+
+def _probe_in_reach(observer, target) -> bool:
+    """`in_reach` through a probe: a live same-set probe whose own reach
+    (unshrunk range, ignoring the hide gates) covers the target."""
+    global _walking_probes
+    if _walking_probes or not _same_set(observer, target):
+        return False
+    probes = _live_probes(observer)
+    if not probes:
+        return False
+    oset = observer.GetContainingSet()
+    _walking_probes = True
+    try:
+        for probe in probes:
+            if (implements(probe, "GetContainingSet")
+                    and probe.GetContainingSet() is oset
+                    and in_reach(probe, target)):
+                return True
+        return False
+    finally:
+        _walking_probes = False
+
+
 def in_reach(observer, target) -> bool:
     """Would *observer* reach *target* if nothing hid it? The continuity
     clock's "in reach" (sensor_contacts.is_concealed): the UNSHRUNK effective
     range -- no density sample, no latch mutation, so a ship in the dense
-    nebula core still counts -- or `_beyond_range_reach`. Ignores rock
-    occlusion and the nebula core on purpose: those are what conceal."""
+    nebula core still counts -- or `_beyond_range_reach`, or a probe's own
+    reach (`_probe_in_reach`). Ignores rock occlusion and the nebula core on
+    purpose: those are what conceal."""
     r = effective_sensor_range(observer)
     if r <= 0.0:
         return False
@@ -518,7 +633,8 @@ def in_reach(observer, target) -> bool:
     dx, dy, dz = tx - ox, ty - oy, tz - oz
     if dx * dx + dy * dy + dz * dz <= r * r:
         return True
-    return _beyond_range_reach(observer, target, is_hidden_by_cloak(target))
+    return (_beyond_range_reach(observer, target, is_hidden_by_cloak(target))
+            or _probe_in_reach(observer, target))
 
 
 def clear_undetectable_player_lock(player) -> None:

@@ -7,6 +7,9 @@ add_executable(assets_tests
     cpu/mesh_build_test.cc
     cpu/mesh_fix_parse_test.cc
     cpu/mesh_fix_apply_test.cc
+    cpu/mesh_fix_shape_edit_test.cc
+    cpu/mesh_fix_texture_test.cc
+    cpu/mesh_fix_flipbook_test.cc
     cpu/gltf_load_test.cc
     cpu/hull_source_test.cc
     cpu/model_build_test.cc
@@ -26,6 +29,7 @@ add_executable(assets_tests
     cpu/rigid_bake_test.cc
     cpu/texture_decode_test.cc
     cpu/flip_frame_test.cc
+    cpu/normal_gen_test.cc
     gpu/gl_fixture.cc
     gpu/fixture_smoke_test.cc
     gpu/mesh_upload_test.cc

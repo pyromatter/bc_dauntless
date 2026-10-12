@@ -15,6 +15,8 @@ public:
     Shader& skinned_shader() noexcept    { return *skinned_; }
     Shader& minor_shader() noexcept      { return *minor_; }
     Shader& impostor_shader() noexcept   { return *impostor_; }
+    /// opaque.frag compiled with PLANET_SURFACE: the surface-detail target planet.
+    Shader& planet_shader() noexcept     { return *planet_; }
     Shader& speck_shader() noexcept      { return *speck_; }
     Shader& rock_speck_shader() noexcept { return *rock_speck_; }
     Shader& rock_puff_shader() noexcept  { return *rock_puff_; }
@@ -44,7 +46,6 @@ public:
     Shader& starmap_shader() noexcept         { return *starmap_; }
     Shader& bridge_shader() noexcept          { return *bridge_; }
     Shader& skinned_bridge_shader() noexcept  { return *skinned_bridge_; }
-    Shader& lightmap_shader() noexcept        { return *lightmap_; }
     Shader& viewscreen_static_shader() noexcept { return *viewscreen_static_; }
     Shader& shadow_depth_shader() noexcept    { return *shadow_depth_; }
     Shader& shockwave_shader() noexcept       { return *shockwave_; }
@@ -56,6 +57,7 @@ private:
     std::unique_ptr<Shader> skinned_;
     std::unique_ptr<Shader> minor_;
     std::unique_ptr<Shader> impostor_;
+    std::unique_ptr<Shader> planet_;
     std::unique_ptr<Shader> speck_;
     std::unique_ptr<Shader> rock_speck_;
     std::unique_ptr<Shader> rock_puff_;
@@ -85,7 +87,6 @@ private:
     std::unique_ptr<Shader> starmap_;
     std::unique_ptr<Shader> bridge_;
     std::unique_ptr<Shader> skinned_bridge_;
-    std::unique_ptr<Shader> lightmap_;
     std::unique_ptr<Shader> viewscreen_static_;
     std::unique_ptr<Shader> shadow_depth_;
     std::unique_ptr<Shader> shockwave_;

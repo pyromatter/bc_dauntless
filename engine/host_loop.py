@@ -16,6 +16,7 @@ import os as _os_mod
 from engine import renderer as r
 from engine import host_io
 from engine import paths as _paths
+from engine import mods as _mods
 from engine.appc.ship_iter import (
     iter_set_objects as _iter_set_objects,
     iter_ships as _iter_ships,
@@ -30,6 +31,7 @@ import engine.missions as _missions
 from engine.ui.target_reticle import build_target_reticle
 from engine.ui.reticle_text import build_reticle_text, _ReticleCam
 from engine import manual_aim
+from engine import bridge_lighting as _bridge_lighting
 from engine.rocks import far_tier as _far_tier
 from engine.appc.windows import TacticalControlWindow
 from engine.ui.letterbox import LetterboxAnimator
@@ -2920,8 +2922,27 @@ class _PlayerControl:
                 # BC: a manual helm input overrides the current order —
                 # cancel the AI, resume from the ship's actual motion, and
                 # fall through so this same tick's input registers.
+                was_warping = getattr(player, "_insystem_warp_transit", None) is not None
                 self._cancel_player_ai(player)
                 self._sync_control_from_ship(player)
+                if was_warping:
+                    # Mark's ruling: taking the helm mid in-system-warp
+                    # resumes at FULL IMPULSE — the live max-impulse speed —
+                    # not at the zeroed velocity _end_in_system_warp (run by
+                    # ClearAI, above) just published, and not at the warp's
+                    # own cruise speed. Same source the throttle ramp's cap
+                    # uses (_get_ies → GetMaxSpeed, already derated for
+                    # damage and power). Only this path: every other
+                    # takeover keeps _sync_control_from_ship's real-velocity
+                    # resume untouched.
+                    ies = self._get_ies(player)
+                    full_impulse = ies.GetMaxSpeed() if ies is not None else 0.0
+                    if full_impulse > 0.0:
+                        fwd = player.GetWorldRotation().GetCol(1)
+                        self._current_speed = full_impulse
+                        player.SetVelocity(TGPoint3(fwd.x * full_impulse,
+                                                     fwd.y * full_impulse,
+                                                     fwd.z * full_impulse))
                 self._ai_owned = False
             else:
                 # AI owns ship motion — skip the entire ship-motion path
@@ -3508,6 +3529,56 @@ def _register_ai_inspector(registry):
     registry.register(panel)
     dev_mode.register_dev_pause_menu_entry("AI Inspector…", panel.open)
     return panel
+
+
+def _register_bridge_emitters(registry, bridge_camera, controller, view_mode,
+                              runtime=None, alert_provider=None):
+    """Developer-only Bridge Editor (docs/superpowers/specs/2026-10-08-bridge-emitters-spike-design.md §4): a pause-menu row and a panel that joins
+    the modal blockers. Returns _NULL_PICKER without --developer.
+
+    `runtime` is the production BridgeRuntime (engine.bridge_editor.runtime) --
+    the panel re-pushes the live document through it after every edit
+    (material edit/clear, light add/remove/place/aim/field, undo, revert),
+    so the result is visible the same frame the bridge still draws while the
+    editor is paused."""
+    if not dev_mode.is_enabled():
+        return _NULL_PICKER
+    from engine.ui.bridge_emitters_panel import BridgeEmittersPanel
+    panel = BridgeEmittersPanel(
+        pose_provider=bridge_camera.compute_camera,
+        instance_provider=lambda: controller.bridge_instance,
+        in_bridge_provider=lambda: bool(view_mode.is_bridge),
+        runtime=runtime, alert_provider=alert_provider)
+    registry.register(panel)
+    dev_mode.register_dev_pause_menu_entry("Bridge Editor…", panel.open)
+    return panel
+
+
+def _bridge_effective_alert(player_level, editor):
+    """The alert level the bridge draws: the Bridge Editor's preview tab
+    while it is open (spec 2026-10-08-bridge-emitters §12.2), else the
+    player's. `editor` may be _NULL_PICKER (no preview methods)."""
+    fn = getattr(editor, "preview_alert", None)
+    preview = fn() if fn is not None else None
+    return player_level if preview is None else preview
+
+
+def _bridge_clock_dt(editor, player_dt, frame_dt):
+    """The bridge clock's dt (§11.3, §12.2): the editor's preview clock while
+    it is open, else the paused-aware player dt."""
+    fn = getattr(editor, "preview_dt", None)
+    return player_dt if fn is None else fn(player_dt, frame_dt)
+
+
+def _bridge_camera_pose(editor, bridge_camera, shake):
+    """The bridge camera to draw: the editor's fly camera while it has one
+    (unshaken -- you are aiming at shapes), else the captain camera shaken."""
+    pose = getattr(editor, "camera_pose", lambda: None)()
+    if pose is not None:
+        return pose
+    eye, target, up, fov = bridge_camera.compute_camera()
+    eye, target, up = shake(eye, target, up)
+    return eye, target, up, fov
 
 
 def _any_blocker_open(blockers) -> bool:
@@ -4367,6 +4438,7 @@ def _reset_timers(keep=None) -> None:
     # matching skip-candidate registry so Backspace can't "skip" stale actions
     # from the prior mission.
     from engine.appc import actions as _appc_actions
+    _appc_actions.reset_launched_sequences(keep)
     if keep is None:
         _appc_actions.reset_deferred_playing()
     else:
@@ -4479,6 +4551,8 @@ def _reset_sensor_state() -> None:
         _nebula_wake.reset()
     if _radiation_driver is not None:
         _radiation_driver.reset()
+    if _crew_hazard_prompts is not None:
+        _crew_hazard_prompts.reset()
     # The native pass keeps its old far-field table across a mission swap --
     # mark our latch UNKNOWN (not None) so the next _push_system_nebula call
     # is forced to either clear it (unmapped/gate-closed) or rebuild it fresh
@@ -4793,6 +4867,7 @@ _warp_hidden = False
 _nebula_tracker = None  # NebulaTracker | None
 _nebula_thunder = None  # NebulaThunderDriver | None
 _radiation_driver = None  # RadiationDriver | None
+_crew_hazard_prompts = None  # CrewHazardPrompts | None
 # Sentinel meaning "native pass state is unknown" -- distinct from None (which
 # means "we know the native pass holds nothing, e.g. after we pushed a clear").
 # Used by _reset_sensor_state on mission swap: the native SystemNebulaPass
@@ -5319,6 +5394,22 @@ def _load_planet_model(r_, nif_path: str, *, cache=None,
     return handle, extent, sphere_radius
 
 
+def _apply_planet_surface(r_, iid, set_name: str, obj_name: str,
+                          nif_path: str, source: str = "set") -> None:
+    """Push this planet instance's surface-detail decision (planet-surface-detail
+    spec §7). Called from _apply_planet_atmosphere so all three realize paths
+    get it; resolved at USE so a toggle flip or catalogue reload applies to
+    planets realized after."""
+    from engine import planet_surface as _planet_surface
+    from engine.planets import surface as _surface
+    if not _planet_surface.enabled():
+        r_.set_instance_surface(iid, None)
+        return
+    r_.set_instance_surface(iid, _surface.to_binding(
+        _surface.resolve_surface(set_name, obj_name, nif_path)))
+    _surface.record_live(iid, set_name, obj_name, nif_path, source=source)
+
+
 def _apply_planet_atmosphere(r_, iid, set_name: str, obj_name: str,
                              nif_path: str, source: str = "set") -> None:
     """Push this planet instance's atmosphere decision -- always called,
@@ -5330,6 +5421,7 @@ def _apply_planet_atmosphere(r_, iid, set_name: str, obj_name: str,
     Read at USE: engine.planet_atmosphere's toggle and the catalogue
     (engine.planets.atmosphere) both resolve now, not at import, so a dev
     toggle flip or a catalogue reload applies to planets realized after."""
+    _apply_planet_surface(r_, iid, set_name, obj_name, nif_path, source=source)
     from engine import planet_atmosphere as _planet_atmosphere
     from engine.planets import atmosphere as _atmosphere
     if not _planet_atmosphere.enabled():
@@ -5351,14 +5443,18 @@ def _iid_eq(a, b) -> bool:
     return _atmosphere.iid_eq(a, b)
 
 
-def _nearest_live_planet(session):
-    """The `atmosphere.live()` entry whose planet is nearest the player, by
-    SURFACE distance (|p_player - centre| - radius), not centre distance --
-    the atmosphere dial group's target (planet-atmosphere spec §7). None if
-    there is no player, no viewed frame, or nothing resolves. Airless
-    entries (resolve() is None) are skipped."""
+def _nearest_live_entry(session, entries, is_valid):
+    """The entry in `entries` (an atmosphere.LivePlanet / surface.LiveSurface
+    sequence) nearest the player, by SURFACE distance (|p_player - centre| -
+    radius), not centre distance -- shared by `_nearest_live_planet` and
+    `_nearest_live_surface_planet` (the atmosphere and "surface" dial
+    groups' targets, planet-atmosphere spec §7 / planet-surface-detail spec
+    §7). None if there is no player, no viewed frame, or nothing resolves.
+    `is_valid(entry)` filters out entries with nothing to tune (airless /
+    no-detail) -- kept in the registry (reload re-pushes them) but never a
+    dial target, so e.g. an airless moon nearer than its atmospheric parent
+    can't capture the dials."""
     from engine.appc import sensor_contacts as _sensor_contacts
-    from engine.planets import atmosphere as _atmosphere
 
     player = _sensor_contacts.current_player()
     if player is None:
@@ -5371,11 +5467,8 @@ def _nearest_live_planet(session):
 
     best = None
     best_dist = None
-    for entry in _atmosphere.live():
-        # Airless entries stay in the registry (reload re-pushes them) but
-        # are never a dial target: an airless moon nearer than its
-        # atmospheric parent would otherwise capture the dials.
-        if _atmosphere.resolve(entry.set_name, entry.obj_name, entry.nif_path) is None:
+    for entry in entries:
+        if not is_valid(entry):
             continue
         centre = None
         radius = None
@@ -5402,6 +5495,31 @@ def _nearest_live_planet(session):
             best_dist = dist
             best = entry
     return best
+
+
+def _nearest_live_planet(session):
+    """The `atmosphere.live()` entry whose planet is nearest the player, by
+    surface distance -- the atmosphere dial group's target (planet-atmosphere
+    spec §7). Airless entries (resolve() is None) are skipped."""
+    from engine.planets import atmosphere as _atmosphere
+
+    def _has_atmosphere(entry):
+        return _atmosphere.resolve(entry.set_name, entry.obj_name, entry.nif_path) is not None
+
+    return _nearest_live_entry(session, _atmosphere.live(), _has_atmosphere)
+
+
+def _nearest_live_surface_planet(session):
+    """The `surface.live()` entry whose planet is nearest the player, by
+    surface distance -- the "surface" dial group's catalogue-field target
+    (planet-surface-detail spec §7). No-detail entries (resolve_surface() is
+    None) are skipped."""
+    from engine.planets import surface as _surface
+
+    def _has_surface(entry):
+        return _surface.resolve_surface(entry.set_name, entry.obj_name, entry.nif_path) is not None
+
+    return _nearest_live_entry(session, _surface.live(), _has_surface)
 
 
 def _ship_stats(ship, *, verbose: bool = False) -> Optional[dict]:
@@ -6113,6 +6231,7 @@ class MissionSession:
 
     def teardown(self, renderer) -> None:
         from engine.planets import atmosphere as _atmosphere
+        from engine.planets import surface as _surface
         for iid in list(self.ship_instances.values()):
             renderer.destroy_instance(iid)
         for iid in list(self.planet_instances.values()):
@@ -6120,6 +6239,7 @@ class MissionSession:
         for iid in list(self.celestial_instances.values()):
             renderer.destroy_instance(iid)
         _atmosphere.clear_live()
+        _surface.clear_live()
         self.celestial_instances.clear()
         self.celestial_placed.clear()
         self.celestial_scale.clear()
@@ -6413,11 +6533,13 @@ def teardown_set_objects(session, pSet, renderer) -> None:
             # re-bind guard so a re-realized object binds afresh.
             session.slot_bindings.pop(ship, None)
     from engine.planets import atmosphere as _atmosphere
+    from engine.planets import surface as _surface
     for planet in list(_iter_planets_in_set(pSet)):
         iid = session.planet_instances.pop(planet, None)
         if iid is not None:
             renderer.destroy_instance(iid)
             _atmosphere.forget_live(iid)
+            _surface.forget_live(iid)
             session.planet_natural_scale.pop(planet, None)
             session.slot_bindings.pop(planet, None)
     # clear_live_for_set, NOT clear_live: the warp spine realizes the
@@ -6427,6 +6549,7 @@ def teardown_set_objects(session, pSet, renderer) -> None:
     # Set-realized entries only: this region's celestial map bodies are
     # still drawn and forget themselves in _reconcile_celestial_instances.
     _atmosphere.clear_live_for_set(pSet.GetName())
+    _surface.clear_live_for_set(pSet.GetName())
 
 
 def _ensure_system_loaded(session) -> None:
@@ -6748,12 +6871,14 @@ def _reconcile_celestial_instances(session, renderer, *, nif_cache=None,
     instances = session.celestial_instances
     want = {b.key for b in drawn}
     from engine.planets import atmosphere as _atmosphere
+    from engine.planets import surface as _surface
     for key in [k for k in placed if k not in want]:
         session.celestial_scale.pop(key, None)
         iid = instances.pop(key, None)
         if iid is not None:
             renderer.destroy_instance(iid)
             _atmosphere.forget_live(iid)
+            _surface.forget_live(iid)
     new_placed = {}
     for body in drawn:
         new_placed[body.key] = body
@@ -6979,6 +7104,12 @@ class HostController:
         self.session: Optional[MissionSession] = None
         self.pending_swap: Optional[str] = None
         self.bridge_instance: Optional[Any] = None  # InstanceId; set by realize_set
+        # Pushes the per-bridge lighting document (materials, spots, probe
+        # origin/scales) to the renderer on every bridge load. Set by run()
+        # before the first mission load; realize_set calls attach/detach on
+        # it as bridge_instance is set/cleared. None in bare-controller tests
+        # that construct realize_set's fakes directly (guarded with getattr).
+        self.bridge_runtime: Any = None
         self.viewscreen_instance: Optional[Any] = None  # InstanceId; set by realize_set
         self.viewscreen_obj: Optional[Any] = None  # set by realize_set
         # NIF path currently bound to bridge_instance. Set by
@@ -7903,6 +8034,13 @@ def _update_ui_for_tick(player, view_mode, session, active_set) -> None:
     return
 
 
+def _bridge_overlay_dirs(tex_rel) -> list:
+    """The replacements-overlay dirs holding project-authored PBR maps for a
+    stock bridge's textures (spec 2026-10-08-bridge-emitters §9.2). Resolved
+    at use; [] when the overlay has nothing there."""
+    return [str(d) for d in _mods.replacements().dirs_for(tex_rel)]
+
+
 def realize_set(controller, r, set_obj, *, is_bridge: bool,
                 comm_set_id: int = None) -> None:
     """Realize any SDK set's renderable content into the renderer.
@@ -7942,6 +8080,9 @@ def realize_set(controller, r, set_obj, *, is_bridge: bool,
             except Exception as _e:
                 dev_mode.log_swallowed("destroy bridge instance", _e)
             controller.bridge_instance = None
+            _bridge_runtime = getattr(controller, "bridge_runtime", None)
+            if _bridge_runtime is not None:
+                _bridge_runtime.detach()
         elif not is_bridge:
             # Mission swap re-realizes this comm set against a fresh SetClass
             # carrier (reset_sdk_globals cleared g_kSetManager._sets), so this
@@ -7966,23 +8107,24 @@ def realize_set(controller, r, set_obj, *, is_bridge: bool,
         nif_abs = str(_paths.game_asset(nif))
         env = _App.g_kModelManager.env_for(nif)
         if env:
-            tex_abs = [str(p) for p in _paths.game_asset_dirs(env)]
+            tex_rel = env
         else:
             # No LoadModel-recorded env — comm sets declare geometry via
             # SetBackgroundModel, not LoadModel, so env_for is None. Set
             # textures live in <model_dir>/High by BC convention; use that
             # rather than the DBridge fallback (which holds only DBridge's tgas).
             import posixpath as _pp
-            tex_abs = [str(p) for p in
-                       _paths.game_asset_dirs(_pp.dirname(nif) + "/High")]
+            tex_rel = _pp.dirname(nif) + "/High"
+        tex_abs = [str(p) for p in _paths.game_asset_dirs(tex_rel)]
         if is_bridge:
-            handle = r.load_model(nif_abs, tex_abs)
+            handle = r.load_model(nif_abs, tex_abs, interior=True,
+                                  sibling_overlay_dirs=_bridge_overlay_dirs(tex_rel))
             iid = r.create_bridge_instance(handle)
         else:
             # A comm/remote set is non-critical: if its NIF or a texture fails
             # to load, log and skip so one bad set can't abort the whole mission.
             try:
-                handle = r.load_model(nif_abs, tex_abs)
+                handle = r.load_model(nif_abs, tex_abs, interior=True)
             except Exception as _e:
                 dev_mode.log_swallowed("comm set load_model %r" % set_name, _e)
                 handle = None
@@ -7995,6 +8137,9 @@ def realize_set(controller, r, set_obj, *, is_bridge: bool,
             if is_bridge:
                 controller.bridge_instance = iid
                 controller.current_bridge_nif_abs = nif_abs
+                _bridge_runtime = getattr(controller, "bridge_runtime", None)
+                if _bridge_runtime is not None:
+                    _bridge_runtime.attach(iid)
             else:
                 controller.comm_instances_by_set.setdefault(set_name, []).append(iid)
                 _tag_comm_instance(r, iid, comm_set_id)
@@ -8014,7 +8159,7 @@ def realize_set(controller, r, set_obj, *, is_bridge: bool,
             vs_env = _App.g_kModelManager.env_for(vs.nif)
             vs_tex = ([str(p) for p in _paths.game_asset_dirs(vs_env)] if vs_env
                       else [str(p) for p in _paths.game_asset_dirs(DBRIDGE_TEX_REL)])
-            vs_handle = r.load_model(vs_nif_abs, vs_tex)
+            vs_handle = r.load_model(vs_nif_abs, vs_tex, interior=True)
             vs_iid = r.create_bridge_instance(vs_handle)
             r.set_world_transform(vs_iid, IDENTITY_MAT4)
             vs.render_instance = vs_iid
@@ -10098,6 +10243,35 @@ def run(mission_name: Optional[str] = None,
         bridge_camera  = _BridgeCamera()
         _last_engaged_char = [None]   # last officer we zoomed to (for disengage)
 
+        # Bridge PBR runtime (engine.bridge_editor.runtime, spec
+        # 2026-10-09-bridge-pbr §7, §9): pushes the per-bridge lighting
+        # document's material overrides and spot lights to the renderer on
+        # every bridge load (realize_set calls attach/detach on it as
+        # controller.bridge_instance is set/cleared), and re-pushes spots on
+        # an alert change below. Must exist before _after_mission_loaded()
+        # runs, since that can realize a bridge on the very first call.
+        from engine.bridge_editor.runtime import BridgeRuntime
+
+        def _bridge_alert_level_of(_player):
+            # The bridge STATE (spec 2026-10-08-bridge-emitters §13.1): offline
+            # while the power plant is down, special via the hook, else the
+            # alert level. Guarded inside bridge_state_of.
+            return _bridge_lighting.bridge_state_of(_player)
+
+        def _bridge_runtime_alert_level():
+            # Zero-arg form for BridgeRuntime itself (attach() can fire from
+            # realize_set during mission load, outside the per-frame block
+            # below where `player` is already in scope).
+            sess = controller.session
+            return _bridge_alert_level_of(sess.player if sess is not None else None)
+
+        controller.bridge_runtime = BridgeRuntime(
+            eye=lambda: _BRIDGE_CAMERA_EYE, alert=_bridge_runtime_alert_level)
+        # Green <-> yellow/red reflection-probe cross-fade (bridge_lighting.
+        # ProbeBlend); fed the paused-aware player dt each frame below.
+        _bridge_probe_blend = _bridge_lighting.ProbeBlend()
+        _bridge_probe_alert_last = [None]   # mutable box: last frame's level
+
         _after_mission_loaded()
         try:
             import _dauntless_host as _h
@@ -10140,6 +10314,19 @@ def run(mission_name: Optional[str] = None,
                 _atmo_dials.set_push_fn(
                     lambda iid, a: r.set_instance_atmosphere(iid, a))
                 _atmo_dials.register()
+                from engine.planets import surface as _surface_catalogue
+                from engine.planets import surface_dials as _surface_dials
+                _surface_dials.set_target_fn(
+                    lambda: _nearest_live_surface_planet(controller.session)
+                    if controller.session is not None else None)
+                _surface_dials.set_push_fn(
+                    lambda iid, s: r.set_instance_surface(
+                        iid, _surface_catalogue.to_binding(s)))
+                _surface_dials.set_target_type_fn(r.planet_detail_target_type)
+                _surface_dials.set_type_params_fns(
+                    r.get_surface_type_params, r.set_surface_type_params)
+                _surface_dials.set_budget_fn(r.set_planet_detail_budget)
+                _surface_dials.register()
             _picker_registry_cache: list = [None]
             def _get_mission_registry():
                 if _picker_registry_cache[0] is None:
@@ -10215,6 +10402,10 @@ def run(mission_name: Optional[str] = None,
         from engine.ui.panel_registry import PanelRegistry
         registry = PanelRegistry()
         ai_inspector = _register_ai_inspector(registry)
+        bridge_emitters = _register_bridge_emitters(registry, bridge_camera,
+                                                    controller, view_mode,
+                                                    controller.bridge_runtime,
+                                                    alert_provider=_bridge_runtime_alert_level)
 
         # Keyboard capture for CEF text fields: while one has focus the native
         # KeyGate makes every key read up. Registered as panel "kbd" so the
@@ -10262,6 +10453,8 @@ def run(mission_name: Optional[str] = None,
             # set_msaa_samples, and that fan-out lives in the SETTINGS table.
             set_aa_mode=lambda mode: _settings.apply_setting(
                 _settings_ctx, "aa_mode", mode),
+            set_bridge_quality=lambda q: _settings.apply_setting(
+                _settings_ctx, "bridge_quality", q),
             max_msaa_samples=r.max_msaa_samples(),
             set_subtitles=_crew_speech.set_subtitles_enabled,
             set_disable_annoying_dialogue=_crew_speech.set_annoying_dialogue_disabled,
@@ -10567,6 +10760,7 @@ def run(mission_name: Optional[str] = None,
         # (the Picard tutorial box), which stays inert to ESC as before.
         _modal_blockers = [mission_picker, developer_options_panel,
                            ship_property_viewer, ai_inspector,
+                           bridge_emitters,
                            configuration_panel, star_map_panel,
                            quick_battle_setup_panel, info_box_panel]
 
@@ -11005,7 +11199,11 @@ def run(mission_name: Optional[str] = None,
             # world so the overlay under inspection holds still).
             pause.set_external_freeze(_devtools_frozen(_h))
             _now = time.monotonic()
-            _frame_dt = _now - _previous_real_time
+            # The raw wall delta, kept apart from _frame_dt (which the freeze
+            # zeroes): the Bridge Editor's preview clock runs while the
+            # (hidden) pause menu freezes the sim (spec 2026-10-08-bridge-emitters §12.2).
+            _wall_dt = _now - _previous_real_time
+            _frame_dt = _wall_dt
             _previous_real_time = _now
             if pause.sim_frozen:
                 _frame_dt = 0.0
@@ -11298,6 +11496,17 @@ def run(mission_name: Optional[str] = None,
                     import App  # deferred: matches host-loop convention
                     from engine.appc import sensor_contacts
                     sensor_contacts.tick(player, App.g_kUtopiaModule.GetGameTime())
+
+                # Crew "raise shields" prompts in asteroids / radiation
+                # (engine/appc/crew_hazard_prompts.py). Sim-gated like the
+                # contact manager above; polls at 1 Hz on game time.
+                if player is not None:
+                    global _crew_hazard_prompts
+                    if _crew_hazard_prompts is None:
+                        from engine.appc.crew_hazard_prompts import CrewHazardPrompts
+                        _crew_hazard_prompts = CrewHazardPrompts()
+                    _crew_hazard_prompts.update(
+                        player, App.g_kUtopiaModule.GetGameTime())
 
                 # Nebula membership → enter/exit events, environmental
                 # damage, sensor scaling. Sim dt (TICK_DT); gated by the
@@ -11812,13 +12021,16 @@ def run(mission_name: Optional[str] = None,
                                 _owner, now=_App.g_kUtopiaModule.GetGameTime(),
                                 state=_tooltip_dispatch_state)
                         bridge_camera.apply(mouse_dx, mouse_dy)
-                    b_eye, b_target, b_up, b_fov = bridge_camera.compute_camera()
                     # Bridge first-person camera uses separate (eye, target,
                     # up) vectors from the exterior view, so it needs its own
                     # perturb call. The camera_shake module is global state,
                     # so the shake energy / phase is shared with the
-                    # exterior perturb above.
-                    b_eye, b_target, b_up = camera_shake.perturb(b_eye, b_target, b_up)
+                    # exterior perturb above. While the Bridge Editor
+                    # editor has a fly pose, it takes over the bridge camera
+                    # unshaken -- you are aiming at shapes, not flying the
+                    # ship.
+                    b_eye, b_target, b_up, b_fov = _bridge_camera_pose(
+                        bridge_emitters, bridge_camera, camera_shake.perturb)
                     r.set_bridge_camera(
                         eye=b_eye, target=b_target, up=b_up,
                         fov_y_rad=b_fov,
@@ -12194,22 +12406,39 @@ def run(mission_name: Optional[str] = None,
             r.set_lighting(ambient, directionals)
 
             bridge_ambient, bridge_directionals = _aggregate_bridge_lights()
-            # Red-alert dim: bridge INTERIOR ambient scales to 50% when the
-            # player ship is at red alert. Matches BC's red-alert bridge
-            # lighting (dimmer overall while the red emergency strip lights
-            # pulse — that pulse is deferred work). Sent as a separate scale
-            # (not baked into the ambient) so the comm-set viewscreen feed —
-            # the other ship's room — keeps constant brightness across alert
-            # levels.
-            _bridge_dim = 1.0
-            if player is not None:
-                try:
-                    if player.GetAlertLevel() == 2:  # ShipClass.RED_ALERT
-                        _bridge_dim = 0.5
-                except Exception as _e:
-                    dev_mode.log_swallowed("red-alert bridge-dim probe", _e)
-            r.set_bridge_ambient_scale(_bridge_dim)
+            # Alert-level bridge brightness (engine.bridge_lighting): sent as a
+            # separate scale, not baked into the ambient, so the comm-set
+            # viewscreen feed — another ship's room — keeps constant brightness.
+            # The Bridge Editor's state tab previews an alert (spec §12.2).
+            _bridge_preview = getattr(bridge_emitters, "preview_alert", lambda: None)()
+            # The bridge's own room light wins (a bridge with lights defaults
+            # to 0, Mark 2026-10-12); else the per-state default.
+            _bridge_rt = getattr(controller, "bridge_runtime", None)
+            r.set_bridge_ambient_scale(_bridge_lighting.bridge_ambient_scale(
+                player, _bridge_preview,
+                _bridge_rt.ambient_scale if _bridge_rt is not None else None))
             r.set_bridge_lighting(bridge_ambient, bridge_directionals)
+            # Bridge PBR reflection-probe cross-fade (spec
+            # 2026-10-09-bridge-pbr §6.3, §9.4): green <-> yellow/red over
+            # ProbeBlend's fade_s, frozen under pause (_player_dt is the
+            # paused-aware dt). The probes themselves are only ever
+            # recaptured on load/edit/alert change (BridgeRuntime), never
+            # per frame — this just blends between the two existing captures.
+            _bridge_alert_level = _bridge_effective_alert(
+                _bridge_alert_level_of(player), bridge_emitters)
+            _bridge_dt = _bridge_clock_dt(
+                bridge_emitters, _player_dt, min(max(_wall_dt, 0.0), MAX_FRAME_DT))
+            # Emissive sibling maps: the alert-level variant (task 17), every
+            # frame, beside the ambient scale (a hard switch, no fade).
+            host_io.set_bridge_alert_level(_bridge_alert_level)
+            host_io.set_bridge_probe_mix(
+                _bridge_probe_blend.update(_bridge_alert_level, _bridge_dt))
+            if _bridge_alert_level != _bridge_probe_alert_last[0]:
+                _bridge_probe_alert_last[0] = _bridge_alert_level
+                controller.bridge_runtime.on_alert(_bridge_alert_level)
+            # Emitter profiles (spec 2026-10-08-bridge-emitters §11.3): pulses
+            # and alert fades on the bridge clock, frozen under pause.
+            controller.bridge_runtime.tick(_bridge_dt)
             # BC's NiFlipController observes *game time*, not wall time
             # — controllers advance with g_kTimerManager (which the
             # original engine scaled, instrumentation Q3). Feeding wall

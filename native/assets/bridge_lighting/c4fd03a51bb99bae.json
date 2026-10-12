@@ -1,0 +1,137 @@
+{
+  "format": 2,
+  "materials": {
+    "LCarsSchematicRight": {
+      "roughness": 0,
+      "texture": "lcarsschematicright.tga"
+    },
+    "ceilingwhite": {
+      "roughness": 0,
+      "texture": "ceilingwhite.tga"
+    },
+    "chair": {
+      "metalness": 1,
+      "roughness": 0.06,
+      "texture": "chair.tga"
+    },
+    "chair 2": {
+      "metalness": 1,
+      "roughness": 0.02,
+      "texture": "chair.tga"
+    },
+    "consoletopview": {
+      "roughness": 0,
+      "texture": "consoletopview.tga"
+    },
+    "lcarsschematicleft": {
+      "roughness": 0,
+      "texture": "lcarsschematicleft.tga"
+    },
+    "newcomp": {
+      "metalness": 1,
+      "roughness": 0,
+      "texture": "newcomp.tga"
+    },
+    "newcomp 2": {
+      "metalness": 0.89,
+      "roughness": 0,
+      "texture": "newcomp.tga"
+    },
+    "newcomp 3": {
+      "metalness": 1,
+      "roughness": 0.04,
+      "texture": "newcomp.tga"
+    },
+    "newcomp 4": {
+      "metalness": 1,
+      "roughness": 0.17,
+      "texture": "newcomp.tga"
+    },
+    "newcomp 5": {
+      "metalness": 1,
+      "roughness": 0.08,
+      "texture": "newcomp.tga"
+    },
+    "newcomp 6": {
+      "metalness": 0.93,
+      "roughness": 0,
+      "texture": "newcomp.tga"
+    },
+    "roofcovelight": {
+      "roughness": 0.02,
+      "texture": "roofcovelight.tga"
+    },
+    "walllcarspanel": {
+      "roughness": 0.14,
+      "texture": "walllcarspanel.tga"
+    },
+    "walllcarspanel 2": {
+      "roughness": 0,
+      "texture": "walllcarspanel.tga"
+    },
+    "walllight": {
+      "metalness": 1,
+      "roughness": 0.14,
+      "texture": "walllight.tga"
+    },
+    "walllight 2": {
+      "metalness": 1,
+      "roughness": 0.08,
+      "texture": "walllight.tga"
+    }
+  },
+  "objects": {
+    "29:walllight 01 Material: Wall Light": {
+      "block": 29,
+      "material": "walllight 2",
+      "name": "walllight 01 Material: Wall Light"
+    },
+    "341:Material: e chairs": {
+      "block": 341,
+      "material": "chair 2",
+      "name": "Material: e chairs"
+    },
+    "359:Material: door center1": {
+      "block": 359,
+      "material": "newcomp 2",
+      "name": "Material: door center1"
+    },
+    "403:Material: door center1": {
+      "block": 403,
+      "material": "newcomp 3",
+      "name": "Material: door center1"
+    },
+    "476:Material: door center1": {
+      "block": 476,
+      "material": "newcomp 4",
+      "name": "Material: door center1"
+    },
+    "487:Material: door center": {
+      "block": 487,
+      "material": "newcomp 5",
+      "name": "Material: door center"
+    },
+    "513:Material: door center1": {
+      "block": 513,
+      "material": "newcomp 6",
+      "name": "Material: door center1"
+    },
+    "68:Material: Material #38": {
+      "block": 68,
+      "material": "walllcarspanel 2",
+      "name": "Material: Material #38"
+    }
+  },
+  "source": "/Users/mward/Documents/Star Trek Bridge Commander/game/data/Models/Sets/EBridge/EBridge.nif",
+  "textures": {
+    "ceilingwhite.tga": "ceilingwhite",
+    "chair.tga": "chair",
+    "consoletopview.tga": "consoletopview",
+    "lcarsschematicleft.tga": "lcarsschematicleft",
+    "lcarsschematicright.tga": "LCarsSchematicRight",
+    "newcomp.tga": "newcomp",
+    "roofcovelight.tga": "roofcovelight",
+    "walllcarspanel.tga": "walllcarspanel",
+    "walllight.tga": "walllight"
+  }
+}

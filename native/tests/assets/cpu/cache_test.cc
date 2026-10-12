@@ -30,6 +30,12 @@ fs::path dauntless_tga_path() {
 fs::path venture_tga_path() {
     return test_support::game_root() / "data/Models/SharedTextures/FedShips/High/Venture.tga";
 }
+fs::path dbridge_path() {
+    return test_support::game_root() / "data/Models/Sets/DBridge/Dbridge.NIF";
+}
+fs::path dbridge_tex_path() {
+    return test_support::game_root() / "data/Models/Sets/DBridge/High";
+}
 bool game_data_present() {
     return fs::exists(galaxy_path());
 }
@@ -95,6 +101,53 @@ TEST(AssetCacheTest, RegistryReplacementProducesDistinctVariant) {
 
     EXPECT_NE(plain.get(), variant.get());
     EXPECT_EQ(variant->textures.size(), plain->textures.size() + 1);
+}
+
+// interior load flag: a distinct cached variant, same shape as geosphere.
+TEST(AssetCacheTest, InteriorLoadIsADistinctCachedVariant) {
+    if (!game_data_present()) GTEST_SKIP() << "game/ not installed";
+    if (!fs::exists(dbridge_path())) GTEST_SKIP() << "DBridge not installed";
+
+    assets::AssetCache cache(stub_config());
+    auto plain    = cache.load(dbridge_path(), {dbridge_tex_path()}, {}, {}, 1.0f, false);
+    auto interior = cache.load(dbridge_path(), {dbridge_tex_path()}, {}, {}, 1.0f, false, true);
+    auto again    = cache.load(dbridge_path(), {dbridge_tex_path()}, {}, {}, 1.0f, false, true);
+    EXPECT_NE(plain.get(), interior.get());
+    EXPECT_EQ(interior.get(), again.get());
+}
+
+// Bridge-editor shape identity (spec 2026-10-08-bridge-emitters §4): an
+// interior load carries the NIF's content hash -- the SAME fnv1a64 of the raw
+// file bytes the mesh-fix lookup uses -- and every other load leaves it empty.
+TEST(AssetCacheTest, InteriorLoadCarriesTheNifContentHash) {
+    if (!game_data_present()) GTEST_SKIP() << "game/ not installed";
+    if (!fs::exists(dbridge_path())) GTEST_SKIP() << "DBridge not installed";
+
+    assets::AssetCache cache(stub_config());
+    auto plain    = cache.load(dbridge_path(), {dbridge_tex_path()}, {}, {}, 1.0f, false);
+    auto interior = cache.load(dbridge_path(), {dbridge_tex_path()}, {}, {}, 1.0f, false, true);
+
+    std::ifstream in(dbridge_path(), std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    EXPECT_EQ(interior->content_hash, assets::fnv1a64_hex(ss.str()));
+    EXPECT_EQ(interior->content_hash.size(), 16u);
+    EXPECT_TRUE(plain->content_hash.empty());
+}
+
+// The sibling-overlay directory list (spec 2026-10-09-bridge-pbr §9.2/§9.3)
+// is folded into the cache key like scale/geosphere/interior: two interior
+// loads of the same NIF that differ only in sibling_overlay_dirs must be
+// distinct cached entries.
+TEST(AssetCacheTest, OverlayDirsAreAPartOfTheInteriorCacheKey) {
+    if (!game_data_present()) GTEST_SKIP() << "game/ not installed";
+    if (!fs::exists(dbridge_path())) GTEST_SKIP() << "DBridge not installed";
+
+    assets::AssetCache cache(stub_config());
+    auto a = cache.load(dbridge_path(), {dbridge_tex_path()}, {}, {}, 1.0f, false, true, {});
+    auto b = cache.load(dbridge_path(), {dbridge_tex_path()}, {}, {}, 1.0f, false, true,
+                        {fs::temp_directory_path()});
+    EXPECT_NE(a.get(), b.get());
 }
 
 // Regression: BC's ReplaceTexture path OMITS the LOD subdir
@@ -290,13 +343,13 @@ TEST(AssetCacheMeshFix, EveryCommittedFixApplies) {
     for (const auto& entry : fs::directory_iterator(fixes))
         if (entry.path().extension() == ".json") fix_files.push_back(entry.path());
     std::sort(fix_files.begin(), fix_files.end());
-    ASSERT_EQ(fix_files.size(), 5u) << "expected exactly 5 committed mesh fixes (High LOD only)";
 
     auto cfg = stub_config();
     assets::AssetCache plain(cfg);
     cfg.mesh_fix_dir = [fixes] { return fixes; };
     assets::AssetCache fixed(cfg);
 
+    std::size_t merge_fixes = 0;
     for (const auto& fix_path : fix_files) {
         SCOPED_TRACE(fix_path.string());
         const auto text = file_bytes(fix_path);
@@ -318,11 +371,14 @@ TEST(AssetCacheMeshFix, EveryCommittedFixApplies) {
         ASSERT_TRUE(fix.has_value()) << "parse failed: " << parse_error;
         EXPECT_EQ(assets::apply_mesh_fix(file, *fix), "")
             << "committed fix was refused";
+        if (!fix->merges.empty()) ++merge_fixes;
 
         std::vector<fs::path> search{nif_path.parent_path() / "High", fed_high_path()};
         auto a = plain.load(nif_path, search);
         auto b = fixed.load(nif_path, search);
-        EXPECT_EQ(b->meshes.size() + 1, a->meshes.size())
-            << "fixed model should have exactly one fewer mesh (the hidden patch)";
+        const std::size_t hidden = fix->merges.size();   // one hidden patch per merge
+        EXPECT_EQ(b->meshes.size() + hidden, a->meshes.size())
+            << "fixed model should lose exactly one mesh per merge (the hidden patch)";
     }
+    EXPECT_EQ(merge_fixes, 5u) << "expected exactly 5 committed hull merge fixes (High LOD only)";
 }

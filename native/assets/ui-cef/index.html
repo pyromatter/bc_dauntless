@@ -15,6 +15,7 @@
     <link rel="stylesheet" href="css/quick_battle_setup.css">
     <link rel="stylesheet" href="css/ship_property_viewer.css">
     <link rel="stylesheet" href="css/ai_inspector.css">
+    <link rel="stylesheet" href="css/bridge_emitters.css">
     <link rel="stylesheet" href="css/reticle_text.css">
     <link rel="stylesheet" href="css/info_box.css">
     <link rel="stylesheet" href="css/engineering_power.css">
@@ -173,6 +174,23 @@
         </div>
       </div>
     </section>
+
+    <!-- Bridge Editor (developer-only, spec 2026-10-08-bridge-emitters §8, §13.3).
+         setBridgeEmitters(state) drives it; actions are
+         dauntlessEvent('bridge-emitters/<action>'). The top-left bar is the
+         editor's chrome; the dock (right) shows only with a selection, so the
+         3D view stays clickable. data-panel routes text-field keyboard capture. -->
+    <div id="bridge-emitters-root" class="dev-only" data-panel="bridge-emitters">
+      <div class="be-top">
+        <div class="be-bar" id="be-bar"></div>
+        <div class="be-hint" id="be-hint"></div>
+        <div class="be-row be-hover-row"><span id="be-hover"></span><span class="be-status" id="be-status"></span></div>
+      </div>
+      <div class="be-dock cp-modal" id="be-dock">
+        <div class="cp-content"><div class="cp-body" id="bridge-emitters-body"></div></div>
+      </div>
+      <div class="be-settings" id="be-settings"></div>
+    </div>
 
     <!-- Quick Battle Setup (production — NOT dev-only). A port of the approved
          design spike (spec 2026-10-02-quickbattle-setup-screen-design §3.1).
@@ -1080,8 +1098,10 @@
     <script src="js/quick_battle_setup.js"></script>
     <script src="js/developer_options.js"></script>
     <script src="js/star_map.js"></script>
+    <script src="js/colour_wheel.js"></script>
     <script src="js/ship_property_viewer.js"></script>
     <script src="js/ai_inspector.js"></script>
+    <script src="js/bridge_emitters.js"></script>
     <script src="js/info_box.js"></script>
     <script src="js/engineering_power.js"></script>
     <script src="js/first_run.js"></script>

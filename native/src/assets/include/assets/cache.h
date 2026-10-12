@@ -116,6 +116,38 @@ public:
                      const std::vector<DecalRequest>& decals,
                      float scale, bool geosphere);
 
+    /// Load as an INTERIOR set model (bridge/comm-set geometry): when
+    /// `interior` is true, shapes authored without normals get generated ones
+    /// (spec 2026-10-08-bridge-lighting-baseline-design.md §3), via
+    /// ModelBuildContext::generate_missing_normals. `interior` is folded into
+    /// the cache key like scale/geosphere, so a plain and an interior load of
+    /// the same path are distinct cached entries; the 6-argument overload is
+    /// `interior = false`, byte-identical to today's behaviour. The glTF
+    /// branch ignores `interior` -- glTF meshes always carry normals.
+    ModelHandle load(const std::filesystem::path& nif_path,
+                     const std::vector<std::filesystem::path>& texture_search_paths,
+                     const std::vector<TextureReplacement>& texture_replacements,
+                     const std::vector<DecalRequest>& decals,
+                     float scale, bool geosphere, bool interior);
+
+    /// Load as an interior model with an explicit sibling-overlay search
+    /// list for the bridge PBR roughness/metalness/normal maps (spec
+    /// 2026-10-09-bridge-pbr §9.2/§9.3): when `interior` is true AND the
+    /// resolved albedo lives in the stock dir (the last entry of
+    /// `texture_search_paths`), a `_rough`/`_metal`/`_normal` sibling is
+    /// probed ONLY in `sibling_overlay_dirs`; otherwise ONLY beside the
+    /// albedo itself. `sibling_overlay_dirs` is folded into the cache key
+    /// like scale/geosphere/interior, so two loads differing only in it are
+    /// distinct cached entries; the 7-argument overload passes an empty
+    /// list. The glTF branch ignores it (glTF meshes have no sibling-map
+    /// convention).
+    ModelHandle load(const std::filesystem::path& nif_path,
+                     const std::vector<std::filesystem::path>& texture_search_paths,
+                     const std::vector<TextureReplacement>& texture_replacements,
+                     const std::vector<DecalRequest>& decals,
+                     float scale, bool geosphere, bool interior,
+                     const std::vector<std::filesystem::path>& sibling_overlay_dirs);
+
     /// Unpin every cached entry for `nif_path`, AT ANY SCALE. A glTF path's
     /// cache key carries a `#s=<scale>` suffix (see the 5-argument `load`
     /// overload / hull_source_string) for every scale != 1.0f, so this drops

@@ -7,10 +7,12 @@ class _FakeRenderer:
         self.created = []
         self.destroyed = []
         self.transforms = {}
+        self.interior_flags = []
         self._next = 1
 
-    def load_model(self, nif_abs, tex_abs):
+    def load_model(self, nif_abs, tex_abs, *, interior=False, sibling_overlay_dirs=None):
         self.loaded.append((nif_abs, tex_abs))
+        self.interior_flags.append(interior)
         return 100 + len(self.loaded)
 
     def create_bridge_instance(self, handle):
@@ -50,6 +52,21 @@ def test_realize_set_loads_bridge_geometry_and_tags_instance():
     assert kind == "bridge"
     assert obj.render_instance == iid
     assert c.bridge_instance == iid
+
+
+def test_realize_set_loads_set_geometry_as_interior():
+    s, obj = _bridge_set_with_geometry()
+
+    class _C:
+        bridge_instance = None
+        nif_to_handle = {}
+        comm_instances_by_set = {}
+        officer_instances = []
+    c = _C(); r = _FakeRenderer()
+
+    hl.realize_set(c, r, s, is_bridge=True)
+
+    assert r.interior_flags and all(r.interior_flags)
 
 
 def test_realize_set_bridge_geometry_is_idempotent():
@@ -177,6 +194,91 @@ def test_realize_set_tears_down_prior_officers_on_bridge_re_realize():
     # ...and the tracking list was reset (not the stale, growing list).
     assert ("officer", 1) not in c.officer_instances
     assert ("officer", 2) not in c.officer_instances
+
+
+# ── BridgeRuntime wiring (engine.bridge_editor.runtime, spec
+# 2026-10-09-bridge-pbr §7, §9) -- realize_set must attach/detach it as
+# controller.bridge_instance is set/cleared, or the per-bridge lighting
+# document (material overrides, spot lights, probe origin) never reaches the
+# renderer for a bridge realized outside the host loop's own test coverage. ──
+
+class _RecordingBridgeRuntime:
+    def __init__(self):
+        self.calls = []
+
+    def attach(self, iid):
+        self.calls.append(("attach", iid))
+
+    def detach(self):
+        self.calls.append(("detach",))
+
+
+def test_realize_set_attaches_the_bridge_runtime_on_first_realize():
+    s, _obj = _bridge_set_with_geometry()
+
+    class _C:
+        bridge_instance = None
+        nif_to_handle = {}
+        comm_instances_by_set = {}
+        officer_instances = []
+    c = _C(); c.bridge_runtime = _RecordingBridgeRuntime(); r = _FakeRenderer()
+
+    hl.realize_set(c, r, s, is_bridge=True)
+
+    assert c.bridge_runtime.calls == [("attach", c.bridge_instance)]
+
+
+def test_realize_set_detaches_then_reattaches_the_bridge_runtime_on_rerealize():
+    # Mission swap re-realizes the bridge set against a FRESH carrier (see
+    # test_realize_set_tears_down_prior_officers_on_bridge_re_realize above):
+    # the prior render instance is destroyed and a new one created. The
+    # runtime must detach() at the moment bridge_instance is cleared to None
+    # and attach(new_iid) once the replacement exists -- never leaving the
+    # old bridge's material overrides/spots live on the new bridge.
+    from engine.appc.bridge_set import BridgeObjectClass
+    s, _first_obj = _bridge_set_with_geometry()
+
+    class _C:
+        bridge_instance = None
+        nif_to_handle = {}
+        comm_instances_by_set = {}
+        officer_instances = []
+    c = _C(); c.bridge_runtime = _RecordingBridgeRuntime(); r = _FakeRenderer()
+
+    hl.realize_set(c, r, s, is_bridge=True)
+    first_iid = c.bridge_instance
+    c.bridge_runtime.calls.clear()
+
+    # A brand-new carrier under the same "bridge" identifier (the old one is
+    # replaced, not mutated) -- __dict__ has no render_instance, so the
+    # geometry guard re-realizes exactly like a mission swap.
+    new_obj = BridgeObjectClass("data/Models/Sets/DBridge/DBridge.nif")
+    s.AddObjectToSet(new_obj, "bridge")
+
+    hl.realize_set(c, r, s, is_bridge=True)
+    second_iid = c.bridge_instance
+
+    assert second_iid != first_iid
+    assert c.bridge_runtime.calls[0] == ("detach",)
+    assert c.bridge_runtime.calls[1] == ("attach", second_iid)
+
+
+def test_realize_set_bridge_runtime_is_optional():
+    """A bare controller fake with no bridge_runtime attribute at all (every
+    other test in this file) must realize exactly as before -- the wiring is
+    read with getattr(..., None), never assumed present."""
+    s, _obj = _bridge_set_with_geometry()
+
+    class _C:
+        bridge_instance = None
+        nif_to_handle = {}
+        comm_instances_by_set = {}
+        officer_instances = []
+    c = _C(); r = _FakeRenderer()   # no bridge_runtime attribute
+
+    hl.realize_set(c, r, s, is_bridge=True)   # must not raise
+
+    assert c.bridge_instance is not None
 
 
 def test_realize_all_sets_realizes_bridge_and_comm_sets(monkeypatch):
@@ -375,6 +477,10 @@ def test_realize_set_bridge_texture_dir_searches_mod_override(monkeypatch, tmp_p
     game_root = tmp_path / "g"
     monkeypatch.setattr(paths, "game_root", lambda: game_root)
     monkeypatch.setattr(mods, "_INDEX", mods.build_index(tmp_path / "mods"))
+    # Hermetic: the project's real replacements overlay may hold DBridge
+    # textures, which would (correctly) sort ahead of the mod dir.
+    monkeypatch.setattr(paths, "project_asset_root", lambda: tmp_path / "no_assets")
+    monkeypatch.setattr(mods, "_REPLACEMENTS", None)
 
     prior_env = App.g_kModelManager._env.get(nif)
     App.g_kModelManager.LoadModel(nif, None, env)
@@ -394,6 +500,55 @@ def test_realize_set_bridge_texture_dir_searches_mod_override(monkeypatch, tmp_p
         assert tex_abs[-1] == str(game_root / "data" / "Models" / "Sets"
                                   / "DBridge" / "High")
     finally:
+        if prior_env is None:
+            App.g_kModelManager._env.pop(nif, None)
+        else:
+            App.g_kModelManager._env[nif] = prior_env
+
+
+def test_realize_set_bridge_texture_dirs_include_the_replacements_overlay(
+        monkeypatch, tmp_path):
+    """A mesh-fix texture op (bridge-shape-diff spec §6) names a .tga that may
+    exist ONLY in the project's replacements overlay
+    (native/assets/replacements/data/Models/Sets/DBridge/High/...). The C++
+    loader searches only the dirs it is handed, so the bridge's texture
+    search list must carry the overlay dir, ahead of stock."""
+    import App
+    from engine import mods, paths
+
+    nif = "data/Models/Sets/DBridge/DBridge.nif"
+    env = "data/Models/Sets/DBridge/High/"
+    s, _obj = _bridge_set_with_geometry(nif)
+
+    assets = tmp_path / "assets"
+    overlay_tex = (assets / "replacements" / "data" / "Models" / "Sets"
+                   / "DBridge" / "High" / "g_new_panel.tga")
+    overlay_tex.parent.mkdir(parents=True)
+    overlay_tex.write_bytes(b"tga")
+    game_root = tmp_path / "g"
+    monkeypatch.setattr(paths, "game_root", lambda: game_root)
+    monkeypatch.setattr(paths, "project_asset_root", lambda: assets)
+    monkeypatch.setattr(mods, "_REPLACEMENTS", None)
+    monkeypatch.setattr(mods, "_INDEX", None)
+
+    prior_env = App.g_kModelManager._env.get(nif)
+    App.g_kModelManager.LoadModel(nif, None, env)
+    try:
+        class _C:
+            bridge_instance = None
+            nif_to_handle = {}
+            comm_instances_by_set = {}
+            officer_instances = []
+        r = _FakeRenderer()
+
+        hl.realize_set(_C(), r, s, is_bridge=True)
+
+        _nif_abs, tex_abs = r.loaded[0]
+        assert tex_abs[0] == str(overlay_tex.parent)
+        assert tex_abs[-1] == str(game_root / "data" / "Models" / "Sets"
+                                  / "DBridge" / "High")
+    finally:
+        mods._REPLACEMENTS = None
         if prior_env is None:
             App.g_kModelManager._env.pop(nif, None)
         else:
@@ -535,7 +690,7 @@ def test_realize_set_comm_load_failure_is_nonfatal():
     c = _CommCtl(); c.comm_instances_by_set = {}; c.nif_to_handle = {}
 
     class _BoomRenderer(_FakeRenderer):
-        def load_model(self, *a):
+        def load_model(self, *a, **kw):
             raise RuntimeError("texture not found: chair.tga")
     r = _BoomRenderer()
     r.set_comm_set_id = lambda *a, **k: None

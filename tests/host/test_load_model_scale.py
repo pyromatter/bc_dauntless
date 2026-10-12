@@ -102,7 +102,10 @@ def test_renderer_wrapper_passes_scale(monkeypatch):
     monkeypatch.setattr(renderer, "_h", H())
     assert renderer.load_model("x.gltf", ["d"], scale=0.25) == 7
     # args: (nif_path, texture_search_path, texture_replacements, decals,
-    # scale, geosphere) -- geosphere is the new trailing arg (Task 3 of the
-    # planet-geosphere plan), so scale is now second-to-last.
-    assert seen["args"][-2] == 0.25
-    assert seen["args"][-1] is False
+    # scale, geosphere, interior, sibling_overlay_dirs) -- sibling_overlay_dirs
+    # is the new trailing arg (Task 2 of the bridge-pbr plan), so scale is now
+    # fourth-from-last.
+    assert seen["args"][-4] == 0.25
+    assert seen["args"][-3] is False
+    assert seen["args"][-2] is False
+    assert seen["args"][-1] == []

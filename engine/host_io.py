@@ -80,6 +80,12 @@ _OPTIONAL_BINDINGS = frozenset({
     "profiler_scopes", "profiler_frame",
     "set_swap_interval", "swap_interval",
     "set_cursor_shape",
+    "ray_trace_mesh_pick", "model_identity", "set_bridge_highlight",
+    "set_bridge_material_overrides", "set_bridge_pbr_enabled",
+    "set_bridge_probe_origin", "set_bridge_probe_scales",
+    "set_bridge_probe_mix", "request_bridge_probe_capture",
+    "set_bridge_spots", "set_bridge_alert_level",
+    "set_bridge_spot_colours", "set_bridge_glow",
 })
 
 
@@ -520,6 +526,175 @@ def ray_trace_mesh(
     return (px + t[0], py + t[1], pz + t[2]), normal, dist
 
 
+def ray_trace_mesh_pick(instance_id, origin, direction, max_dist,
+                        exclude_meshes=()):
+    """Bridge editor pick: ray_trace_mesh plus (mesh_index, triangle).
+
+    World ray in, world hit out, like ray_trace_mesh. Triangles of
+    `exclude_meshes` are never hit. Unlike ray_trace_mesh this never raises:
+    the editor calls it every frame for the hover tint, so a stale id or a
+    stale binary is just "no hit"."""
+    fn = getattr(_h, "ray_trace_mesh_pick", None) if _h is not None else None
+    if fn is None:
+        return None
+    t = _h.instance_translation(instance_id)
+    rel = origin if t is None else _relative_to(t, origin)
+    hit = fn(instance_id, rel, direction, max_dist, list(exclude_meshes))
+    if hit is None:
+        return None
+    (px, py, pz), normal, dist, mesh, tri = hit
+    if t is not None:
+        px, py, pz = px + t[0], py + t[1], pz + t[2]
+    return (px, py, pz), normal, dist, mesh, tri
+
+
+def _lossy_str(v) -> str:
+    """A NIF name as str: the binding hands names over as bytes (a NIF holds
+    whatever bytes its exporter wrote), decoded here with errors="replace" so
+    a non-UTF-8 name can never raise into the host loop."""
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).decode("utf-8", errors="replace")
+    return str(v)
+
+
+_NO_MAPS = {"roughness": False, "metalness": False, "normal": False, "emissive": False}
+
+
+def model_identity(instance_id):
+    """{source, content_hash, meshes:[{mesh, block, name, node_chain,
+    textures, material, maps}]} for an instance's model; None headless or for
+    a stale id. `textures` is the Base-stage texture basename as BUILT (parent
+    inheritance resolved), or []. Names are str (lossily decoded). `maps` is
+    {roughness, metalness, normal, emissive} bool (spec 2026-10-09-bridge-pbr;
+    emissive: spec 2026-10-08-bridge-emitters §11.2); all-False
+    when absent (a binary built before this field existed)."""
+    fn = getattr(_h, "model_identity", None) if _h is not None else None
+    info = None if fn is None else fn(instance_id)
+    if info is None:
+        return None
+    for m in info["meshes"]:
+        m["name"] = _lossy_str(m["name"])
+        m["node_chain"] = [_lossy_str(n) for n in m["node_chain"]]
+        m["textures"] = [_lossy_str(t) for t in m.get("textures", ())]
+        if "maps" not in m:
+            m["maps"] = dict(_NO_MAPS)
+    return info
+
+
+def set_bridge_highlight(instance_id, selected, hover) -> None:
+    """Developer-only selection tint on the bridge: `selected` / `hover` are
+    mesh indices into the instance's model (-1 = none). No-op headless."""
+    fn = getattr(_h, "set_bridge_highlight", None) if _h is not None else None
+    if fn is not None:
+        fn(instance_id, int(selected), int(hover))
+
+
+def set_bridge_material_overrides(instance_id, overrides) -> None:
+    """Bridge PBR per-shape material overrides (production data, applied
+    without --developer): `overrides` is [(mesh, roughness, metalness)], a
+    channel < 0 meaning "no override". None or a stale id clears. No-op
+    headless."""
+    fn = getattr(_h, "set_bridge_material_overrides", None) if _h is not None else None
+    if fn is not None:
+        fn(instance_id, [(int(m), float(r), float(mt)) for m, r, mt in overrides])
+
+
+def set_bridge_pbr_enabled(on) -> None:
+    """Developer-only A/B switch for bridge PBR (default on). No-op headless
+    and without --developer."""
+    fn = getattr(_h, "set_bridge_pbr_enabled", None) if _h is not None else None
+    if fn is not None:
+        fn(bool(on))
+
+
+def set_bridge_probe_origin(origin) -> None:
+    """Bridge reflection probe capture point (x, y, z), bridge world space --
+    the captain's-chair eye. Production (not developer-gated); takes effect at
+    the next capture. No-op headless."""
+    fn = getattr(_h, "set_bridge_probe_origin", None) if _h is not None else None
+    if fn is not None:
+        x, y, z = origin
+        fn((float(x), float(y), float(z)))
+
+
+def set_bridge_probe_scales(green, yellow_red) -> None:
+    """Ambient multipliers the green and yellow/red reflection probes are
+    captured with. Takes effect at the next capture. No-op headless."""
+    fn = getattr(_h, "set_bridge_probe_scales", None) if _h is not None else None
+    if fn is not None:
+        fn(float(green), float(yellow_red))
+
+
+def set_bridge_probe_mix(t) -> None:
+    """Reflection cross-fade, 0 = green probe .. 1 = yellow/red probe
+    (clamped natively). No-op headless."""
+    fn = getattr(_h, "set_bridge_probe_mix", None) if _h is not None else None
+    if fn is not None:
+        fn(float(t))
+
+
+def set_bridge_alert_level(level) -> None:
+    """Player alert level (0 green, 1 yellow, 2 red) choosing the bridge's
+    emissive sibling-map variants; None -> green. Pushed every frame. No-op
+    headless."""
+    fn = getattr(_h, "set_bridge_alert_level", None) if _h is not None else None
+    if fn is not None:
+        fn(int(level) if level is not None else 0)
+
+
+def request_bridge_probe_capture() -> None:
+    """Recapture both bridge reflection probes in the next bridge frame (bridge
+    load, lighting / override / spot edits) -- never per frame. No-op
+    headless."""
+    fn = getattr(_h, "request_bridge_probe_capture", None) if _h is not None else None
+    if fn is not None:
+        fn()
+
+
+def set_bridge_spots(spots) -> int:
+    """Bridge spot lights (production, not developer-gated): `spots` is
+    [(pos3, dir3, inner_deg, outer_deg, range, (r, g, b), intensity
+    [, capture_green3, capture_alert3])], the angles HALF-angles from the
+    axis. With capture colours (spec 2026-10-08-bridge-emitters §11.4, every
+    spot or none) the probes see those and the live colour
+    (set_bridge_spot_colours) never recaptures. Returns how many were DROPPED
+    (invalid + over the cap). 0 headless."""
+    fn = getattr(_h, "set_bridge_spots", None) if _h is not None else None
+    if fn is None:
+        return 0
+
+    def _v3(v):
+        x, y, z = v
+        return (float(x), float(y), float(z))
+
+    rows, caps = [], []
+    for s in spots:
+        p, d, i, o, r, c, k = s[:7]
+        rows.append((_v3(p), _v3(d), float(i), float(o), float(r), _v3(c), float(k)))
+        if len(s) >= 9:
+            caps.append((_v3(s[7]), _v3(s[8])))
+    if caps and len(caps) == len(rows):
+        return int(fn(rows, caps))
+    return int(fn(rows))
+
+
+def set_bridge_spot_colours(colours) -> None:
+    """Live LINEAR radiance per bridge spot, in set_bridge_spots order (spec
+    §11.4); never recaptures the probes. No-op headless."""
+    fn = getattr(_h, "set_bridge_spot_colours", None) if _h is not None else None
+    if fn is not None:
+        fn([(float(r), float(g), float(b)) for r, g, b in colours])
+
+
+def set_bridge_glow(instance_id, glow) -> None:
+    """Per-mesh emitter glow for the bridge (spec §11.2): [(mesh, src_code,
+    (r, g, b), level)]; None clears. No-op headless."""
+    fn = getattr(_h, "set_bridge_glow", None) if _h is not None else None
+    if fn is not None:
+        fn(instance_id, [(int(m), int(s), (float(c[0]), float(c[1]), float(c[2])), float(lv))
+                         for m, s, c, lv in glow])
+
+
 # ── Star map (Helm → Set Course) ─────────────────────────────────────────────
 # Soft-guarded: a stale native module leaves the map blank (warned at boot
 # under --developer) instead of raising AttributeError inside the helm menu.
@@ -606,7 +781,9 @@ def profiler_enabled() -> bool:
 
 
 def profiler_scopes() -> List[dict]:
-    """Per-pass render timings: [{name, cpu_ms, gpu_ms, calls, depth}, ...].
+    """Per-pass render timings: [{name, cpu_ms, gpu_ms, gpu_measured, calls,
+    depth}, ...]. `gpu_measured` False means no GPU query covered the scope
+    (nested under GL_TIME_ELAPSED): its gpu_ms is NOT MEASURED, not free.
 
     In pass order. `cpu_ms`/`gpu_ms` are EMA-smoothed; `calls` is the raw count
     from the last resolved frame, so a pass that ran twice in one frame (the
@@ -619,18 +796,20 @@ def profiler_scopes() -> List[dict]:
 
 
 def profiler_frame() -> dict:
-    """Whole-frame render totals: {cpu_ms, gpu_ms, frames, enabled}.
+    """Whole-frame render totals: {cpu_ms, gpu_ms, frames, enabled, ...}.
 
-    `gpu_ms` is measured first-timestamp-to-last, NOT as a sum of the scopes:
-    scopes nest, so summing them would double-count. Returns zeros with
-    enabled=False when the binding is absent.
+    Also `gpu_timer` ("timestamp" | "elapsed" | "none"), chosen from the
+    driver's declared counter bits (`timestamp_bits`, `elapsed_bits`), and
+    `timestamp_queries` issued since the last enable. Under GL_TIMESTAMP,
+    `gpu_ms` is first-timestamp-to-last, NOT a sum of the nested scopes; under
+    GL_TIME_ELAPSED (Apple's GL) it is the sum of the sequential top-level
+    passes, the only ones timed. Returns zeros with enabled=False when the
+    binding is absent.
 
     A gpu_ms of exactly 0.0 across many resolved frames does NOT mean a free
-    GPU: a driver whose GL_TIMESTAMP counters read zero (Apple's GL) produces
-    that, and the timer cannot tell it apart from a fast frame because a span
-    is only accumulated when t1 >= t0. frame_profiler's report calls that case
-    out as GPU TIMING UNAVAILABLE for the same reason this module reports an
-    absent binding rather than inventing zeros for it.
+    GPU: a driver that declares a counter yet returns zeros produces that.
+    frame_profiler's report calls it out as GPU TIMING UNAVAILABLE for the same
+    reason this module reports an absent binding rather than inventing zeros.
     """
     fn = getattr(_h, "profiler_frame", None)
     if fn is None:

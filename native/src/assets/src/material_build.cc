@@ -1,6 +1,7 @@
 #include "material_build.h"
 
 #include <cctype>
+#include <string>
 #include <string_view>
 
 namespace assets::detail {
@@ -24,6 +25,20 @@ bool filename_is_lightmap(std::string_view fname) {
     };
     return lower_ends_with(fname, " lm.tga") ||
            lower_ends_with(fname, "_lm.tga");
+}
+
+/// Basename (after the last '/' or '\\') of the source file of NiImage link
+/// `image_link`, "" for an embedded or unknown image.
+std::string image_basename(
+    std::uint32_t image_link,
+    const std::unordered_map<std::uint32_t, std::string>* image_filename_for_link)
+{
+    if (!image_filename_for_link) return {};
+    auto it = image_filename_for_link->find(image_link);
+    if (it == image_filename_for_link->end()) return {};
+    const std::string& fn = it->second;
+    const auto cut = fn.find_last_of("/\\");
+    return cut == std::string::npos ? fn : fn.substr(cut + 1);
 }
 
 void apply_material_property(Material& m, const nif::NiMaterialProperty& src) {
@@ -75,7 +90,11 @@ void apply_texture_property(
     const std::unordered_set<std::uint32_t>* specular_image_links,
     const std::unordered_map<std::uint32_t, int>* sibling_specular_for_image,
     const std::unordered_set<std::uint32_t>* normal_image_links,
-    const std::unordered_map<std::uint32_t, int>* sibling_normal_for_image)
+    const std::unordered_map<std::uint32_t, int>* sibling_normal_for_image,
+    const std::unordered_map<std::uint32_t, int>* sibling_rough_for_image,
+    const std::unordered_map<std::uint32_t, int>* sibling_metal_for_image,
+    const std::unordered_map<std::uint32_t, int>* const (&sibling_emissive_for_image)[4],
+    const std::unordered_map<std::uint32_t, std::string>* image_filename_for_link)
 {
     // Single-texture v3.x property — usually populates the Base stage.
     //
@@ -129,6 +148,7 @@ void apply_texture_property(
     auto& base = m.stages[static_cast<std::size_t>(Material::StageSlot::Base)];
     base.texture_index = tex_idx;
     base.apply_mode    = 2;
+    m.base_texture_name = image_basename(effective_image_link, image_filename_for_link);
     const bool is_glow = glow_image_links &&
         glow_image_links->find(effective_image_link) != glow_image_links->end();
     if (is_glow) {
@@ -158,6 +178,40 @@ void apply_texture_property(
             bump.texture_index = it->second;
             bump.apply_mode    = 2;
         }
+    }
+    // Bridge PBR sibling shims, mirroring the _normal block above: a probed
+    // `_rough` / `_metal` sibling binds to Roughness / Metalness. The hull
+    // texture stays in Base / Glow.
+    if (sibling_rough_for_image) {
+        auto it = sibling_rough_for_image->find(effective_image_link);
+        if (it != sibling_rough_for_image->end()) {
+            auto& rough = m.stages[static_cast<std::size_t>(Material::StageSlot::Roughness)];
+            rough.texture_index = it->second;
+            rough.apply_mode    = 2;
+        }
+    }
+    if (sibling_metal_for_image) {
+        auto it = sibling_metal_for_image->find(effective_image_link);
+        if (it != sibling_metal_for_image->end()) {
+            auto& metal = m.stages[static_cast<std::size_t>(Material::StageSlot::Metalness)];
+            metal.texture_index = it->second;
+            metal.apply_mode    = 2;
+        }
+    }
+    // Emissive siblings (task 17): default, yellow-alert, red-alert. Same
+    // shape as the blocks above; the base image's FRAME 0 for a flipbook
+    // (effective_image_link), so a flipbook's emissive is static.
+    constexpr Material::StageSlot kEmissiveSlots[4] = {
+        Material::StageSlot::Emissive, Material::StageSlot::EmissiveYellow,
+        Material::StageSlot::EmissiveRed, Material::StageSlot::EmissiveSpecial};
+    for (int k = 0; k < 4; ++k) {
+        const auto* sink = sibling_emissive_for_image[k];
+        if (!sink) continue;
+        auto it = sink->find(effective_image_link);
+        if (it == sink->end()) continue;
+        auto& stage = m.stages[static_cast<std::size_t>(kEmissiveSlots[k])];
+        stage.texture_index = it->second;
+        stage.apply_mode    = 2;
     }
 }
 
@@ -236,6 +290,8 @@ void apply_multi_texture_property(
         stage.filter_mode   = el.filter_mode;
         stage.uv_set        = el.uv_set;
         stage.apply_mode    = 2;  // APPLY_MODULATE — niflib default
+        if (target == S::Base)
+            m.base_texture_name = image_basename(el.image_link, image_filename_for_link);
     }
 }
 
@@ -247,12 +303,19 @@ Material build_material(const MaterialInputs& in) {
     if (in.alpha)         apply_alpha_property(m, *in.alpha);
     if (in.zbuffer)       apply_zbuffer_property(m, *in.zbuffer);
     if (in.vertex_color)  apply_vertex_color_property(m, *in.vertex_color);
+    const std::unordered_map<std::uint32_t, int>* const emissive_sinks[4] = {
+        in.sibling_emissive_for_image, in.sibling_emissive_y_for_image,
+        in.sibling_emissive_r_for_image, in.sibling_emissive_s_for_image};
     if (in.texture) apply_texture_property(m, *in.texture,
         in.texture_link_id, in.flip_image_override_for_prop,
         in.image_to_texture, in.glow_image_links, in.specular_image_links,
         in.sibling_specular_for_image,
         in.normal_image_links,
-        in.sibling_normal_for_image);
+        in.sibling_normal_for_image,
+        in.sibling_rough_for_image,
+        in.sibling_metal_for_image,
+        emissive_sinks,
+        in.image_filename_for_link);
     if (in.multi_texture) apply_multi_texture_property(m, *in.multi_texture,
         in.image_to_texture, in.image_filename_for_link);
 
@@ -269,33 +332,6 @@ Material build_material(const MaterialInputs& in) {
         for (auto& stage : m.stages) {
             if (stage.texture_index >= 0 && stage.uv_set > max_set) {
                 stage.uv_set = max_set;
-            }
-        }
-    }
-
-    // Apply BC's lightmap-filename convention. Looks up the source
-    // filename for whichever NiImage actually landed in the resolved
-    // Base stage of the final Material (i.e. after both
-    // NiTextureProperty and NiMultiTextureProperty have run — DBridge
-    // shapes inherit BOTH from different ancestor NiNodes, with the
-    // multi-texture's lightmap correctly overwriting the texture
-    // property's base). Sets m.lightmap_pass if that filename matches
-    // "* lm.tga" / "*_lm.tga".
-    if (in.image_filename_for_link && in.image_to_texture) {
-        const int base_tex_idx = m.stages[
-            static_cast<std::size_t>(Material::StageSlot::Base)].texture_index;
-        if (base_tex_idx >= 0) {
-            // Reverse-lookup: which NiImage link_id maps to this
-            // texture_index? Image count is typically tens; linear scan
-            // is fine.
-            for (const auto& [link_id, tex_idx] : *in.image_to_texture) {
-                if (tex_idx != base_tex_idx) continue;
-                auto fn_it = in.image_filename_for_link->find(link_id);
-                if (fn_it == in.image_filename_for_link->end()) continue;
-                if (filename_is_lightmap(fn_it->second)) {
-                    m.lightmap_pass = true;
-                }
-                break;
             }
         }
     }
