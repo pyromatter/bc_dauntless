@@ -11,6 +11,7 @@
 
 #include <renderer/bloom_pass.h>
 #include <renderer/bridge_pass.h>
+#include <renderer/bridge_pbr.h>
 #include <renderer/frame.h>
 #include <renderer/hdr_target.h>
 #include <renderer/pipeline.h>
@@ -674,6 +675,57 @@ TEST_F(BridgePbrFrame, OfficersAreNotInTheProbes) {
     EXPECT_GT(c.r, c.g * 1.5f);
 }
 
+// Characters reflect nothing (2026-10-13): BC's officer textures paint hair
+// and cloth near-black, so the default dielectric sheen (F0 0.04) became most
+// of what showed and washed the heads out grey. With a captured probe and a
+// spot on the officer, the Specular-only view reads black on the officer and
+// still shows the room's reflection on the floor beside it.
+TEST_F(BridgePbrFrame, OfficersReflectNothing) {
+    use_red_wall_corner();
+    officer = make_green_officer();
+    pass->set_probe_origin({60.0f, 0.0f, 40.0f});
+    pass->request_probe_capture();
+    pass->set_spots({{{40.0f, 0.0f, 20.0f}, {-1.0f, 0.0f, 0.0f},
+                      std::cos(glm::radians(30.0f)), std::cos(glm::radians(60.0f)),
+                      200.0f, glm::vec3(1.0f) * 2000.0f}});
+    pass->set_debug_view(renderer::BridgeDebugView::SpecularOnly);
+    sample_ = {70.0f, 0.0f, 0.0f};
+    const glm::vec3 floor = render_floor();
+    sample_ = {5.0f, 0.0f, 20.0f};
+    const glm::vec3 off = render_floor();
+    pass->set_debug_view(renderer::BridgeDebugView::Off);
+    EXPECT_GT(floor.r + floor.g + floor.b, 0.01f);   // the room still reflects
+    EXPECT_LT(off.r + off.g + off.b, 1e-4f);
+}
+
+// ...and gives up no diffuse to a reflection it no longer makes: under one
+// spot, no ambient and no probe, an officer texel is plain Lambert -- no
+// (1 - F) cut. The light skims the panel from below while the eye looks down
+// at it (V.H ~ 0.37), where Schlick's grazing term alone, F0 or not, would
+// take ~10% of the diffuse.
+TEST_F(BridgePbrFrame, OfficerDiffuseHasNoFresnelLoss) {
+    officer = make_green_officer();
+    sample_ = {5.0f, 0.0f, 20.0f};
+    const glm::vec3 spot_pos(8.0f, 0.0f, -10.0f);
+    const glm::vec3 to_spot = spot_pos - sample_;
+    const float d = glm::length(to_spot);
+    const glm::vec3 L = to_spot / d;
+    const float range = 200.0f;
+    const float radiance = 5700.0f;   // ~0.2 linear: under the diffuse ceiling's knee
+    pass->set_spots({{spot_pos, -L,
+                      std::cos(glm::radians(30.0f)), std::cos(glm::radians(60.0f)),
+                      range, glm::vec3(radiance)}});
+    renderer::Lighting dark;
+    dark.ambient = glm::vec3(0.0f);
+    const glm::vec3 c = render_floor_with(dark);
+    const glm::vec3 N(1.0f, 0.0f, 0.0f);
+    const float lambert = (1.0f / renderer::pbr::kPi) * radiance
+                        * renderer::pbr::spot_falloff(d, range) * glm::dot(N, L);
+    const float want = renderer::pbr::encode(glm::vec3(lambert)).g;
+    EXPECT_NEAR(c.g, want, 0.004f);
+    EXPECT_LT(c.r + c.b, 1e-4f);
+}
+
 // A request made before any bridge is drawn (the host requests at bridge
 // load, possibly before the instance exists) stays pending: it is not spent
 // capturing an empty, black room.
@@ -1308,4 +1360,109 @@ TEST_F(BridgePbrFrame, OfflineDarkensTheDefaultButNotAMaterialGlow) {
     EXPECT_NEAR(render_floor().r, 0.5f, 3e-3f);
     pass->clear_glow();
     pass->set_alert_level(0);
+}
+
+// ── Area lights: strips and panels (spec §16.3) ──────────────────────────────
+
+namespace {
+renderer::BridgeAreaLight area(glm::vec3 c, glm::vec3 u, glm::vec3 v, float range,
+                               glm::vec3 radiance) {
+    renderer::BridgeAreaLight a;
+    a.center = c; a.half_u = u; a.half_v = v; a.range = range; a.radiance = radiance;
+    return a;
+}
+}  // namespace
+
+TEST_F(BridgePbrFrame, AnAreaLightLightsTheFloorInFrontOfIt) {
+    set_base({0.6f, 0.6f, 0.6f, 1.0f});
+    const glm::vec3 dark = render_floor();
+    // 20 x 20 panel over the sample point, emitting down (cross(u, v) = -z).
+    pass->set_area_lights({area({70, 0, 40}, {10, 0, 0}, {0, -10, 0}, 300.0f, glm::vec3(10.0f))});
+    EXPECT_GT(render_floor().r, dark.r + 0.05f);
+}
+
+TEST_F(BridgePbrFrame, AnAreaLightFacingAwayLightsNothing) {
+    set_base({0.6f, 0.6f, 0.6f, 1.0f});
+    const glm::vec3 dark = render_floor();
+    pass->set_area_lights({area({70, 0, 40}, {10, 0, 0}, {0, 10, 0}, 300.0f, glm::vec3(10.0f))});
+    EXPECT_NEAR(render_floor().r, dark.r, 1e-3f);
+}
+
+TEST_F(BridgePbrFrame, NoAreaLightsRendersExactlyAsBefore) {
+    set_base({0.6f, 0.6f, 0.6f, 1.0f});
+    const glm::vec3 before = render_floor();
+    EXPECT_EQ(pass->set_area_lights({}), 0u);
+    const glm::vec3 after = render_floor();
+    EXPECT_EQ(before, after);
+}
+
+TEST_F(BridgePbrFrame, AreaLightsBeyondTheCapAreDroppedAndCounted) {
+    std::vector<renderer::BridgeAreaLight> many(
+        renderer::kBridgeMaxAreaLights + 3,
+        area({0, 0, 50}, {1, 0, 0}, {0, -1, 0}, 100.0f, glm::vec3(1.0f)));
+    EXPECT_EQ(pass->set_area_lights(many), 3u);
+    EXPECT_EQ(pass->area_light_count(), static_cast<std::size_t>(renderer::kBridgeMaxAreaLights));
+    render_floor();
+    EXPECT_EQ(glGetError(), static_cast<GLenum>(GL_NO_ERROR));
+}
+
+TEST_F(BridgePbrFrame, SettingAreaLightsMarksTheProbesDirtyButColoursDoNot) {
+    EXPECT_FALSE(pass->probe_capture_pending());
+    pass->set_area_lights({area({0, 0, 50}, {1, 0, 0}, {0, -1, 0}, 100.0f, glm::vec3(1.0f))});
+    EXPECT_TRUE(pass->probe_capture_pending());
+    use_red_wall_corner();
+    render_floor();                              // captures
+    EXPECT_FALSE(pass->probe_capture_pending());
+    pass->set_area_radiance({glm::vec3(5.0f)});
+    EXPECT_FALSE(pass->probe_capture_pending());
+    pass->set_area_lights({});
+    EXPECT_TRUE(pass->probe_capture_pending());
+}
+
+TEST_F(BridgePbrFrame, AnAreaLightNeverMakesLitDiffuseBloom) {
+    set_base({1, 1, 1, 1});
+    set_floor_override(1.0f, 0.0f);
+    // 100, not 1e4: specular is deliberately UNCAPPED (spec §9.5), so a huge
+    // radiance on a close, overhead, fully-rough panel pushes it past the
+    // bound too -- that's correct, not a bug. 100 still drives diffuse ~10x
+    // past the ceiling (proving the cap) while keeping the rough-dielectric
+    // specular small.
+    pass->set_area_lights({area({70, 0, 10}, {50, 0, 0}, {0, -50, 0}, 300.0f, glm::vec3(100.0f))});
+    EXPECT_LT(render_floor().r, renderer::kBridgeLighting.diffuse_max + 0.25f);
+}
+
+// Spec §16.8: two JOINED halves of a strip light the floor under their joint
+// like the one strip they replace; unjoined, their highlights add.
+TEST_F(BridgePbrFrame, JoinedStripHalvesMatchOneStripAtTheJoint) {
+    set_base({0.6f, 0.6f, 0.6f, 1.0f});
+    set_floor_override(0.3f, 0.0f);                       // glossy enough to show the highlight
+    sample_ = {70.0f, 0.0f, 0.0f};
+    // V = normalize((0, 0.6, 1)), zero x-component: the strip runs along x
+    // one unit above the floor, so the reflection's nearest point on each
+    // half clamps to that half's OWN joined end -- exactly the joint.
+    //
+    // Deliberately NEAR-FIELD (the strip sits 1 unit above the sampled
+    // floor point): this is the regime of the live bug (a snapped strip
+    // washing the surface it sits close to). At FAR field (the strip ~20
+    // units up) the joined measurement comes in ~9% below the single
+    // rectangle's -- a known limit of the join weighting (spec §16.8,
+    // "Known limit") -- so this test does not exercise that distance.
+    eye_ = {70.0f, 30.0f, 50.0f};
+    target_ = sample_;
+    auto strip = [&](glm::vec3 c, float half_len, int joins) {
+        renderer::BridgeAreaLight a = area(c, {half_len, 0, 0}, {0, -0.25f, 0}, 300.0f,
+                                           glm::vec3(2.0f));
+        a.joins = joins;
+        return a;
+    };
+    pass->set_area_lights({strip({70, 0, 1}, 20.0f, 0)});
+    const float one = render_floor().r;
+    pass->set_area_lights({strip({60, 0, 1}, 10.0f, 2), strip({80, 0, 1}, 10.0f, 1)});
+    const float joined = render_floor().r;
+    pass->set_area_lights({strip({60, 0, 1}, 10.0f, 0), strip({80, 0, 1}, 10.0f, 0)});
+    const float unjoined = render_floor().r;
+    // Review item 10 (deferred T4): tightened from 0.02 (measured diff
+    // 0.0025) to 0.008 -- two 8-bit colour steps (1/255 ~ 0.0039 each).
+    EXPECT_NEAR(joined, one, 0.008f);
+    EXPECT_GT(unjoined, joined + 0.01f);                  // the doubling this guards against
 }
