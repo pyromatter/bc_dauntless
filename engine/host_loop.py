@@ -728,6 +728,105 @@ def _poll_skip_dialogue(host, input_map) -> None:
     _skip_dialogue_prev = down
 
 
+def _articulated_running_lights(ship, iid, specs) -> tuple:
+    """The 9-tuples to send for `specs` (rest positions), each light carried
+    by the articulated part it sits on and dropped if that part was severed
+    -- the subsystem emitter lights' rule (`_part_pose_at`)."""
+    from engine.appc import part_pose
+    out = []
+    for s in specs:
+        t = s.as_tuple()
+        pose = _part_pose_at(ship, iid, s.pos)
+        if pose is _PART_SEVERED:
+            continue
+        if pose is not None:
+            t = part_pose.apply(pose, s.pos) + t[3:]
+        out.append(t)
+    return tuple(out)
+
+
+def _register_running_lights(r, session, ship, iid) -> None:
+    """Send a ship's BlinkingLightProperty running lights to native at spawn
+    (running-lights spec §4.3). Unlit ships send nothing. The rest specs and
+    the sent list are kept so `_push_running_lights` can re-send when an
+    articulated part moves."""
+    from engine.appc import running_lights
+    specs = running_lights.lights_for(ship)
+    if not specs:
+        return
+    phase = running_lights.phase_for(ship)
+    session.ship_running_lights[iid] = phase
+    sent = _articulated_running_lights(ship, iid, specs)
+    session.ship_running_light_specs[iid] = (tuple(specs), sent)
+    r.set_running_lights(iid, list(sent), phase)
+
+
+def _resend_articulated_running_lights(r, session, ship, iid, phase) -> None:
+    """Re-send `ship`'s lights when an articulated part has moved them since
+    the last send. Native caches positions at send time and places them only
+    through the hull's own matrix, so a part's pose reaches the lights ONLY
+    through here. Unrigged ships cost one rig lookup."""
+    record = session.ship_running_light_specs.get(iid)
+    if record is None:
+        return
+    from engine.appc import articulation
+    if not articulation.posed_part_names(ship):
+        return
+    specs, last = record
+    sent = _articulated_running_lights(ship, iid, specs)
+    if sent == last:
+        return
+    session.ship_running_light_specs[iid] = (specs, sent)
+    r.set_running_lights(iid, list(sent), phase)
+
+
+def _push_running_lights(r, session, hidden_iids=()) -> None:
+    """Per-frame running-light brightness + dials (spec §4.3). Level folds in
+    death, power-plant state and the live cloak fraction; a vanished ship, or
+    one whose hull the host loop hides, is sent 0. No lit ships => no calls.
+
+    The pass ignores the instance's visible flag on purpose (a cloaking hull
+    is hidden while its lights fade), so every OTHER hull hide must be
+    mirrored here or the lights float on their own: `session.scope_hidden`,
+    the warp-transit hide (`session.warp_hidden_iids`, recorded by
+    `_sync_instance_transforms` where it hides them) and `hidden_iids` — the
+    bridge-view player hide, as returned by `_apply_bridge_player_visibility`.
+    """
+    lit = getattr(session, "ship_running_lights", None)
+    if not lit:
+        return
+    import App  # deferred, as elsewhere in this module (sound-manager init order)
+    from engine.appc import running_lights, running_light_dials
+    now = App.g_kUtopiaModule.GetGameTime()
+    by_iid = {iid: ship for ship, iid in session.ship_instances.items()}
+    hidden = (set(getattr(session, "scope_hidden", ()))
+              | set(getattr(session, "warp_hidden_iids", ()))
+              | set(hidden_iids))
+    levels = []
+    for iid, phase in lit.items():
+        ship = by_iid.get(iid)
+        if ship is None or iid in hidden:
+            levels.append((iid, 0.0))
+            continue
+        try:
+            _resend_articulated_running_lights(r, session, ship, iid, phase)
+        except Exception as _e:
+            dev_mode.log_swallowed("running light articulation", _e)
+        frac = 0.0
+        get_cloak = getattr(ship, "GetCloakingSubsystem", None)
+        cloak = get_cloak() if get_cloak is not None else None
+        if cloak is not None:
+            frac = float(cloak.GetTransitionFraction())
+        try:
+            levels.append((iid, running_lights.level_for(ship, frac, now, phase)))
+        except Exception as _e:
+            dev_mode.log_swallowed("running light level", _e)
+            levels.append((iid, 0.0))
+    r.set_running_light_levels(levels)
+    d = running_light_dials.current()
+    r.set_running_light_dials(d["size_gu_per_radius"], d["min_px"], d["intensity"])
+
+
 def _push_cloak_refraction(r, session, player) -> None:
     """Per-frame cloak VFX wiring.
 
@@ -1575,6 +1674,41 @@ def _build_explosion_light_render_data():
     return out
 
 
+_PART_SEVERED = object()
+
+
+def _part_pose_at(ship, iid, position):
+    """The live pose of the articulated part a hull-attached point sits on.
+
+    `position` is the point's authored rest position (body frame, ship
+    units), attributed by `part_severance.part_for_mount` -- the one rule
+    hardpoint mounts and severance also use, so a light, the weapon beside
+    it and what dies with the part always agree. Returns the part's pose
+    (R, t), None when the point does not move (unrigged ship, no part, a part
+    at its identity pose), or `_PART_SEVERED` when its part has been shot
+    off. Shared by every per-frame attached effect -- the subsystem emitter
+    lights and the running lights -- so they follow exactly the pose
+    `_sync_ship_articulation` pushes to the renderer this frame."""
+    from engine.appc import articulation
+    names = articulation.posed_part_names(ship)
+    if not names:
+        return None
+    leaf = articulation.leaf_for(ship)
+    from engine.appc.part_severance import part_for_mount, is_detached
+    name = part_for_mount(leaf, tuple(position), iid)
+    if name is None:
+        return None
+    if is_detached(ship, name):
+        return _PART_SEVERED
+    if name not in names:
+        return None
+    from engine.appc import part_pose
+    pose = articulation.pose_for_part(ship, name)
+    if part_pose.is_identity(pose):
+        return None
+    return pose
+
+
 def _articulate_emitter_light(ship, iid, spec, d):
     """Carry body-frame light dict `d` with the articulated part it sits on,
     or return None when that part has been severed.
@@ -1595,23 +1729,12 @@ def _articulate_emitter_light(ship, iid, spec, d):
     Identity -- the same dict, untouched -- for an unrigged ship, a light on
     no part, or a part at its identity pose.
     """
-    from engine.appc import articulation
-    names = articulation.posed_part_names(ship)
-    if not names:
-        return d
-    leaf = articulation.leaf_for(ship)
-    from engine.appc.part_severance import part_for_point, is_detached
-    name = part_for_point(leaf, tuple(spec["position"]), iid)
-    if name is None:
-        return d
-    if is_detached(ship, name):
+    pose = _part_pose_at(ship, iid, spec["position"])
+    if pose is _PART_SEVERED:
         return None
-    if name not in names:
+    if pose is None:
         return d
     from engine.appc import part_pose
-    pose = articulation.pose_for_part(ship, name)
-    if part_pose.is_identity(pose):
-        return d
     for key in ("position", "position_b"):
         if key in d:
             d[key] = part_pose.apply(pose, d[key])
@@ -6211,6 +6334,12 @@ class MissionSession:
     # `_build_ship_emitter_cache(ship)` list consumed each frame by
     # `_build_emitter_light_render_data`. Best-effort VFX; ships with no
     # baked LightEmitter* fields simply get an empty/absent entry.
+    # Running lights registered at spawn: render InstanceId -> blink phase (s).
+    # Fed per frame by _push_running_lights (running-lights spec §4.3).
+    ship_running_lights: dict[object, float] = field(default_factory=dict)
+    # Running lights' rest specs + the list last sent, per render InstanceId,
+    # so a moving articulated part re-sends them (_resend_articulated_running_lights).
+    ship_running_light_specs: dict[object, tuple] = field(default_factory=dict)
     ship_emitters: dict[object, list] = field(default_factory=dict)  # keyed by the renderer InstanceId (not int): the value is passed straight through as each light's instance_id
     planet_instances: dict[Any, int] = field(default_factory=dict)
     # Per-planet natural_scale = GetRadius() / NIF_extent, cached at load.
@@ -6233,6 +6362,10 @@ class MissionSession:
     # or past the draw distance; _reconcile_runtime_instances). Consulted by
     # every other per-frame visibility writer so none re-shows them.
     scope_hidden: set = field(default_factory=set)
+    # Ship instance ids the warp-transit hide hid on the last
+    # _sync_instance_transforms run (empty when not warping). Read by
+    # _push_running_lights, whose pass ignores the visible flag.
+    warp_hidden_iids: set = field(default_factory=set)
     # The system map's planets and moons (system-frames Plan 3 Task 4),
     # diffed each tick against celestial.draw_list(viewing_set()) by
     # _reconcile_celestial_instances. celestial_instances: body key -> iid;
@@ -6263,8 +6396,11 @@ class MissionSession:
         self.ship_instances.clear()
         self.ship_glow_controllers.clear()
         self.ship_emitters.clear()
+        self.ship_running_lights.clear()
+        self.ship_running_light_specs.clear()
         self.ship_articulation.clear()
         self.scope_hidden.clear()
+        self.warp_hidden_iids.clear()
         self.planet_instances.clear()
         self.planet_natural_scale.clear()
         # The bindings themselves died with the instances above; drop the
@@ -6482,6 +6618,12 @@ def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
         except Exception as _e:
             dev_mode.log_swallowed("realize ship_emitters cache", _e)
 
+        # Running lights (best-effort VFX); never block spawn.
+        try:
+            _register_running_lights(r_, session, ship, iid)
+        except Exception as _e:
+            dev_mode.log_swallowed("realize running lights", _e)
+
         # Shield render state. No-op for ships without a ShieldProperty.
         # The hull box is cached unconditionally (even for unshielded hulls) —
         # it costs nothing and keeps the two call sites symmetric.
@@ -6546,6 +6688,11 @@ def teardown_set_objects(session, pSet, renderer) -> None:
             # at the static pose until its deflection next CHANGED.
             session.ship_articulation.pop(iid, None)
             session.scope_hidden.discard(iid)
+            # Per-iid light caches (emitter lights, running lights): a
+            # recycled iid must not inherit a destroyed hull's lights.
+            session.ship_emitters.pop(iid, None)
+            session.ship_running_lights.pop(iid, None)
+            session.ship_running_light_specs.pop(iid, None)
             # The transform-slot binding died with the instance; drop the
             # re-bind guard so a re-realized object binds afresh.
             session.slot_bindings.pop(ship, None)
@@ -6783,6 +6930,8 @@ def _reconcile_runtime_instances(session, renderer, *,
                 session.ship_glow_controllers.pop(iid, None)
                 session.ship_articulation.pop(iid, None)
                 session.ship_emitters.pop(iid, None)
+                session.ship_running_lights.pop(iid, None)
+                session.ship_running_light_specs.pop(iid, None)
                 session.scope_hidden.discard(iid)
                 # The transform-slot binding died with the instance.
                 session.slot_bindings.pop(ship, None)
@@ -7669,6 +7818,12 @@ class _MissionLoader:
                 sess.ship_emitters[iid] = _build_ship_emitter_cache(ship)
             except Exception as _e:
                 dev_mode.log_swallowed("ship_emitters cache", _e)
+
+            # Running lights (best-effort VFX); never block spawn.
+            try:
+                _register_running_lights(r_, sess, ship, iid)
+            except Exception as _e:
+                dev_mode.log_swallowed("realize running lights", _e)
 
             # Register shield render state. Reads ShieldProperty data-bag
             # for glow color, decay, and skin-mode flag. No-op for ships
@@ -8924,17 +9079,22 @@ def drive_viewscreen_static_and_brightness(r, controller, ramp, dt,
 
 
 def _apply_bridge_player_visibility(r, player_iid, *, is_bridge, spv_open,
-                                    scope_hidden=False) -> None:
+                                    scope_hidden=False) -> frozenset:
     """Hide the player ship while in bridge view so it doesn't appear on its
     own viewscreen feed (and the centre-mounted forward cam doesn't clip its
     hull). No-op while the Ship Property Viewer owns the frame (it manages
     visibility itself). Idempotent — safe to call every frame.
 
     `scope_hidden`: the render scope hides the player while a cutscene shows
-    another frame (_reconcile_runtime_instances); this must not re-show it."""
+    another frame (_reconcile_runtime_instances); this must not re-show it.
+
+    Returns the iids it hid FOR BRIDGE VIEW (the player, or nothing), so the
+    running lights — which ignore the visible flag — go dark with the hull
+    (`_push_running_lights(hidden_iids=...)`)."""
     if spv_open or player_iid is None:
-        return
+        return frozenset()
     r.set_visible(player_iid, not is_bridge and not scope_hidden)
+    return frozenset((player_iid,)) if is_bridge else frozenset()
 
 
 def _ensure_target_menu() -> None:
@@ -9323,6 +9483,9 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
     _warp_hide = _wh.is_active() and _wh.streak_intensity() > 0.0
     _warp_apply_vis = _warp_hide or _warp_hidden
     _warp_hidden = _warp_hide
+    # The ships this frame's warp hide hides: their running lights ignore the
+    # visible flag, so _push_running_lights reads this to darken them too.
+    _warp_hid_iids = set()
     _live_ship_iids = []
     # Hull-discharge emissive boost for the player: `_hull_discharge` is a
     # module global (HullDischargeDriver | None).  Returns exactly 1.0 when
@@ -9402,6 +9565,8 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
         if _warp_apply_vis:
             r.set_visible(iid, not _warp_hide
                           and iid not in session.scope_hidden)
+            if _warp_hide:
+                _warp_hid_iids.add(iid)
         # NOTE: scale is read live, not interpolated — the
         # buffer only stores loc+rot. Fine for steady scale;
         # a mid-animation GetScale() change applies the
@@ -9419,6 +9584,7 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
         r.set_world_transform(
             iid, _world_matrix_from(_iloc, _irot, model_scale * _ps))
     xform_buf.prune(_live_ship_iids)
+    session.warp_hidden_iids = _warp_hid_iids
     # Drop controllers for instances no longer present. The
     # player iid is excluded from _live_ship_iids (handled by
     # the continue above), so key the keep-set on the full
@@ -10377,6 +10543,8 @@ def run(mission_name: Optional[str] = None,
                 _far_dials.register()
                 from engine.appc import sensor_dials as _sensor_dials
                 _sensor_dials.register()
+                from engine.appc import running_light_dials as _rl_dials
+                _rl_dials.register()
                 from engine.planets import atmosphere_dials as _atmo_dials
                 _atmo_dials.set_target_fn(
                     lambda: _nearest_live_planet(controller.session)
@@ -12440,7 +12608,7 @@ def run(mission_name: Optional[str] = None,
             # the player is on the bridge in state. Without this the hide-on-
             # bridge (so the ship doesn't show on its own viewscreen) leaves the
             # cutscene exterior empty — the ship you're watching is invisible.
-            _apply_bridge_player_visibility(
+            _bridge_hidden_iids = _apply_bridge_player_visibility(
                 r, _player_iid_vs,
                 is_bridge=view_mode.is_bridge and _cc is None, spv_open=_spv_open,
                 scope_hidden=(session is not None
@@ -12608,6 +12776,7 @@ def run(mission_name: Optional[str] = None,
                 r, active_set, _warp_streaking, player=player)
 
             _push_cloak_refraction(r, session, player)
+            _push_running_lights(r, session, hidden_iids=_bridge_hidden_iids)
 
             _pump_letterbox(r, _letterbox_anim, _player_dt)
 

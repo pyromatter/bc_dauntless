@@ -463,6 +463,23 @@ def _implicit_relative_fixer(file_path, logical_rel):
     return _FixImplicitRelativeImport(pkg, sibling_dirs, logical.stem)
 
 
+def _module_tree(path, fullname):
+    """The AST an SDK-loader file compiles from: parsed from source, or --
+    for a mod-provided Python 1.5 `.pyc` with no `.py` -- lifted from its
+    bytecode by engine.py15 into the tree that source would have parsed to.
+    Only _mod_override_spec ever hands this a `.pyc`; stock always loads
+    from SDK source. Mirrors tools/mission_harness._module_tree."""
+    if str(path).lower().endswith(".pyc"):
+        from engine import py15
+        return py15.load_tree(path, fullname)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        source = f.read()
+    source = _fix_py2_syntax(source.expandtabs(4))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return ast.parse(source, filename=path)
+
+
 class _SDKLoader(importlib.abc.Loader):
     """Load an SDK script with Python 2 compatibility fixes applied."""
 
@@ -479,13 +496,7 @@ class _SDKLoader(importlib.abc.Loader):
         return None
 
     def exec_module(self, module):
-        with open(self.path, encoding="utf-8", errors="replace") as f:
-            source = f.read()
-        source = source.expandtabs(4)
-        source = _fix_py2_syntax(source)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            tree = ast.parse(source, filename=self.path)
+        tree = _module_tree(self.path, module.__name__)
         tree = _MoveGlobalsToTop().visit(tree)
         tree = _implicit_relative_fixer(self.path, self.logical_rel).visit(tree)
         tree = _FixDottedImport().visit(tree)
@@ -559,7 +570,11 @@ def _mod_override_spec(fullname, logical, qualified=None):
     if not _mods_may_override(fullname):
         return None
     qualified = qualified or fullname
-    for suffix, is_pkg in ((".py", False), ("/__init__.py", True)):
+    # A mod's .py always beats a .pyc for the same module (Python 1.5's own
+    # rule when the two disagree), so the bytecode arms come last. Only mod
+    # files ever reach engine.py15 -- see _module_tree.
+    for suffix, is_pkg in ((".py", False), ("/__init__.py", True),
+                           (".pyc", False), ("/__init__.pyc", True)):
         hit = _mods.sdk_override(logical + suffix)
         if hit is None:
             continue
@@ -728,16 +743,18 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
             # No stock file of that name anywhere, but a mod may still add one
             # in a subdirectory -- this branch is the only route to it. Cannot
             # change stock behaviour: it runs only when the rglob found nothing.
-            for _key, _mf in sorted(_mods.current().files.items()):
-                if _mf.target != "sdk" or "/" not in _key:  # paths-guard: kind label
-                    continue
-                if _key.rpartition("/")[2] != fullname.lower() + ".py":
-                    continue
-                _logical = _key[:-len(".py")]
-                _spec = _mod_override_spec(
-                    fullname, _logical, _stock_dotted_name(_logical, fullname))
-                if _spec is not None:
-                    return _spec
+            # Any mod's .py beats any mod's .pyc (spec 4.3), across directories.
+            for _suffix in (".py", ".pyc"):
+                for _key, _mf in sorted(_mods.current().files.items()):
+                    if _mf.target != "sdk" or "/" not in _key:  # paths-guard: kind label
+                        continue
+                    if _key.rpartition("/")[2] != fullname.lower() + _suffix:
+                        continue
+                    _logical = _key[:-len(_suffix)]
+                    _spec = _mod_override_spec(
+                        fullname, _logical, _stock_dotted_name(_logical, fullname))
+                    if _spec is not None:
+                        return _spec
         return None
 
 
@@ -929,10 +946,13 @@ def _reset_leakable_engine_globals():
     # The projectile-module cache memoises import FAILURES, so one test
     # firing a tube with an unimportable script would otherwise decide every
     # later test's torpedoes for that script name.
+    # Same for the once-only [weapons] announcements: one test's missing
+    # module would otherwise silence the line for every later test.
     try:
         from engine.appc.weapon_subsystems import (
-            _reset_projectile_module_cache)
+            _announced, _reset_projectile_module_cache)
         _reset_projectile_module_cache()
+        _announced.clear()
     except Exception:
         pass
     # Part-articulation dev override: a forced wing deflection set by one test
@@ -1509,6 +1529,12 @@ def _reset_leakable_engine_globals():
         sensor_dials.reset()
     except Exception:
         pass
+    # Running-light dials: same leak shape as the sensor dials above.
+    try:
+        from engine.appc import running_light_dials as _rl_dials
+        _rl_dials.reset()
+    except Exception:
+        pass
     # Occlusion caches: per-(observer,target) and per-set major-rock lists
     # keyed on game time/tick time/bucket size, so a test that cached a
     # blocked() answer would otherwise leave it stale for the next test.
@@ -1601,6 +1627,16 @@ def _reset_leakable_engine_globals():
     # snapshot above: this dict is process-lifetime and never reset by
     # production code (the geometry never changes), so this only ever does
     # real work once.
+    # Authored-point part answers (part_severance.part_for_mount) and the
+    # leaf -> model handles they query: both process-lifetime caches, so a
+    # test's fake geometry would otherwise answer for every later test.
+    try:
+        from engine.appc import articulation as _articulation_models
+        from engine.appc import part_severance as _part_severance_mod
+        _articulation_models._leaf_models.clear()
+        _part_severance_mod._mount_parts.clear()
+    except Exception:
+        pass
     try:
         from engine.appc import articulation as _articulation_mod
         if "birdofprey" not in _articulation_mod._derived_boxes:
