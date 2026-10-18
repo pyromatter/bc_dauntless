@@ -35,9 +35,42 @@ def host():
 
 @pytest.fixture(autouse=True)
 def _clean_profiler(host):
+    # Most of this module covers the GPU query path, so it opts in to GPU
+    # timing, which is OFF by default (perf-register.md M-6). The CPU-only
+    # tests turn it back off themselves.
     host.profiler_set_enabled(False)
+    host.profiler_set_gpu_enabled(True)
     yield
     host.profiler_set_enabled(False)
+    host.profiler_set_gpu_enabled(False)
+
+
+def test_cpu_only_mode_issues_no_gpu_queries_and_still_times_the_cpu(host):
+    """GPU timing off is the default because the queries themselves make the
+    CPU wait for the GPU (perf-register.md SIG-019). Off must mean no query of
+    any kind, while the CPU column keeps measuring."""
+    host.profiler_set_gpu_enabled(False)
+    host.profiler_set_enabled(True)
+    _run_frames(20)
+    f = host.profiler_frame()
+    assert f["gpu_requested"] is False, f
+    assert f["gpu_timer"] == "none", f
+    assert f["gpu_queries"] is False, f
+    assert f["timestamp_queries"] == 0, f
+    scopes = host.profiler_scopes()
+    assert scopes, "nothing resolved"
+    assert not any(s["gpu_measured"] for s in scopes), scopes
+    frame_row = [s for s in scopes if s["name"] == "frame"][0]
+    assert frame_row["cpu_ms"] > 0.0, frame_row
+
+
+def test_requesting_gpu_timing_uses_the_drivers_timer(host):
+    host.profiler_set_enabled(True)
+    _run_frames(8)
+    f = host.profiler_frame()
+    assert f["gpu_requested"] is True, f
+    assert f["gpu_timer"] == _expected_timer(f["timestamp_bits"],
+                                             f["elapsed_bits"]), f
 
 
 def _run_frames(n):
@@ -321,3 +354,22 @@ def test_the_whole_frame_gpu_total_agrees_with_the_frame_row(host):
     # returns zeros they are both 0.
     assert abs(total - by_name["frame"]["gpu_ms"]) <= 0.5 + 0.05 * total, (
         total, by_name["frame"])
+
+
+def test_last_frame_raw_is_available_immediately_and_unsmoothed(host):
+    """The spike log reads the frame that JUST ended: no ring latency, and
+    the frame row's raw CPU time matches the whole-frame raw total."""
+    host.profiler_set_enabled(True)
+    _run_frames(1)
+    raw = host.profiler_last_frame_raw()
+    by_name = {s["name"]: s for s in raw["scopes"]}
+    assert "frame" in by_name, sorted(by_name)
+    assert by_name["frame"]["depth"] == 0
+    assert by_name["frame"]["cpu_ms"] > 0.0
+    assert by_name["frame"]["cpu_ms"] <= raw["cpu_ms"] + 1e-6
+    assert set(raw["scopes"][0]) == {"name", "cpu_ms", "calls", "depth"}
+
+
+def test_last_frame_raw_is_empty_when_disabled(host):
+    _run_frames(2)
+    assert host.profiler_last_frame_raw()["scopes"] == []

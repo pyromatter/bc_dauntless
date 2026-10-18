@@ -44,6 +44,14 @@ void FrameTimer::set_enabled(bool v) {
     reset();
 }
 
+void FrameTimer::set_gpu_requested(bool v) {
+    if (v == gpu_requested_) return;
+    gpu_requested_ = v;
+    // reset() also re-probes, so the next frame picks its timer from the new
+    // request. Called between frames (from Python), never with a query open.
+    if (enabled_) reset();
+}
+
 void FrameTimer::reset() {
     for (auto& rec : ring_) {
         rec.samples.clear();
@@ -74,6 +82,8 @@ void FrameTimer::reset() {
     open_t0_.clear();
     open_sample_.clear();
     results_.clear();
+    last_raw_.clear();
+    last_raw_cpu_ms_ = 0.0;
     frame_cpu_ms_ = 0.0;
     frame_gpu_ms_ = 0.0;
     cpu_total_seeded_ = false;
@@ -129,7 +139,7 @@ void FrameTimer::begin_frame() {
         glGetQueryiv(GL_TIME_ELAPSED, GL_QUERY_COUNTER_BITS, &te);
         timestamp_bits_ = ts;
         elapsed_bits_ = te;
-        gpu_timer_ = choose_gpu_timer(ts, te);
+        gpu_timer_ = select_gpu_timer(gpu_requested_, ts, te);
     }
 
     current_ = &next;
@@ -156,6 +166,21 @@ void FrameTimer::end_frame() {
     // corrupts the next frame's stack.
     while (!open_.empty()) pop();
     current_->frame_cpu_ns = static_cast<double>(now_ns() - frame_t0_);
+
+    last_raw_.clear();
+    last_raw_.reserve(current_->order.size());
+    for (int slot : current_->order) {
+        const auto i = static_cast<std::size_t>(slot);
+        if (i >= slots_.size()) continue;
+        ScopeResult r;
+        r.name = slots_[i].name;
+        r.cpu_ms = (i < current_->cpu_ns.size() ? current_->cpu_ns[i] : 0.0) / 1e6;
+        r.calls = (i < current_->calls.size() ? current_->calls[i] : 0);
+        r.depth = (i < current_->depth.size() ? current_->depth[i] : 0);
+        last_raw_.push_back(std::move(r));
+    }
+    last_raw_cpu_ms_ = current_->frame_cpu_ns / 1e6;
+
     current_->pending = true;
     current_ = nullptr;
     ++frame_index_;

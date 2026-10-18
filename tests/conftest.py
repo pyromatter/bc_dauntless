@@ -36,6 +36,24 @@ if not _RESOLUTION.ok:
         "s.set('paths','sdk','/path/to/sdk')\"\n"
     )
 
+# Hermetic user data: every write site resolves under a throwaway data dir
+# (removed at interpreter exit), and the content roots are pinned in the
+# environment so a later paths.resolve() finds them without the developer's
+# real settings.json. setdefault, so a developer's own env still wins.
+import atexit
+import shutil
+import tempfile
+
+from engine import mods as _mods
+
+if _paths.DATA_DIR_ENV not in os.environ:
+    _TEST_DATA_DIR = tempfile.mkdtemp(prefix="dauntless-test-data-")
+    os.environ[_paths.DATA_DIR_ENV] = _TEST_DATA_DIR
+    atexit.register(shutil.rmtree, _TEST_DATA_DIR, ignore_errors=True)
+for _kind, _root in (("game", _RESOLUTION.game), ("sdk", _RESOLUTION.sdk)):  # paths-guard: ENV_VARS kind labels
+    os.environ.setdefault(_paths.ENV_VARS[_kind], str(_root))
+os.environ.setdefault(_mods.ENV_VAR, str(PROJECT_ROOT / "mods"))
+
 SDK_SCRIPTS = _paths.sdk_scripts()
 
 # Make the C++-built _dauntless_host extension importable. CMake outputs it
@@ -496,15 +514,24 @@ class _SDKLoader(importlib.abc.Loader):
         return None
 
     def exec_module(self, module):
-        tree = _module_tree(self.path, module.__name__)
-        tree = _MoveGlobalsToTop().visit(tree)
-        tree = _implicit_relative_fixer(self.path, self.logical_rel).visit(tree)
-        tree = _FixDottedImport().visit(tree)
-        tree = _FixPy2Sort().visit(tree)
-        tree = _FixDictKeysIter().visit(tree)
-        tree = _FixPy2Compare().visit(tree)
-        ast.fix_missing_locations(tree)
-        code = compile(tree, self.path, "exec")
+        fixer = _implicit_relative_fixer(self.path, self.logical_rel)
+
+        def build():
+            tree = _module_tree(self.path, module.__name__)
+            tree = _MoveGlobalsToTop().visit(tree)
+            tree = fixer.visit(tree)
+            tree = _FixDottedImport().visit(tree)
+            tree = _FixPy2Sort().visit(tree)
+            tree = _FixDictKeysIter().visit(tree)
+            tree = _FixPy2Compare().visit(tree)
+            ast.fix_missing_locations(tree)
+            return compile(tree, self.path, "exec")
+        # Parse + transform + compile once per file content. Keep in sync
+        # with the twin in tools/mission_harness.py.
+        from engine import sdk_code_cache
+        code = sdk_code_cache.compiled(
+            __name__, self.path, module.__name__, (fixer._pkg, fixer._self_name),
+            fixer._sibling_dirs, build)
         module.__dict__.setdefault('apply', lambda f, a=(), kw={}: f(*a, **kw))
         # SDK loadspacehelper.py:91 calls `reload(mod)` after ClearLocalTemplates()
         # to re-register hardpoint templates by re-running the module top-level.
@@ -633,6 +660,16 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
             return None
         if (PROJECT_ROOT / rel).is_dir() and (PROJECT_ROOT / rel / "__init__.py").exists():
             return None
+        # Dotted names Dauntless claims outright (spec 2026-10-16 §8.1):
+        # after the project-root shims, BEFORE the mod overlay, so a mod's
+        # own copy of a claimed package never loads.
+        from engine.compat import claimed as _claimed
+        # claimed.py's own imports re-enter this finder while it is still
+        # half-initialised; it has no claimed_spec yet, so decline.
+        _claimed_spec = getattr(_claimed, "claimed_spec", None)
+        _cspec = _claimed_spec(fullname) if _claimed_spec is not None else None
+        if _cspec is not None:
+            return _cspec
         # An installed mod's script wins over the stock SDK module. Checked
         # after the project-root shims (those are OUR replacements and must
         # not be overridable) and before the SDK itself. Never over the
@@ -900,6 +937,12 @@ def _reset_leakable_engine_globals():
         _mods.configure(None)
     except Exception:
         pass
+    # Warp preload: begin/active/end hold one module-global Preload.
+    try:
+        from engine import warp_preload as _warp_preload
+        _warp_preload.end()
+    except Exception:
+        pass
     # Ship catalog memo (engine/ship_catalog/catalog.py): keyed on the mod
     # index, but a test that mutates a ShipDef in place would otherwise leak
     # a stale snapshot into the next test that happens to share the index.
@@ -908,6 +951,13 @@ def _reset_leakable_engine_globals():
     try:
         from engine import ship_catalog as _ship_catalog
         _ship_catalog.reset_session()
+    except Exception:
+        pass
+    # Queued ET_SET_ALERT_LEVEL levels (engine/appc/ships.py): a test that
+    # posts without ticking would land its level on a later test's ship.
+    try:
+        from engine.appc import ships as _ships
+        del _ships._pending_alert_levels[:]
     except Exception:
         pass
     # Swapped-module split: fixtures that re-import an SDK module
@@ -960,6 +1010,12 @@ def _reset_leakable_engine_globals():
     try:
         from engine.appc import articulation as _articulation
         _articulation.reset()
+    except Exception:
+        pass
+    # Physical-parent preview overlay + one-time missing-part warnings.
+    try:
+        from engine.appc import physical_parents as _physical_parents
+        _physical_parents.reset()
     except Exception:
         pass
     # SPV Model Parts pane: expanded/selection are module-level (mirrors the
@@ -1106,6 +1162,19 @@ def _reset_leakable_engine_globals():
     try:
         import _dauntless_host as _host
         _host.ambient_gradient_set_enabled(True)
+    except Exception:
+        pass
+    # Bridge probe stash (origin + per-state scales) is process-lifetime C++
+    # state too: any host_loop.run() of a bridge mission leaves it at the
+    # bridge camera eye with scales 0, which broke
+    # test_bridge_editor_bindings.py::test_probe_stash_is_at_defaults
+    # whenever it ran after one. A pending capture is NOT reset here (no
+    # production clear exists; draining it takes a GL init/shutdown), so that
+    # tripwire still catches a test that leaks one.
+    try:
+        import _dauntless_host as _host
+        _host.set_bridge_probe_origin((0.0, 0.0, 0.0))
+        _host.set_bridge_probe_scales((1.0,) * 5)
     except Exception:
         pass
     # Hull-hit smoke beam throttle: keyed by (id(target), id(source)), and
@@ -1789,6 +1858,30 @@ def _reset_leakable_engine_globals():
     # reset would raise StaleHandleError the next time it was read. The real
     # fix is the rule the conformance suite already states and follows:
     # every test that allocates a transform handle must free it.
+    # Legacy FX API surface (spec 2026-10-16): global glow/specular flags and
+    # per-object glow disables.
+    try:
+        from engine.appc import glow_maps as _glow_maps
+        _glow_maps.reset()
+    except Exception:
+        pass
+    try:
+        from engine.compat import claimed as _claimed
+        _claimed.reset()
+    except Exception:
+        pass
+    try:
+        from engine.planets import atmosphere as _atmo_req
+        _atmo_req.clear_requested()
+    except Exception:
+        pass
+    try:
+        from engine import sprites as _sprites
+        _sprites.reset()
+        from engine.appc import texture_anim as _texture_anim
+        _texture_anim.reset()
+    except Exception:
+        pass
 
 
 def bop_fixture_rig():

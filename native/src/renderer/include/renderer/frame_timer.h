@@ -73,6 +73,18 @@ public:
                                   : GpuTimer::None;
     }
 
+    /// The GPU timer to use: none unless GPU timing was requested, else the
+    /// driver's choice. GPU timing is OPT-IN: on Apple's GL the queries make
+    /// the CPU wait for the GPU every frame, adding about the GPU frame time
+    /// (docs/engine/perf-register.md, M-6), so a capture that times the GPU
+    /// cannot also be read for frame time.
+    static constexpr GpuTimer select_gpu_timer(bool requested,
+                                               int timestamp_bits,
+                                               int elapsed_bits) {
+        return requested ? choose_gpu_timer(timestamp_bits, elapsed_bits)
+                         : GpuTimer::None;
+    }
+
     /// Under GL_TIME_ELAPSED, the one scope depth that gets a query: the
     /// children of the outermost scope. They are sequential, so at most one
     /// TIME_ELAPSED query is ever active.
@@ -94,6 +106,12 @@ public:
     /// recording. Either way the query pool is dropped (see reset()), so the
     /// next enable generates fresh queries in whatever context is current.
     void set_enabled(bool v);
+
+    /// Opt in to (or out of) GPU timing. Off by default; see
+    /// select_gpu_timer. A change while enabled resets the averages, like
+    /// set_enabled, so one report never mixes timed and untimed frames.
+    void set_gpu_requested(bool v);
+    bool gpu_requested() const { return gpu_requested_; }
 
     /// Frame boundary. begin_frame resolves the oldest pending record and
     /// starts a new one; end_frame closes it. Both are no-ops when disabled.
@@ -118,6 +136,13 @@ public:
     /// A scope that stops running simply leaves the table; its average keeps
     /// decaying internally in case it comes back.
     const std::vector<ScopeResult>& results() const { return results_; }
+
+    /// The frame end_frame() just closed, CPU only and RAW: not smoothed and
+    /// not lagged by the ring (CPU time is known at pop). gpu_ms is 0 and
+    /// gpu_measured false on every row. For the spike log, which needs one
+    /// long frame's own numbers -- the EMA in results() hides a single hitch.
+    const std::vector<ScopeResult>& last_frame_raw() const { return last_raw_; }
+    double last_frame_raw_cpu_ms() const { return last_raw_cpu_ms_; }
 
     /// Whole-frame totals, EMA-smoothed, in ms.
     double frame_cpu_ms() const { return frame_cpu_ms_; }
@@ -204,6 +229,7 @@ private:
     bool enabled_ = false;
     bool gpu_probed_ = false;                    // counter bits read this enable
     GpuTimer gpu_timer_ = GpuTimer::None;
+    bool gpu_requested_ = false;
     int timestamp_bits_ = -1;
     int elapsed_bits_ = -1;
     bool elapsed_open_ = false;                  // a TIME_ELAPSED query is active
@@ -226,6 +252,8 @@ private:
     bool   gpu_total_seeded_ = false;
 
     std::vector<ScopeResult> results_;
+    std::vector<ScopeResult> last_raw_;
+    double last_raw_cpu_ms_ = 0.0;
 };
 
 /// RAII scope. Zero cost when the timer is disabled.
