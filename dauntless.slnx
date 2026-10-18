@@ -1,0 +1,396 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Solution>
+	<Configurations>
+		<BuildType Name="Debug"/>
+		<BuildType Name="Release"/>
+		<BuildType Name="MinSizeRel"/>
+		<BuildType Name="RelWithDebInfo"/>
+		<Platform Name="x64"/>
+	</Configurations>
+	<Project Path="_deps/openal_soft-build/OpenAL.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="dbdd02b5-108e-38dc-aba5-538947f61721">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="_deps/openal_soft-build/build_version.vcxproj"/>
+	</Project>
+	<Project Path="native/src/host/_dauntless_host.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="d0c83338-2a5a-38a5-8f37-c3d07302b3db">
+		<BuildDependency Project="_deps/openal_soft-build/OpenAL.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/src/audio/dauntless_audio.vcxproj"/>
+		<BuildDependency Project="native/src/host/dauntless_host_core.vcxproj"/>
+		<BuildDependency Project="native/src/transforms/dauntless_transforms.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="native/libcef_dll_wrapper/libcef_dll_wrapper.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/platform/platform.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/ui_cef/ui_cef.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/src/assets/assets.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="3aa13c3f-f522-30fc-abde-e484fac9475f">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/assets/assets_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="1a54f2f9-d243-38ba-8721-46f68304a893">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/audio/audio_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="24215b2f-572a-33ea-9b5e-a220ccac966d">
+		<BuildDependency Project="_deps/openal_soft-build/OpenAL.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/audio/dauntless_audio.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+	</Project>
+	<Project Path="_deps/openal_soft-build/build_version.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="3d69242f-1665-33b3-a7f2-42d3aeada0c0">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="_deps/openal_soft-build/common.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="290d4283-49d2-3b29-9b2b-ab81f2041c00">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/src/host/dauntless.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="dd2d612e-cce4-3c14-865f-f9250ede0ca2">
+		<BuildDependency Project="_deps/openal_soft-build/OpenAL.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/src/audio/dauntless_audio.vcxproj"/>
+		<BuildDependency Project="native/src/host/dauntless_host_core.vcxproj"/>
+		<BuildDependency Project="native/src/transforms/dauntless_transforms.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="native/libcef_dll_wrapper/libcef_dll_wrapper.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/platform/platform.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/ui_cef/ui_cef.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/src/audio/dauntless_audio.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="bcb2b01a-36b7-36f6-89fe-e919eba5bb60">
+		<BuildDependency Project="_deps/openal_soft-build/OpenAL.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/src/host/dauntless_host_core.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="5873c4ab-c1c4-370f-b741-df11ffd3f2da">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/src/transforms/dauntless_transforms.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="d2acc3f3-a877-3d10-818c-d2e65c6d20ab">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/dump_bounds/dump_bounds.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="67ff4481-90a4-350d-a006-ebf19e13f9e6">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/dump_bridge_assets/dump_bridge_assets.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="835c1a34-d63a-3f77-8383-dffb464e75c0">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/dump_nif_tree/dump_nif_tree.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="c8f040d8-c877-38b9-be42-8d2438edbc84">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="_deps/openal_soft-build/ex-common.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="6a1a1a95-6be6-3db4-8d5d-78054c6206f3">
+		<BuildDependency Project="_deps/openal_soft-build/OpenAL.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/third_party/glad/glad.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="c2b851ec-64c2-3c86-a257-7d2e960142d4">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="_deps/googletest-build/googlemock/gmock.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="83ede316-c4b9-3c01-86fd-a8deb51983b8">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="_deps/googletest-build/googlemock/gmock_main.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="7939b346-91cd-34c3-8da8-02c9f2a8b2f6">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="_deps/googletest-build/googletest/gtest.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="0225fd3d-ea5b-3eda-9cd3-dfab555420dd">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="_deps/googletest-build/googletest/gtest_main.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="fa4c90d5-344a-3c9a-836d-2fd5b7fdc7d3">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/host/host_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="2715d1ee-341c-38aa-8d67-71f213f489a4">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/src/host/dauntless_host_core.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/inspect_flip/inspect_flip.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="6e56e9e5-f741-39da-81da-77d2e6bde58b">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/inspect_materials/inspect_materials.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="f6be38e8-b53a-3ede-bbf0-8ea06f71b19b">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/inspect_tex_props/inspect_tex_props.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="cb2445f2-56e3-344f-9c98-36339b4143d6">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/libcef_dll_wrapper/libcef_dll_wrapper.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="461cff9c-02bd-3443-8b4b-fd12bdcf152a">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/src/nif/nif.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="fe6e03e0-d5a4-34c1-83a0-145ae9f8aa23">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/nif_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="c8d97dd4-cca5-35e8-9681-d4e7d396330f">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/src/platform/platform.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="9bcb455c-2231-379e-81c7-d239d23d6bb9">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/platform/platform_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="f0da8151-dd5f-32d6-94ba-6d156bf9274a">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/platform/platform.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/probe_animation_keys/probe_animation_keys.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="c771d60d-1ae6-3685-a2f8-e806f898df0c">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/probe_block_inventory/probe_block_inventory.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="9604ccff-6848-348c-b952-f8a082614126">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/probe_bound_radius/probe_bound_radius.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="8c29b0b2-cf5c-3e38-a472-54e1116e4faa">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/probe_officer_pose/probe_officer_pose.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="9688365e-734a-3ffe-9ebd-8dec167f7647">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/probe_shape_transforms/probe_shape_transforms.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="dbe4657f-2fc1-34f0-b923-1221784ba0a0">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/probe_texture_stages/probe_texture_stages.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="b0e05bd1-34f5-3b72-b166-e5ff7584196a">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/src/renderer/renderer.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="461c8210-3d14-3ea8-8e52-d83b81eb392c">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/renderer/renderer_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="13833829-658d-333c-86a4-75531dcdb00c">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/rock_catalogue/rock_catalogue.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="1021ddcf-c14b-3576-85ac-cd617e0f33a7">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/tools/rock_catalogue/rock_catalogue_writer.vcxproj"/>
+		<BuildDependency Project="native/src/rockgen/rockgen.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/rock_catalogue/rock_catalogue_writer.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="eab33ba8-eda4-3440-9282-04f08c8464d5">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/rockgen/rockgen.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/src/rockgen/rockgen.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="146cc6c8-4164-3535-a19e-47d44f86e2a8">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/rockgen/rockgen_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="ee14e01c-816a-3992-99f0-5341fff2cb39">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/tools/rock_catalogue/rock_catalogue_writer.vcxproj"/>
+		<BuildDependency Project="native/src/rockgen/rockgen.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/scan_nifs/scan_nifs.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="c364ad00-8558-3d2a-827b-76ca57299b97">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/src/scenegraph/scenegraph.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="2cec477b-9875-3343-8a0f-2bc61540f450">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/scenegraph/scenegraph_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="87379322-f488-32f9-936c-771011f5b465">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/transforms/transform_store_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="7f6e4631-d3ff-30c2-90d6-7d46921d972d">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/transforms/dauntless_transforms.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+	</Project>
+	<Project Path="native/src/ui_cef/ui_cef.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="b9d95c5f-f353-3915-ba1f-8e90661d1560">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+		<BuildDependency Project="native/libcef_dll_wrapper/libcef_dll_wrapper.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/platform/platform.vcxproj"/>
+		<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+		<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/src/voxel/voxel.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="19ef1dab-5259-3fc7-9322-1149348fddb9">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+	</Project>
+	<Project Path="native/tools/voxel_inspect/voxel_inspect.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="128adb94-6fc2-3a2b-8702-617024a7ca49">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Project Path="native/tests/voxel/voxel_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="a37c1c56-73ec-3591-bdad-7c85dc4f370b">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+		<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+		<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+		<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+		<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+	</Project>
+	<Folder Name="/CMakePredefinedTargets/">
+		<Project Path="ALL_BUILD.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="77ecadf9-f8b9-3370-ad1c-5392b87a13cb" DefaultStartup="true">
+			<BuildDependency Project="_deps/openal_soft-build/OpenAL.vcxproj"/>
+			<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+			<BuildDependency Project="native/src/host/_dauntless_host.vcxproj"/>
+			<BuildDependency Project="native/src/assets/assets.vcxproj"/>
+			<BuildDependency Project="native/tests/assets/assets_tests.vcxproj"/>
+			<BuildDependency Project="native/tests/audio/audio_tests.vcxproj"/>
+			<BuildDependency Project="native/src/host/dauntless.vcxproj"/>
+			<BuildDependency Project="native/src/audio/dauntless_audio.vcxproj"/>
+			<BuildDependency Project="native/src/host/dauntless_host_core.vcxproj"/>
+			<BuildDependency Project="native/src/transforms/dauntless_transforms.vcxproj"/>
+			<BuildDependency Project="native/tools/dump_bounds/dump_bounds.vcxproj"/>
+			<BuildDependency Project="native/tools/dump_bridge_assets/dump_bridge_assets.vcxproj"/>
+			<BuildDependency Project="native/tools/dump_nif_tree/dump_nif_tree.vcxproj"/>
+			<BuildDependency Project="native/third_party/glad/glad.vcxproj"/>
+			<BuildDependency Project="native/third_party/glfw/src/glfw.vcxproj"/>
+			<BuildDependency Project="_deps/googletest-build/googlemock/gmock.vcxproj"/>
+			<BuildDependency Project="_deps/googletest-build/googlemock/gmock_main.vcxproj"/>
+			<BuildDependency Project="_deps/googletest-build/googletest/gtest.vcxproj"/>
+			<BuildDependency Project="_deps/googletest-build/googletest/gtest_main.vcxproj"/>
+			<BuildDependency Project="native/tests/host/host_tests.vcxproj"/>
+			<BuildDependency Project="native/tools/inspect_flip/inspect_flip.vcxproj"/>
+			<BuildDependency Project="native/tools/inspect_materials/inspect_materials.vcxproj"/>
+			<BuildDependency Project="native/tools/inspect_tex_props/inspect_tex_props.vcxproj"/>
+			<BuildDependency Project="native/libcef_dll_wrapper/libcef_dll_wrapper.vcxproj"/>
+			<BuildDependency Project="native/src/nif/nif.vcxproj"/>
+			<BuildDependency Project="native/tests/nif_tests.vcxproj"/>
+			<BuildDependency Project="native/src/platform/platform.vcxproj"/>
+			<BuildDependency Project="native/tests/platform/platform_tests.vcxproj"/>
+			<BuildDependency Project="native/tools/probe_animation_keys/probe_animation_keys.vcxproj"/>
+			<BuildDependency Project="native/tools/probe_block_inventory/probe_block_inventory.vcxproj"/>
+			<BuildDependency Project="native/tools/probe_bound_radius/probe_bound_radius.vcxproj"/>
+			<BuildDependency Project="native/tools/probe_officer_pose/probe_officer_pose.vcxproj"/>
+			<BuildDependency Project="native/tools/probe_shape_transforms/probe_shape_transforms.vcxproj"/>
+			<BuildDependency Project="native/tools/probe_texture_stages/probe_texture_stages.vcxproj"/>
+			<BuildDependency Project="native/src/renderer/renderer.vcxproj"/>
+			<BuildDependency Project="native/tests/renderer/renderer_tests.vcxproj"/>
+			<BuildDependency Project="native/tools/rock_catalogue/rock_catalogue.vcxproj"/>
+			<BuildDependency Project="native/tools/rock_catalogue/rock_catalogue_writer.vcxproj"/>
+			<BuildDependency Project="native/src/rockgen/rockgen.vcxproj"/>
+			<BuildDependency Project="native/tests/rockgen/rockgen_tests.vcxproj"/>
+			<BuildDependency Project="native/tools/scan_nifs/scan_nifs.vcxproj"/>
+			<BuildDependency Project="native/src/scenegraph/scenegraph.vcxproj"/>
+			<BuildDependency Project="native/tests/scenegraph/scenegraph_tests.vcxproj"/>
+			<BuildDependency Project="native/tests/transforms/transform_store_tests.vcxproj"/>
+			<BuildDependency Project="native/src/ui_cef/ui_cef.vcxproj"/>
+			<BuildDependency Project="native/src/voxel/voxel.vcxproj"/>
+			<BuildDependency Project="native/tools/voxel_inspect/voxel_inspect.vcxproj"/>
+			<BuildDependency Project="native/tests/voxel/voxel_tests.vcxproj"/>
+		</Project>
+		<Project Path="INSTALL.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="9b828141-1bf1-395c-8c9d-c48304d0ca56">
+			<BuildDependency Project="ALL_BUILD.vcxproj"/>
+			<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+			<Build Solution="Debug|*" Project="false"/>
+			<Build Solution="Release|*" Project="false"/>
+			<Build Solution="MinSizeRel|*" Project="false"/>
+			<Build Solution="RelWithDebInfo|*" Project="false"/>
+		</Project>
+		<Project Path="RUN_TESTS.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="f5a73dac-2905-3f0c-818b-4e60ceac7836">
+			<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+			<Build Solution="Debug|*" Project="false"/>
+			<Build Solution="Release|*" Project="false"/>
+			<Build Solution="MinSizeRel|*" Project="false"/>
+			<Build Solution="RelWithDebInfo|*" Project="false"/>
+		</Project>
+		<Project Path="ZERO_CHECK.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="9cdf69b3-0bd6-3c82-a4dd-6162f3c8a834"/>
+	</Folder>
+	<Folder Name="/GLFW3/">
+		<Project Path="native/third_party/glfw/src/glfw.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="51c1e7e8-bb32-33e8-b5e5-da39a1395d34">
+			<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		</Project>
+		<Project Path="native/third_party/glfw/src/update_mappings.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="4bfa88e5-e30b-35e6-9efa-fac113932d02">
+			<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+			<Build Solution="Debug|*" Project="false"/>
+			<Build Solution="Release|*" Project="false"/>
+			<Build Solution="MinSizeRel|*" Project="false"/>
+			<Build Solution="RelWithDebInfo|*" Project="false"/>
+		</Project>
+	</Folder>
+</Solution>

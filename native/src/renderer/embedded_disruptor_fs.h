@@ -1,0 +1,15 @@
+// Generated. Do not edit.
+#pragma once
+namespace renderer::shader_src {
+constexpr const char* disruptor_fs =
+R"GLSL(#version 410 core
+out vec4 frag_color;
+
+uniform vec4 u_color;   // flat unlit color; alpha carried through (bolt taper fade)
+
+void main() {
+    frag_color = u_color;
+}
+)GLSL"
+;
+}

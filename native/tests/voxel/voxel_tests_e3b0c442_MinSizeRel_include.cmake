@@ -1,0 +1,5 @@
+if(EXISTS "C:/Work/bc_dauntless/native/tests/voxel/voxel_tests_e3b0c442_MinSizeRel_tests.cmake")
+  include("C:/Work/bc_dauntless/native/tests/voxel/voxel_tests_e3b0c442_MinSizeRel_tests.cmake")
+else()
+  add_test(voxel_tests_NOT_BUILT voxel_tests_NOT_BUILT)
+endif()

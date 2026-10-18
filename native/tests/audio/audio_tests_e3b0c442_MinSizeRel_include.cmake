@@ -1,0 +1,5 @@
+if(EXISTS "C:/Work/bc_dauntless/native/tests/audio/audio_tests_e3b0c442_MinSizeRel_tests.cmake")
+  include("C:/Work/bc_dauntless/native/tests/audio/audio_tests_e3b0c442_MinSizeRel_tests.cmake")
+else()
+  add_test(audio_tests_NOT_BUILT audio_tests_NOT_BUILT)
+endif()

@@ -1,0 +1,5 @@
+if(EXISTS "C:/Work/bc_dauntless/native/tests/host/host_tests_e3b0c442_RelWithDebInfo_tests.cmake")
+  include("C:/Work/bc_dauntless/native/tests/host/host_tests_e3b0c442_RelWithDebInfo_tests.cmake")
+else()
+  add_test(host_tests_NOT_BUILT host_tests_NOT_BUILT)
+endif()

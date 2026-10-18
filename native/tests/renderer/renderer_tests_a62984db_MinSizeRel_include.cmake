@@ -1,0 +1,5 @@
+if(EXISTS "C:/Work/bc_dauntless/native/tests/renderer/renderer_tests_a62984db_MinSizeRel_tests.cmake")
+  include("C:/Work/bc_dauntless/native/tests/renderer/renderer_tests_a62984db_MinSizeRel_tests.cmake")
+else()
+  add_test(renderer_tests_NOT_BUILT renderer_tests_NOT_BUILT)
+endif()
