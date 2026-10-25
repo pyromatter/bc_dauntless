@@ -669,6 +669,23 @@ class _EnergyWeaponFireMixin:
     # PhaserBank overrides to 0.6. See the guide §8 constants above.
     REMOTE_FIRE_PRIORITY = REMOTE_PULSE_PRIORITY
 
+    # ── Weapon AI surface ────────────────────────────────────────────────────
+    # BC's PhaserBank / PulseWeapon / TractorBeam ARE Weapons; ours derive from
+    # WeaponSystem, so Weapon's two AI queries never reached them and fell
+    # through to a truthy _Stub. IntelligentCircleObject.py:234-238 then dotted
+    # the stub to 0 on every axis and filed every bank as pointing starboard,
+    # and PhaserSweep.py:182 compared a stub against its arc threshold.
+    # Same semantics as Weapon's versions (see Weapon.CalculateRoughDirection).
+
+    def CalculateRoughDirection(self) -> TGPoint3:
+        """WORLD-space mount direction, as Weapon.CalculateRoughDirection."""
+        return _emitter_world_direction(self, self._climb_to_ship())
+
+    def CalculateWeaponAppeal(self) -> float:
+        """Weapon.CalculateWeaponAppeal's approximation: 1.0 functional, 0.0
+        disabled. BC's formula is not recoverable from the SDK."""
+        return 0.0 if self.IsDisabled() else 1.0
+
     def _remote_fire_priority(self) -> float:
         return self.REMOTE_FIRE_PRIORITY
 
@@ -960,6 +977,32 @@ def _cloak_blocks_fire(weapon_system) -> bool:
     return cloak is not None and bool(cloak.IsTryingToCloak())
 
 
+# warp_state imports ships, which imports this module, so it cannot be bound at
+# import time. Resolved once on first use and cached (same cycle-breaking idea
+# as engine/appc/ship_motion.py's module-scope imports, but lazy).
+_warp_state_mod = None
+
+
+def _warp_state():
+    global _warp_state_mod
+    if _warp_state_mod is None:
+        from engine.appc import warp_state
+        _warp_state_mod = warp_state
+    return _warp_state_mod
+
+
+def _dewarp_blocks_fire(weapon_system) -> bool:
+    """True while the owning ship is sliding onto its warp-in placement
+    (warp-in spec 6.1, "During the slide": it holds fire until it has fully
+    arrived). Accepts any subsystem in the chain -- GetParentShip climbs.
+    Our rule, not recovered BC behaviour."""
+    ship = (weapon_system.GetParentShip()
+            if ids.implements(weapon_system, "GetParentShip") else None)
+    if ship is None:
+        return False
+    return _warp_state().is_arriving(ship)
+
+
 def _target_undetectable(weapon_system, target) -> bool:
     """True when the firing ship cannot detect *target* (fully cloaked, nebula
     lock-break, or degraded/offline sensors).
@@ -1054,7 +1097,12 @@ class Weapon(ShipSubsystem):
         runtime state and must no-op; "not implemented" is a bug and must shout.
 
         iReserved/iForce are kept for SDK signature compatibility and unused.
+
+        Bypasses WeaponSystem.StartFiring, so the warp-in hold-fire gate is
+        checked here too.
         """
+        if _dewarp_blocks_fire(self):
+            return
         self.Fire(target=None, offset=None)
 
     def CalculateRoughDirection(self) -> TGPoint3:
@@ -1327,6 +1375,9 @@ class WeaponSystem(PoweredSubsystem):
             return
         # Cloak gate: a cloaked / cloaking ship cannot fire (BC rule).
         if _cloak_blocks_fire(self):
+            return
+        # Warp-in gate: an arriving ship holds fire until it has landed.
+        if _dewarp_blocks_fire(self):
             return
         # Detectability gate: never fire (nor play warm-up SFX) at a target the
         # ship can't detect — cloaked, nebula-hidden, or out of sensor range.
@@ -2271,6 +2322,8 @@ class TractorBeamSystem(_HeldFireWeaponSystem):
         if _is_offline(self):
             return
         if _cloak_blocks_fire(self):
+            return
+        if _dewarp_blocks_fire(self):
             return
         self._add_target(target)
         self._fire_held = True
@@ -3434,11 +3487,34 @@ class TorpedoTube(Weapon):
         which stock BC calls on an ammo-type switch. TorpedoSystem.SetAmmoType
         calls it for every ready round of every tube when the selected slot
         actually CHANGES — stbc-oracle bible §4 T4 measured the switch
-        unloading the Sovereign's tubes for one full ReloadDelay."""
+        unloading the Sovereign's tubes for one full ReloadDelay.
+
+        Like BC it then posts ET_TORPEDO_FIRED: FUN_0057D9A0 ends in
+        TorpedoTube_PostTorpedoFiredEvent(0) (0x0057DA20) — type 0x800066,
+        source NULL, destination this tube. ConditionTorpsReady re-counts the
+        tubes on that event; without it the gate stayed latched ready through
+        the whole reload and FedAttack flew torpedo runs with every tube empty.
+        The NULL source is what keeps Episode7.TorpedoFired (which destroys the
+        destination tube on a roll) out: it bails when Torpedo_Cast fails."""
         if self._num_ready <= 0:
             return
         self._num_ready -= 1
         self._start_slot_cooldown(_game_time())
+        self._broadcast_unload()
+
+    def _broadcast_unload(self) -> None:
+        """ET_TORPEDO_FIRED with NO source and the TUBE as destination — BC's
+        unload notification (see UnloadTorpedo). Not _broadcast_torpedo_fired:
+        that one carries the projectile and is skipped without one."""
+        import App
+        from engine import dev_mode
+        try:
+            evt = App.TGEvent_Create()
+            evt.SetEventType(App.ET_TORPEDO_FIRED)
+            evt.SetDestination(self)
+            App.g_kEventManager.AddEvent(evt)
+        except Exception as _e:
+            dev_mode.log_swallowed("ET_TORPEDO_FIRED (unload) broadcast", _e)
 
     def IsDumbFire(self) -> int:
         """Torpedo tubes are dumbfire-capable in BC (no guidance).

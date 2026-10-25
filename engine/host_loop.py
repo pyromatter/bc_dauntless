@@ -30,6 +30,7 @@ from engine.core import frame_profiler
 from engine.dev_mission_picker import MissionPicker
 import engine.missions as _missions
 from engine.ui.target_reticle import build_target_reticle
+from engine.ui.viewscreen_bars import build_viewscreen_bars
 from engine.ui.reticle_text import build_reticle_text, _ReticleCam
 from engine import manual_aim
 from engine import bridge_lighting as _bridge_lighting
@@ -725,11 +726,12 @@ def _poll_skip_dialogue(host, input_map) -> None:
     _skip_dialogue_prev = down
 
 
-def _articulated_running_lights(ship, iid, specs) -> tuple:
+def _articulated_running_lights(ship, iid, specs, severed_mask=None) -> tuple:
     """The 9-tuples to send for `specs` (rest positions), each light carried
     by the articulated part it sits on and dropped if that part was severed
-    (`_part_pose_at`). The part is the light's explicit physical parent when
-    set, else the geometric `part_for_mount` rule, via
+    (`_part_pose_at`) -- a rig part, or a structure part in `severed_mask`
+    (read here when None). The part is the light's explicit physical parent
+    when set, else the geometric `part_for_mount` rule, via
     `physical_parents.part_for_property`."""
     from engine.appc import part_pose
     from engine.appc.physical_parents import PropRef
@@ -740,7 +742,8 @@ def _articulated_running_lights(ship, iid, specs) -> tuple:
         # reaches these spawn-time specs without a respawn.
         prop = s.prop if s.prop is not None else PropRef(s.name,
                                                          s.physical_parent)
-        pose = _part_pose_at(ship, iid, s.pos, prop=prop)
+        pose = _part_pose_at(ship, iid, s.pos, prop=prop,
+                             severed_mask=severed_mask)
         if pose is _PART_SEVERED:
             continue
         if pose is not None:
@@ -753,38 +756,52 @@ def _register_running_lights(r, session, ship, iid) -> None:
     """Send a ship's BlinkingLightProperty running lights to native at spawn
     (running-lights spec §4.3). Unlit ships send nothing. The rest specs and
     the sent list are kept so `_push_running_lights` can re-send when an
-    articulated part moves."""
-    from engine.appc import running_lights
+    articulated part moves or a structure part breaks off."""
+    from engine.appc import hull_breakup, running_lights
     specs = running_lights.lights_for(ship)
     if not specs:
         return
     phase = running_lights.phase_for(ship)
     session.ship_running_lights[iid] = phase
-    sent = _articulated_running_lights(ship, iid, specs)
-    session.ship_running_light_specs[iid] = (tuple(specs), sent)
+    mask = hull_breakup.severed_mask(iid)
+    sent = _articulated_running_lights(ship, iid, specs, severed_mask=mask)
+    session.ship_running_light_specs[iid] = (tuple(specs), sent, mask)
     r.set_running_lights(iid, list(sent), phase)
+
+
+def _restore_running_lights(r, session, ship, iid) -> None:
+    """The SPV closed over `iid` (SPV running-lights spec §3.5): put back
+    what spawn sent -- the last sent list with its phase -- or, for a ship
+    unlit at spawn, remove the preview so no orphan lights stay in native."""
+    if session is not None and iid in session.ship_running_lights:
+        sent = session.ship_running_light_specs[iid][1]
+        r.set_running_lights(iid, list(sent), session.ship_running_lights[iid])
+    else:
+        r.set_running_lights(iid, [], 0.0)
 
 
 def _resend_articulated_running_lights(r, session, ship, iid, phase) -> None:
-    """Re-send `ship`'s lights when an articulated part has moved them since
-    the last send. Native caches positions at send time and places them only
-    through the hull's own matrix, so a part's pose reaches the lights ONLY
-    through here. Unrigged ships cost one rig lookup."""
+    """Re-send `ship`'s lights when an articulated part has moved them, or a
+    structure part has broken off, since the last send. Native caches
+    positions at send time and places them only through the hull's own
+    matrix, so a part's pose -- or its loss -- reaches the lights ONLY
+    through here. An unrigged ship costs one rig lookup and one severed-mask
+    read, and is re-labelled only when that mask has changed."""
     record = session.ship_running_light_specs.get(iid)
     if record is None:
         return
-    from engine.appc import articulation
-    if not articulation.posed_part_names(ship):
+    from engine.appc import articulation, hull_breakup
+    specs, last, last_mask = record
+    mask = hull_breakup.severed_mask(iid)
+    if mask == last_mask and not articulation.posed_part_names(ship):
         return
-    specs, last = record
-    sent = _articulated_running_lights(ship, iid, specs)
-    if sent == last:
-        return
-    session.ship_running_light_specs[iid] = (specs, sent)
-    r.set_running_lights(iid, list(sent), phase)
+    sent = _articulated_running_lights(ship, iid, specs, severed_mask=mask)
+    session.ship_running_light_specs[iid] = (specs, sent, mask)
+    if sent != last:
+        r.set_running_lights(iid, list(sent), phase)
 
 
-def _push_running_lights(r, session, hidden_iids=()) -> None:
+def _push_running_lights(r, session, hidden_iids=(), preview_iids=()) -> None:
     """Per-frame running-light brightness + dials (spec §4.3). Level folds in
     death, power-plant state and the live cloak fraction; a vanished ship, or
     one whose hull the host loop hides, is sent 0. No lit ships => no calls.
@@ -795,6 +812,12 @@ def _push_running_lights(r, session, hidden_iids=()) -> None:
     the warp-transit hide (`session.warp_hidden_iids`, recorded by
     `_sync_instance_transforms` where it hides them) and `hidden_iids` — the
     bridge-view player hide, as returned by `_apply_bridge_player_visibility`.
+
+    `preview_iids` are the instances the open Ship Property Viewer is
+    previewing lights on (SPV running-lights spec §3.5): their articulated
+    re-send is skipped, or the SPV's own pose forcing would overwrite the
+    preview with the spawn lights. Closing the SPV restores them
+    (`_restore_running_lights`). Empty outside the SPV.
     """
     lit = getattr(session, "ship_running_lights", None)
     if not lit:
@@ -812,10 +835,11 @@ def _push_running_lights(r, session, hidden_iids=()) -> None:
         if ship is None or iid in hidden:
             levels.append((iid, 0.0))
             continue
-        try:
-            _resend_articulated_running_lights(r, session, ship, iid, phase)
-        except Exception as _e:
-            dev_mode.log_swallowed("running light articulation", _e)
+        if iid not in preview_iids:
+            try:
+                _resend_articulated_running_lights(r, session, ship, iid, phase)
+            except Exception as _e:
+                dev_mode.log_swallowed("running light articulation", _e)
         frac = 0.0
         get_cloak = getattr(ship, "GetCloakingSubsystem", None)
         cloak = get_cloak() if get_cloak is not None else None
@@ -1046,8 +1070,8 @@ def _advance_combat(ships, dt: float, ship_instances=None,
     """
     ships_list = list(ships)
 
-    # Refresh damage-carve eligibility for this tick before any hits are
-    # processed: player always + capped nearest/largest ships.
+    # Refresh damage eligibility (part severance) for this tick before any
+    # hits are processed: player always + capped nearest/largest ships.
     # See engine.appc.damage_eligibility.
     with frame_profiler.scope("cb.eligibility"):
         damage_eligibility.update(ships_list)
@@ -1074,20 +1098,27 @@ def _advance_combat(ships, dt: float, ship_instances=None,
         shockwaves.advance(dt)
         particles.advance(dt)
     with frame_profiler.scope("cb.death"):
-        ship_death.advance(dt)
+        with frame_profiler.scope("death.ship"):
+            ship_death.advance(dt)
         # Fireball lights age on the same clock as the death sequence that
         # scheduled them.
-        _explosion_lights.advance(dt)
+        with frame_profiler.scope("death.lights"):
+            _explosion_lights.advance(dt)
         from engine.appc import object_lifetime
-        object_lifetime.advance(dt)
+        with frame_profiler.scope("death.lifetime"):
+            object_lifetime.advance(dt)
     with frame_profiler.scope("cb.damage_sys"):
         from engine.appc import subsystem_cascade, warp_core_breach
-        subsystem_cascade.advance(dt)
-        warp_core_breach.advance(dt, ship_instances=ship_instances)
-        from engine.appc import core_breach_carve
-        core_breach_carve.advance(dt, ship_instances=ship_instances)
+        with frame_profiler.scope("dmg.cascade"):
+            subsystem_cascade.advance(dt)
+        with frame_profiler.scope("dmg.core_breach"):
+            warp_core_breach.advance(dt, ship_instances=ship_instances)
         from engine.appc import visible_damage
-        visible_damage.advance(dt, ship_instances=ship_instances)
+        with frame_profiler.scope("dmg.visible"):
+            visible_damage.advance(dt, ship_instances=ship_instances)
+        from engine.appc import internal_blast            # SPIKE (damage redesign)
+        with frame_profiler.scope("dmg.internal_blast"):
+            internal_blast.advance(dt, ship_instances=ship_instances)
         camera_shake.update(dt)
 
     # BC WeaponSystem tick: one update_weapons per armed system per frame.
@@ -1233,7 +1264,8 @@ def _advance_combat(ships, dt: float, ship_instances=None,
                 if damage > 0:
                     # LIGHT (PP_LOW) phaser power is "disable, don't destroy":
                     # damage routes to subsystems only, the hull takes no condition
-                    # damage and is not voxel-carved (verified by dev-console probe).
+                    # damage (verified by dev-console probe) and no plating wear
+                    # or severance share (hit_feedback._structural_hit).
                     # `sys_` is the firing PhaserSystem; read PP_LOW off it directly.
                     damage_hull = (sys_.GetPowerLevel() != sys_.PP_LOW
                                    if hasattr(sys_, "GetPowerLevel") else True)
@@ -1269,7 +1301,7 @@ def _push_combat_render_data(ships_list, *, ship_instances=None,
     # Per-frame VFX descriptor lists route through the host_io façade, which
     # no-ops when the native module is absent (headless). The hit/damage
     # bindings (ray_trace_mesh, shield_hit, world_to_body, …) inside the
-    # _build_* helpers and the combat/carve advances now route through
+    # _build_* helpers and the combat/damage advances now route through
     # host_io too, so nothing below consumes the raw `host` module.
     with frame_profiler.scope("cb.render_data"):
         host_io.set_torpedoes(_build_torpedo_render_data())
@@ -1279,6 +1311,8 @@ def _push_combat_render_data(ships_list, *, ship_instances=None,
             _build_emitter_light_render_data(ship_instances, ship_emitters,
                                              player=player)))
         host_io.set_shockwaves(_build_shockwave_render_data())
+        host_io.set_warp_in_flashes(_build_warp_in_flash_render_data())
+        host_io.set_warp_in_flash_params(_warp_in_flash_params())
         host_io.set_hit_vfx(_build_hit_vfx_render_data())
         host_io.set_particle_emitters(_build_particle_render_data(ship_instances))
         host_io.set_phaser_beams(_build_phaser_beam_render_data(
@@ -1681,7 +1715,14 @@ def _build_explosion_light_render_data():
 _PART_SEVERED = object()
 
 
-def _part_pose_at(ship, iid, position, prop=None):
+def _forget_part_labels(iid) -> None:
+    """Drop a destroyed instance's cached structure-part light labels
+    (`hull_breakup.forget_instance`) so a recycled iid starts clean."""
+    from engine.appc import hull_breakup
+    hull_breakup.forget_instance(iid)
+
+
+def _part_pose_at(ship, iid, position, prop=None, severed_mask=None):
     """The live pose of the articulated part a hull-attached point sits on.
 
     `position` is the point's authored rest position (body frame, ship
@@ -1694,8 +1735,16 @@ def _part_pose_at(ship, iid, position, prop=None):
     at its identity pose), or `_PART_SEVERED` when its part has been shot
     off. Shared by every per-frame attached effect -- the subsystem emitter
     lights and the running lights -- so they follow exactly the pose
-    `_sync_ship_articulation` pushes to the renderer this frame."""
-    from engine.appc import articulation
+    `_sync_ship_articulation` pushes to the renderer this frame.
+
+    A STRUCTURE part (unrigged hulls, `hull_breakup`) that has broken off
+    also answers `_PART_SEVERED`: the point's `structure_part_at` label has
+    its bit set in the instance's severed mask (`severed_mask`, the caller's
+    once-per-ship read, or read here when None). Checked first, because
+    that is exactly the hull with no rig."""
+    from engine.appc import articulation, hull_breakup
+    if hull_breakup.on_severed_part(ship, iid, position, severed_mask):
+        return _PART_SEVERED
     names = articulation.posed_part_names(ship)
     if not names:
         return None
@@ -1720,7 +1769,7 @@ def _part_pose_at(ship, iid, position, prop=None):
     return pose
 
 
-def _articulate_emitter_light(ship, iid, spec, d):
+def _articulate_emitter_light(ship, iid, spec, d, severed_mask=None):
     """Carry body-frame light dict `d` with the articulated part it sits on,
     or return None when that part has been severed.
 
@@ -1738,9 +1787,11 @@ def _articulate_emitter_light(ship, iid, spec, d):
     tag could run before, silently tagging every light None forever.
 
     Identity -- the same dict, untouched -- for an unrigged ship, a light on
-    no part, or a part at its identity pose.
+    no part, or a part at its identity pose. `severed_mask` is the ship's
+    structure-part severed mask when the caller read it (`_part_pose_at`).
     """
-    pose = _part_pose_at(ship, iid, spec["position"])
+    pose = _part_pose_at(ship, iid, spec["position"],
+                         severed_mask=severed_mask)
     if pose is _PART_SEVERED:
         return None
     if pose is None:
@@ -1780,7 +1831,7 @@ def _build_emitter_light_render_data(ship_instances, ship_emitters,
     if not ship_instances or not ship_emitters:
         return out
     import App
-    from engine.appc import light_emitters
+    from engine.appc import hull_breakup, light_emitters
     if not light_emitters.enabled():
         return out          # Cinematic Lighting off — cast no emitter lights.
     from engine.appc.subsystem_glow import commanded_impulse_frac
@@ -1822,6 +1873,7 @@ def _build_emitter_light_render_data(ship_instances, ship_emitters,
         if fade is None:
             continue
         _wg = warp_glow if ship is player else None
+        severed = hull_breakup.severed_mask(iid)    # once per ship per frame
         for (sub, is_impulse, is_warp, phase, spec, struct) in entries:
             try:
                 inten = light_emitters.resolve_emitter_intensity(
@@ -1835,7 +1887,8 @@ def _build_emitter_light_render_data(ship_instances, ship_emitters,
                 # lights), so the light and the hull share one pose per frame
                 # — interpolated, live or mid-handover alike. Shallow copy is
                 # enough: every value in `struct` is an immutable tuple/float.
-                d = _articulate_emitter_light(ship, iid, spec, dict(struct))
+                d = _articulate_emitter_light(ship, iid, spec, dict(struct),
+                                              severed_mask=severed)
                 if d is None:
                     continue    # its part has been shot off
                 d["intensity"] = inten * fade
@@ -1864,6 +1917,48 @@ def _build_shockwave_render_data():
         d["world_center"] = pos
         out.append(d)
     return out
+
+
+def _build_warp_in_flash_render_data():
+    """Warp-in flashes (warp-in spec 6.3) in the viewed frame: the centre in
+    RENDER space, the forward axis unshifted (a direction). A flash whose set
+    is outside the viewed frame (or gone) stays out of the scene."""
+    import App  # deferred, as elsewhere in this module
+    from engine.appc import warp_in_flash as _warp_in_flash
+    out = []
+    view = _frames.viewing_set()
+    if view is None:
+        return out
+    for f in _warp_in_flash.active():
+        pSet = App.g_kSetManager.GetSet(f.set_name)
+        if pSet is None:
+            continue
+        pos = _frames.to_render(view, pSet, *f.center)
+        if pos is None:
+            continue
+        out.append({
+            "world_center": pos,
+            "forward": f.forward,
+            "radius": f.radius,
+            "age": f.age,
+            "lifetime": f.lifetime,
+        })
+    return out
+
+
+def _warp_in_flash_params() -> dict:
+    """The "warp in" dials as the native set_warp_in_flash_params dict."""
+    from engine.appc import warp_in_dials
+    d = warp_in_dials.current()
+    return {
+        "core_radii": d["core_radii"],
+        "streak_radii": d["streak_radii"],
+        "ring_radii": d["ring_radii"],
+        "intensity": d["intensity"],
+        "streak_end": d["streak_end"],
+        "ring_rise": d["ring_rise"],
+        "tint": (d["tint_r"], d["tint_g"], d["tint_b"]),
+    }
 
 
 def _build_hit_vfx_render_data():
@@ -3683,6 +3778,10 @@ def _developer_family_entry():
                 module_name="engine.dev_missions.felix_destroy",
                 dir_name="Felix Destroy",
                 display_name="Felix: Destroy (B2 baseline)",
+            ), MissionEntry(
+                module_name="engine.dev_missions.vesuvi_dust_cloud",
+                dir_name="Vesuvi Dust Cloud",
+                display_name="Vesuvi Dust Cloud (B3 baseline)",
             )],
         )],
     )
@@ -4416,20 +4515,25 @@ def _officer_zoom_factor(officer):
 _tooltip_dispatch_state = {"last": -1e9}
 
 
-def _start_hull_prebake() -> None:
-    """Kick off the boot-time hull-volume pre-bake (a daemon thread).
+# SDK modules the engine itself imports lazily in combat. The SDK loader
+# parses, transforms and compiles a script on its first import in a process
+# (engine/sdk_code_cache.py is in-memory), and only five SDK missions import
+# Effects themselves, so elsewhere the first death cascade blast or hull-hit
+# smoke paid it mid-combat: 15.8 ms of a dying Sovereign's death frame in
+# Debug (perf-register P-4). Effects' module body is `import App` and three
+# constants, so importing it early has no side effects.
+_PREWARM_SDK_MODULES = ("Effects",)
 
-    Runs after _setup_sdk (discovery imports ships/*.py through the SDK
-    finder) and after Foundation plugins (they add ship scripts). Best
-    effort by contract: the pre-bake only moves WHEN a bake happens, never
-    whether one does -- a hull it never reaches still bakes at spawn
-    exactly as before -- so nothing here may stop boot.
-    """
-    try:
-        from engine.appc import hull_volume
-        hull_volume.prebake_all()
-    except Exception as _e:  # noqa: BLE001 - never block boot
-        dev_mode.log_swallowed("start hull volume prebake", _e)
+
+def _prewarm_sdk_modules() -> None:
+    """Import _PREWARM_SDK_MODULES at boot, after _setup_sdk. Best effort:
+    a module that fails here still imports on first use, as before."""
+    import importlib
+    for name in _PREWARM_SDK_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as _e:  # noqa: BLE001 - never block boot
+            dev_mode.log_swallowed("prewarm SDK module %s" % name, _e)
 
 
 def _setup_sdk() -> None:
@@ -5438,10 +5542,12 @@ def _star_godray(player, star_render_pos):
     """The star as a steady god-ray source (system-nebula gate):
     toward the star from the render origin (the camera sits at ~0), at
     profile_fx.star_godray_intensity(godray_gain dial, the profile at the
-    player, the eye->star transmittance), in the map star's colour. None
-    when there is no light to cast (clear space, a fully veiled star) or the
-    star sits on the origin. Never a cloud-lighting flash: the haze already
-    forward-scatters the star."""
+    player, the eye->star transmittance), in the map star's colour, with its
+    render-space distance (hulls nearer than the star occlude its shafts and
+    never streak their own lights along them). None when there is no light to
+    cast (clear space, a fully veiled star) or the star sits on the origin.
+    Never a cloud-lighting flash: the haze already forward-scatters the
+    star."""
     from engine.systems import profile as _profile
     from engine.systems import profile_fx as _profile_fx
     intensity = _profile_fx.star_godray_intensity(
@@ -5456,7 +5562,7 @@ def _star_godray(player, star_render_pos):
     colour = (tuple(star.appearance.color)
               if star is not None and star.appearance.color else (1.0, 1.0, 1.0))
     return {"dir": (x / length, y / length, z / length),
-            "intensity": intensity, "color": colour}
+            "intensity": intensity, "color": colour, "distance": length}
 
 
 def _map_star(player):
@@ -6395,8 +6501,10 @@ class MissionSession:
     # Running lights registered at spawn: render InstanceId -> blink phase (s).
     # Fed per frame by _push_running_lights (running-lights spec §4.3).
     ship_running_lights: dict[object, float] = field(default_factory=dict)
-    # Running lights' rest specs + the list last sent, per render InstanceId,
-    # so a moving articulated part re-sends them (_resend_articulated_running_lights).
+    # Running lights per render InstanceId: (rest specs, the list last sent,
+    # the structure-part severed mask it was sent under), so a moving
+    # articulated part -- or a structure severance changing the mask --
+    # re-sends them (_resend_articulated_running_lights).
     ship_running_light_specs: dict[object, tuple] = field(default_factory=dict)
     ship_emitters: dict[object, list] = field(default_factory=dict)  # keyed by the renderer InstanceId (not int): the value is passed straight through as each light's instance_id
     planet_instances: dict[Any, int] = field(default_factory=dict)
@@ -6442,6 +6550,7 @@ class MissionSession:
         from engine.planets import surface as _surface
         for iid in list(self.ship_instances.values()):
             renderer.destroy_instance(iid)
+            _forget_part_labels(iid)
         for iid in list(self.planet_instances.values()):
             renderer.destroy_instance(iid)
         for iid in list(self.celestial_instances.values()):
@@ -6519,6 +6628,48 @@ def _cache_ship_hull_pieces(ship, handle, r_, iid=None) -> None:
         cache_hull_bound_spheres(ship, r_.model_bounds(handle), iid=iid)
     except Exception as _e:
         dev_mode.log_swallowed("realize hull bound spheres", _e)
+
+
+def _prewarm_trace_accel(r_, handle) -> None:
+    """Build the hull's ray-trace BVH at spawn rather than on its first trace
+    in combat (perf-register SIG-039/040: 7.7 ms on a station). ONE helper for
+    BOTH realize sites (realize_set_objects and _MissionLoader._realize_session).
+    Best-effort: never block spawn."""
+    try:
+        with frame_profiler.scope("realize.trace_prewarm"):
+            r_.prewarm_trace_accel(handle)
+    except Exception as _e:
+        dev_mode.log_swallowed("prewarm trace accel", _e)
+
+
+def _prefetch_hull_damage_state(r_, handle) -> None:
+    """Start the hull's damage-side worker loads at spawn: the fill volume
+    decode (the interior's left-the-ship test), so the first cut never loads
+    it synchronously, and the structure-part detection (severance's regions,
+    layered damage phase 4 §2.2), so a hull can sever on its first hit. ONE
+    helper for BOTH realize sites. Each is best-effort on its own: a renderer
+    missing one (a stale .so) never blocks spawn or skips the other."""
+    try:
+        r_.prefetch_hull_fill(handle)
+    except Exception as _e:
+        dev_mode.log_swallowed("prefetch hull fill", _e)
+    try:
+        r_.prefetch_structure_parts(handle)
+    except Exception as _e:
+        dev_mode.log_swallowed("prefetch structure parts", _e)
+
+
+def _mark_rigged(r_, iid, ship) -> None:
+    """Flag a rigged ship's instance native-side (layered damage phase 4
+    §2.1): at the identity pose its node overrides are empty, and the flag is
+    what keeps a hit there on the part it struck. ONE helper for BOTH realize
+    sites. Unrigged ships are never flagged. Best-effort: never block spawn."""
+    try:
+        from engine.appc import articulation
+        if articulation.parts_for_ship(ship):
+            r_.set_instance_rigged(iid, True)
+    except Exception as _e:
+        dev_mode.log_swallowed("flag rigged instance", _e)
 
 
 def _runtime_ship_model_source(ship, *, verbose: bool = False):
@@ -6603,7 +6754,7 @@ def _warp_preload_deps(controller, r_) -> dict:
         loaded = _load_runtime_ship_model(ship, r_)
         if loaded is not None:
             from engine.appc import hull_volume as _hull_volume
-            _hull_volume.prewarm_for_model(ship, loaded[0])
+            _hull_volume.prewarm_for_model(loaded[0])
 
     def planet_models(name):
         from engine.systems import resolve
@@ -6720,25 +6871,9 @@ def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
         _cache_ship_hull_pieces(ship, handle, r_, iid=iid)
         r_.set_world_transform(iid, _ship_world_matrix(ship, BC_MODEL_SCALE))
         session.ship_instances[ship] = iid
-        # BC's authored damage-volume RESOLUTION for this hull
-        # (ShipProperty.SetDamageResolution) -- a per-ship ratio, NOT a cell
-        # size; the native baker derives cell = authored_res / quality.
-        # Best-effort: never block spawn.
-        try:
-            from engine.appc.hull_volume import push_resolution
-            push_resolution(ship, iid)
-        except Exception as _e:
-            dev_mode.log_swallowed("push hull volume resolution", _e)
-        # Pre-warm the bake NOW, at spawn, instead of paying it lazily on
-        # this hull's first combat hit (spec §4; up to 192ms measured on a
-        # Warbird). Separate try/except, same "never block spawn" contract
-        # as push_resolution above.
-        try:
-            from engine.appc.hull_volume import prewarm_field
-            with frame_profiler.scope("realize.hull_prewarm"):
-                prewarm_field(iid)
-        except Exception as _e:
-            dev_mode.log_swallowed("prewarm hull volume field", _e)
+        _prefetch_hull_damage_state(r_, handle)
+        _prewarm_trace_accel(r_, handle)
+        _mark_rigged(r_, iid, ship)
         render_instances.register(ship, iid)
         # Fresnel rim applies to ship hulls only — planets share the opaque
         # shader and must stay rim-free (default ineligible).
@@ -6838,6 +6973,7 @@ def teardown_set_objects(session, pSet, renderer) -> None:
             session.ship_emitters.pop(iid, None)
             session.ship_running_lights.pop(iid, None)
             session.ship_running_light_specs.pop(iid, None)
+            _forget_part_labels(iid)
             # The transform-slot binding died with the instance; drop the
             # re-bind guard so a re-realized object binds afresh.
             session.slot_bindings.pop(ship, None)
@@ -7077,6 +7213,7 @@ def _reconcile_runtime_instances(session, renderer, *,
                 session.ship_emitters.pop(iid, None)
                 session.ship_running_lights.pop(iid, None)
                 session.ship_running_light_specs.pop(iid, None)
+                _forget_part_labels(iid)
                 session.scope_hidden.discard(iid)
                 # The transform-slot binding died with the instance.
                 session.slot_bindings.pop(ship, None)
@@ -7545,25 +7682,30 @@ class HostController:
         subsystem_cascade.reset()
         from engine.appc import warp_core_breach
         warp_core_breach.reset()
-        from engine.appc import core_breach_carve
-        core_breach_carve.reset()
         from engine.appc import visible_damage
         visible_damage.reset()
+        from engine.appc import internal_blast            # SPIKE (damage redesign)
+        internal_blast.reset()
         from engine.appc import registry_texture
         registry_texture.reset()
         from engine.appc import shockwaves
         shockwaves.reset()
+        from engine.appc import warp_in_flash as _warp_in_flash
+        _warp_in_flash.reset()
+        # Quick Battle late arrivals: pending orders and the cached event
+        # type (the event-type counter restarts at 1200 on a swap).
+        from engine.quickbattle import late_arrivals as _qb_late
+        _qb_late.reset()
         from engine.appc import particles
         particles.reset()
         damage_eligibility.reset()
-        # All three emission throttles are keyed by id(ship), and id() is a
+        # The decal emission throttle is keyed by id(ship), and id() is a
         # RECYCLED address: a dead ship's entry is inherited by whatever lands
-        # at that address next, which silently suppresses the new ship's first
-        # decal or carve. Clearing the carve pair and not the decal one was an
-        # omission, not a distinction.
-        hit_feedback._last_carve_time.clear()
-        hit_feedback._pending_carve_strength.clear()
+        # at that address next, which silently suppresses the new ship's
+        # first decal.
         hit_feedback._last_decal_emit.clear()
+        from engine.appc import hull_wear
+        hull_wear.reset()
         from engine.appc import hull_hit_smoke
         hull_hit_smoke.reset()
         from engine.appc import damage_geometry
@@ -7757,6 +7899,9 @@ class _MissionLoader:
         # seeder it runs before placement: nothing is realised at
         # GenerateShips time, so every ship would otherwise report radius 0.
         _qb_spawn.install_generate_ships_hook(_QB)
+        # Late groups (warp-in delay): EndSimulation cancels their pending
+        # arrivals -- End Combat, Restart and the end-of-battle timer alike.
+        _qb_spawn.install_end_simulation_hook(_QB)
         _qb_spawn.set_radius_fn(self._seed_quickbattle_ship_radius)
 
         import QuickBattle.QuickBattleGame as _QBGame
@@ -7990,24 +8135,9 @@ class _MissionLoader:
             _cache_ship_hull_pieces(ship, handle, r_, iid=iid)
             r_.set_world_transform(iid, _ship_world_matrix(ship, BC_MODEL_SCALE))
             sess.ship_instances[ship] = iid
-            # BC's authored damage-volume RESOLUTION for this hull
-            # (ShipProperty.SetDamageResolution) -- a per-ship ratio, NOT a
-            # cell size; the native baker derives cell = authored_res / quality.
-            # Best-effort: never block spawn.
-            try:
-                from engine.appc.hull_volume import push_resolution
-                push_resolution(ship, iid)
-            except Exception as _e:
-                dev_mode.log_swallowed("push hull volume resolution", _e)
-            # Pre-warm the bake NOW, at spawn, instead of paying it lazily on
-            # this hull's first combat hit (spec §4; up to 192ms measured on
-            # a Warbird). Separate try/except, same "never block spawn"
-            # contract as push_resolution above.
-            try:
-                from engine.appc.hull_volume import prewarm_field
-                prewarm_field(iid)
-            except Exception as _e:
-                dev_mode.log_swallowed("prewarm hull volume field", _e)
+            _prefetch_hull_damage_state(r_, handle)
+            _prewarm_trace_accel(r_, handle)
+            _mark_rigged(r_, iid, ship)
             render_instances.register(ship, iid)
             # Fresnel rim applies to ship hulls only — planets share the
             # opaque shader and must stay rim-free (default ineligible).
@@ -8207,6 +8337,13 @@ def _compute_camera(view_mode, director, *, player, dt, pose_of=None) -> tuple:
     # opens on a stale boost after time on the bridge. Forward component
     # only: astern narrows, a lateral shove counts for nothing.
     director.set_speed(_player_forward_speed_gups(player, rot))
+    try:
+        fb_w, fb_h = host_io.framebuffer_size()
+        if fb_h > 0:
+            director.set_aspect(fb_w / fb_h)
+    except Exception as _e:
+        # no host / fake host_io: keep the solver's current aspect
+        dev_mode.log_swallowed("exterior camera aspect", _e)
     if view_mode.is_bridge:
         fwd = rot.GetCol(1)
         up  = rot.GetCol(2)
@@ -8241,9 +8378,51 @@ def _player_forward_speed_gups(player, rot) -> float:
 # Lengths in game units.
 VS_NEAR: float = SCENE_NEAR_GU
 VS_FAR: float = SCENE_FAR_GU
+# Viewscreen RTT shape; keep in step with kViewscreenRttW/H in host_bindings.cc.
+VS_ASPECT: float = 640.0 / 360.0
+
+from engine.cameras import zoom_fit as _zoom_fit  # noqa: E402
+# Eased eye distance for the viewscreen target feed, persistent across frames.
+_VS_ZOOM_SMOOTHER = _zoom_fit.DistanceSmoother()
 
 
-def _viewscreen_scene_feed(player, forward_fov):
+def _viewscreen_feed_target(player):
+    """The object the viewscreen target feed is watching, or None.
+
+    The frame-to-frame `_vs_last_player_target` compare stands in for
+    Camera.PlayerTargetChanged (we never dispatch ET_TARGET_WAS_CHANGED), so a
+    mission's ViewscreenWatchObject persists until the player retargets.
+    Idempotent within a frame: a second call finds the memory already current.
+    Liveness is the caller's concern."""
+    if player is None:
+        return None
+    game = Game_GetCurrentGame()
+    if game is None:
+        return None
+    cam = game.GetPlayerCamera()
+    if cam is None:
+        return None
+    mode = cam.GetNamedCameraMode("ViewscreenZoomTarget")   # Target holder only
+    if mode is None:
+        return None
+    cur = player.GetTarget()
+    if cur is not cam._vs_last_player_target:      # stands in for PlayerTargetChanged
+        mode.SetAttrIDObject("Target", cur)
+        cam._vs_last_player_target = cur
+    return mode.GetAttrIDObject("Target")
+
+
+def drive_viewscreen_bars(r, player, target) -> None:
+    """Push this frame's target-feed readout, or clear it (no target, dead
+    target, hail, forward view, bridge off all pass target=None)."""
+    bars = build_viewscreen_bars(player, target)
+    if bars.get("visible"):
+        r.set_viewscreen_bars(bars["name"], bars["detail"], bars["dot_rgb"])
+    else:
+        r.clear_viewscreen_bars()
+
+
+def _viewscreen_scene_feed(player, forward_fov, dt=None):
     """Resolve the ViewscreenZoomTarget scene feed: the SAME framing the
     exterior view shows when holding Z (camera_zoom_target), rendered into the
     bridge viewscreen RTT. Returns (eye, target, up, fov_y_rad, near, far) or
@@ -8255,49 +8434,56 @@ def _viewscreen_scene_feed(player, forward_fov):
     lets MissionLib.ViewscreenWatchObject(obj) persist until the player retargets.
 
     Framing reuses engine.cameras.tracking._TrackingCamera in ZoomTarget mode —
-    the identical solver the exterior Z zoom uses (eye close behind the target on
-    the ship->target axis, look-at the subsystem aim point, FOV unchanged at the
-    exterior value). Rigid (dt=None): no spring smoothing, which for an inset
-    reads as a clean lock rather than a swoop.
+    the same fit-to-frame solver the exterior Z zoom uses: the whole target
+    fits the viewscreen's aspect (VS_ASPECT), the eye sits behind it on the
+    ship->target axis, and the look-at is the target's box centre. The eye
+    distance is smoothed across frames by _VS_ZOOM_SMOOTHER (snaps on
+    retarget, held while `dt` is 0 under pause); the pose itself is rigid
+    (compute dt=None).
 
     Pull-model: reads SDK state, never writes bridge_flag()/GetRenderedSet()."""
     if player is None:
+        _VS_ZOOM_SMOOTHER.reset()
         return None
     from engine.appc.camera_modes import _target_alive
-    game = Game_GetCurrentGame()
-    if game is None:
-        return None
-    cam = game.GetPlayerCamera()
-    if cam is None:
-        return None
-    mode = cam.GetNamedCameraMode("ViewscreenZoomTarget")   # Target holder only
-    if mode is None:
-        return None
-
-    cur = player.GetTarget()
-    if cur is not cam._vs_last_player_target:      # stands in for PlayerTargetChanged
-        mode.SetAttrIDObject("Target", cur)
-        cam._vs_last_player_target = cur
-
-    tgt = mode.GetAttrIDObject("Target")            # mission watch persists until then
+    tgt = _viewscreen_feed_target(player)
     if not _target_alive(tgt):
+        _VS_ZOOM_SMOOTHER.reset()
         return None                                  # -> ViewscreenForward
 
     from engine.cameras.tracking import _TrackingCamera
-    from engine.ui.target_reticle import target_aim_point
     tc = _TrackingCamera()
     tc.set_ship_radius(max(player.GetRadius(), 1e-6))
     tc.enter_zoom_target()
     # Solved in the VIEWED set's coordinates, like the exterior camera: the
     # player and the watched object are each moved into them (_view_pose_of).
     pose_of = _view_pose_of(None, _frames.viewing_set())
-    # Subsystem-aware aim only when watching the player's OWN target; a mission
-    # ViewscreenWatchObject on a different object frames that object's centre.
-    aim = (target_aim_point(player, pose_of=pose_of)
-           if tgt is player.GetTarget() else None)
-    eye, look_at, up = tc.compute(player=player, target=tgt, dt=None,
-                                  aim_point=aim, pose_of=pose_of)
+    tc.v_fov_rad = forward_fov
+    tc.aspect = VS_ASPECT
+    eye, look_at, up = tc.compute(
+        player=player, target=tgt, dt=None, pose_of=pose_of,
+        distance_filter=lambda t, d: _VS_ZOOM_SMOOTHER.step(id(t), d, dt))
     return (eye, look_at, up, forward_fov, VS_NEAR, VS_FAR)
+
+
+def _push_viewscreen_target(r, scene_feed, ship_instances) -> None:
+    """Push the render instance id of the ship the viewscreen's scene feed
+    frames (its ViewscreenZoomTarget "Target", resolved by
+    _viewscreen_scene_feed this frame), or -1 when the viewscreen frames no
+    target (`scene_feed` None: forward or comm feed) or that target has no
+    render instance. On the viewscreen render only that hull draws decks and
+    rooms behind its holes (renderer/hull_interior_policy.h). Pushed every
+    frame, so a stale target never lingers."""
+    iid = -1
+    if scene_feed is not None and ship_instances:
+        game = Game_GetCurrentGame()
+        cam = game.GetPlayerCamera() if game is not None else None
+        mode = (cam.GetNamedCameraMode("ViewscreenZoomTarget")
+                if cam is not None else None)
+        tgt = mode.GetAttrIDObject("Target") if mode is not None else None
+        if tgt is not None:
+            iid = ship_instances.get(tgt, -1)
+    r.set_viewscreen_target_instance(iid)
 
 
 def _push_target_reticle(r, player) -> None:
@@ -9206,10 +9392,10 @@ def _comm_camera_params(cam):
 
     CameraObjectClass.orientation is the BC-object convention (col0=right,
     col1=forward, col2=up) for BOTH camera sources: the explicit angle-axis
-    D/E coords cameras (CameraObjectClass_Create) and the embedded NiCamera
-    sets, whose Gamebryo camera frame (-Z view axis) is converted into this
-    convention by CameraObjectClass_CreateFromNiCamera. So world-forward is
-    GetCol(1) and world-up is GetCol(2) here, uniformly.
+    D/E coords cameras and the embedded NiCamera sets. Each constructor
+    (CameraObjectClass_Create / _CreateFromNiCamera) converts its source frame
+    into this convention, so world-forward is GetCol(1) and world-up is
+    GetCol(2) here, uniformly.
 
     fov_y is derived from the _NiFrustum top/bottom + near as
     2*atan(((top-bottom)/2)/near); a degenerate frustum falls back to the bridge
@@ -10240,8 +10426,21 @@ def run(mission_name: Optional[str] = None,
 
     boot_quickbattle = mission_name is None
 
+    # Build identity first: whatever happens after this, the log says which
+    # build produced it. A bug report against an unidentifiable zip is one
+    # nobody can act on, and main moves fast enough that "last week's build"
+    # names nothing. Stderr, not stdout -- a packaged build merges the console
+    # mirror onto stderr, and anything parsing stdout must not see this
+    # (per-user-dirs spec section 9).
+    try:
+        from engine.version import banner as _build_banner
+        sys.stderr.write(_build_banner() + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass   # a diagnostic line must never cost a launch
+
     _init_w, _init_h = _initial_window_size(_os.environ)
-    r.init(_init_w, _init_h, "open_stbc")
+    r.init(_init_w, _init_h, "BC Dauntless")
     # Verify the native module exposes every binding the renderer façade calls.
     # Catches a stale/incomplete .so at boot (a recurring hazard — host_bindings
     # compiles into both this module and build/dauntless) instead of as a
@@ -10326,12 +10525,15 @@ def run(mission_name: Optional[str] = None,
     # normal map resolves against this, not the BC install. Bare, like the
     # two pushes around it.
     r.set_project_asset_root(str(_paths.project_asset_root()))
-    # Where the native HullVolumeCache bakes/reads .dhv files for per-instance
-    # hull damage fields. Pushed here, right alongside set_game_root, for the
-    # same reason: it must land before the first hull volume lookup, and
-    # nothing else at boot touches one yet. No try/except -- a broken binding
-    # here must be as loud as a broken set_game_root, not silently skipped.
-    r.hull_volume_set_cache_root(str(_paths.hull_volume_cache_root()))
+    # Hull structure-part segmentations (.sps) cache through the per-user
+    # data dirs. The data dir is fixed for the process (the first-run picker
+    # re-roots game/sdk, never the cache), so one push at boot is enough;
+    # resolved here, at the push, never captured at import.
+    r.structure_parts_set_cache_root(str(_paths.structure_parts_cache_root()))
+    # The 12.6 MB scuff normal map resolves against that root; load it now,
+    # not in the frame of the session's first collision scuff (~0.6 s in
+    # Debug, perf-register P-11).
+    r.prewarm_scuff_normal_texture()
     # Pushed alongside set_game_root, not before -- the C++ side resolves a
     # relative asset path onto the game root, so its override map must land
     # no earlier than the root itself. mods.current() is whatever
@@ -10384,7 +10586,7 @@ def run(mission_name: Optional[str] = None,
             r.shutdown()
             return 0
 
-    _start_hull_prebake()
+    _prewarm_sdk_modules()
 
     import App
     from engine.core.loop import GameLoop
@@ -10401,6 +10603,12 @@ def run(mission_name: Optional[str] = None,
         controller = HostController()
         controller.renderer = r
         controller.loader = _MissionLoader(controller, verbose=verbose)
+        # Warp-in Ruling 2: the loader's radius seed (the one Quick Battle
+        # placement uses) also sizes warp-in slides and flashes, for every
+        # mission -- ships report GetRadius() == 0 until realised. Cleared on
+        # teardown beside spawn.set_radius_fn(None).
+        from engine.appc import warp_state as _warp_state
+        _warp_state.set_radius_seeder(controller.loader._seed_quickbattle_ship_radius)
 
         # Warp spine render hooks (Stage 1 hard cut): the warp sequence loads
         # the destination set then calls realize; on arrival it tears down the
@@ -10620,6 +10828,18 @@ def run(mission_name: Optional[str] = None,
         from engine import bridge_selection as _bs
         controller.bridge_pins = _bs.load_bridge_pins()
         init_audio_backend()
+        # DAUNTLESS_DEV_RENDER_OFF=a,b: perf A/B runs with features switched
+        # off (engine/dev_render_off.py). Applied here because the planet
+        # flags are read when the boot mission realises its planets, and again
+        # after the saved settings below. A bad name stops the boot: a typo
+        # must not pass for an A/B of the unchanged scene.
+        from engine import dev_render_off as _dev_render_off
+        _render_off = _dev_render_off.from_env(_os.environ,
+                                               developer=dev_mode.is_enabled())
+        if _render_off:
+            _dev_render_off.apply(_render_off, r)
+            print("[dev-render-off] off: %s" % ", ".join(_render_off),
+                  flush=True)
         if boot_quickbattle:
             # Real SDK QuickBattle entry cascade: builds the QuickBattleRegion
             # set, GalaxyBridge, and initial player, injects the player-only
@@ -10759,6 +10979,9 @@ def run(mission_name: Optional[str] = None,
         mission_picker = _NULL_PICKER  # noop until we know dev mode is on
         developer_options_panel = _NULL_PICKER  # noop until dev mode confirmed
         ship_property_viewer = _NULL_PICKER  # noop until dev mode confirmed
+        # Top-right FPS/resolution overlay (Developer Options -> Diagnostics).
+        # None outside --developer, so production never builds or ticks it.
+        perf_monitor_panel = None
         if dev_mode.is_enabled():
             # Default stub-observability telemetry ON under --developer so every
             # dev session passively accumulates coverage into stub_hits.jsonl
@@ -10781,6 +11004,10 @@ def run(mission_name: Optional[str] = None,
                 _sensor_dials.register()
                 from engine.appc import running_light_dials as _rl_dials
                 _rl_dials.register()
+                from engine.appc import warp_in_dials as _warp_in_dials
+                _warp_in_dials.register()
+                from engine.appc import plating_dials as _plating_dials
+                _plating_dials.register()
                 from engine.planets import atmosphere_dials as _atmo_dials
                 _atmo_dials.set_target_fn(
                     lambda: _nearest_live_planet(controller.session)
@@ -10831,6 +11058,8 @@ def run(mission_name: Optional[str] = None,
             dev_mode.register_dev_pause_menu_entry(
                 "Developer Options…", developer_options_panel.open,
             )
+            from engine.ui.perf_monitor_panel import PerfMonitorPanel
+            perf_monitor_panel = PerfMonitorPanel()
 
             # Ship Property Viewer — dev-only orbiting hologram inspector.
             # ship_getter returns the live player ship (same object the
@@ -10858,6 +11087,10 @@ def run(mission_name: Optional[str] = None,
                 iid_getter=_spv_player_iid,
                 # Decals pane: where the class's Masks/ lives and a Save routes.
                 model_rel_getter=declared_model_rel,
+                # Running lights: closing gives the SPV's live preview back
+                # to the spawn lights (or none, for an unlit ship).
+                on_running_lights_closed=lambda ship, iid: (
+                    _restore_running_lights(r, controller.session, ship, iid)),
             )
             # The Decals pane's live override is keyed on the player's
             # instance; drop it before a swap destroys that instance.
@@ -10912,6 +11145,8 @@ def run(mission_name: Optional[str] = None,
             light_emitters=_light_emitters, camera_shake=_camera_shake, App=App,
         )
         _settings.apply_all(_store, _settings_ctx)
+        if _render_off:
+            _dev_render_off.apply(_render_off, r)
         configuration_panel = ConfigurationPanel(
             tabs=[("graphics", "Graphics"), ("gameplay", "Gameplay"),
                   ("controls", "Controls"), ("bridges", "Bridges")],
@@ -11056,6 +11291,7 @@ def run(mission_name: Optional[str] = None,
         if dev_mode.is_enabled():
             registry.register(mission_picker)
             registry.register(developer_options_panel)
+            registry.register(perf_monitor_panel)
             registry.register(ship_property_viewer)
 
         # SDK ShipDisplay factories register against this same registry.
@@ -11277,6 +11513,9 @@ def run(mission_name: Optional[str] = None,
         # (docs/engine/perf-register.md, M-6).
         host_io.profiler_set_gpu_enabled(
             frame_profiler.gpu_timing_requested_from_env())
+        # DAUNTLESS_PROFILE_GPU_FOCUS=a,b: GPU-time these nested scopes too
+        # (perf-register.md M-1). Attribution only, like any GPU-timed run.
+        host_io.profiler_set_gpu_focus(frame_profiler.gpu_focus_from_env())
         try:
             _profile_frames = int(_os.environ.get('DAUNTLESS_PROFILE_FRAMES', '0'))
         except ValueError:
@@ -11304,11 +11543,14 @@ def run(mission_name: Optional[str] = None,
             try:
                 _fbw0, _fbh0 = host_io.framebuffer_size()
                 _wnw0, _wnh0 = host_io.window_size()
+                _focus0 = frame_profiler.gpu_focus_from_env()
                 print("[profile] framebuffer %dx%d, window %dx%d, headless=%s, "
-                      "gpu timing=%s"
+                      "gpu timing=%s%s"
                       % (_fbw0, _fbh0, _wnw0, _wnh0,
                          bool(_os.environ.get("OPEN_STBC_HOST_HEADLESS")),
-                         "on" if host_io.profiler_gpu_enabled() else "off"),
+                         "on" if host_io.profiler_gpu_enabled() else "off",
+                         (", gpu focus=%s" % ",".join(_focus0))
+                         if _focus0 else ""),
                       flush=True)
             except Exception as _e:  # a profiler must never stop the game
                 print("[profile] capture header failed: %s" % _e, flush=True)
@@ -11758,6 +12000,8 @@ def run(mission_name: Optional[str] = None,
             _wall_dt = _now - _previous_real_time
             _frame_dt = _wall_dt
             _previous_real_time = _now
+            if perf_monitor_panel is not None:
+                perf_monitor_panel.tick(_wall_dt)
             if pause.sim_frozen:
                 _frame_dt = 0.0
             _accumulator, _sim_ticks_this_frame = step_accumulator(
@@ -12208,22 +12452,28 @@ def run(mission_name: Optional[str] = None,
                 # the player integrator — the collision-velocity overlay is
                 # real-time motion, so it advances/decays on real elapsed time,
                 # not the fixed sim TICK_DT.
-                # Advance BC's warp FSM before collisions: a ship in warp is
+                # BC's warp FSM (dewarp transitions + warp-in slides) advances
+                # on game time inside GameLoop.tick (warp_state.tick_warp_states),
+                # which runs above, before collisions: a ship in warp is
                 # non-collidable (collisions._collisions_enabled), so a dewarp
-                # that completes this frame must be collidable THIS frame, not
-                # next. sync_flythrough is the leak guard — once the warp
-                # animator is inactive the flythrough ship cannot still read as
-                # warping, however the sequence ended.
+                # that completes this frame is collidable THIS frame, not next.
+                # sync_flythrough is the leak guard — once the warp animator is
+                # inactive the flythrough ship cannot still read as warping,
+                # however the sequence ended.
                 from engine.appc import warp_state as _warp_state
                 from engine import warp_vfx as _wv_state
-                _warp_state.tick_warp_states(_player_dt)
                 _warp_state.sync_flythrough(_wv_state.get().is_active())
 
                 with frame_profiler.scope("sim.debris_chunks"):
                     from engine.appc import debris_chunk as _debris_chunk
-                    _debris_chunk.tick(_player_dt, r)
+                    with frame_profiler.scope("dc.tick"):
+                        _debris_chunk.tick(_player_dt, r)
                     from engine.appc import hull_breakup as _hull_breakup
-                    _hull_breakup.drain()
+                    with frame_profiler.scope("dc.breakup_drain"):
+                        _hull_breakup.drain()
+                    from engine.appc import hull_wear as _hull_wear
+                    with frame_profiler.scope("dc.wear_drain"):
+                        _hull_wear.drain()
 
                 with frame_profiler.scope("sim.collisions"):
                     collisions.tick_collisions(
@@ -12889,8 +13139,18 @@ def run(mission_name: Optional[str] = None,
             _feed = _active_comm_feed(controller)
             _scene = None
             if _feed is None:
-                _scene = _viewscreen_scene_feed(player, director.fov_y_rad)
+                _scene = _viewscreen_scene_feed(player, director.fov_y_rad,
+                                                dt=_player_dt)
+            else:
+                # Hailing: the scene feed is not called, so drop its smoothed
+                # distance; the next target view re-fits from scratch.
+                _VS_ZOOM_SMOOTHER.reset()
             _vs_src = _select_viewscreen_source(r, _feed, _scene)
+            _push_viewscreen_target(
+                r, _scene, session.ship_instances if session is not None else None)
+            drive_viewscreen_bars(
+                r, player,
+                _viewscreen_feed_target(player) if _vs_src == "scene" else None)
             if _vs_src == "comm":
                 _set_id, _cam = _feed
                 # Frame the comm set by the camera's AUTHORED orientation (the
@@ -13094,7 +13354,9 @@ def run(mission_name: Optional[str] = None,
                 r, active_set, _warp_streaking, player=player)
 
             _push_cloak_refraction(r, session, player)
-            _push_running_lights(r, session, hidden_iids=_bridge_hidden_iids)
+            _push_running_lights(r, session, hidden_iids=_bridge_hidden_iids,
+                preview_iids=(ship_property_viewer.running_light_preview_iids()
+                          if _spv_open else ()))
 
             _pump_letterbox(r, _letterbox_anim, _player_dt)
 
@@ -13148,7 +13410,8 @@ def run(mission_name: Optional[str] = None,
                         TopWindow_GetTopWindow().IsCutsceneMode(),
                         _scripted_destroy,
                         log=_scripted_log,
-                        force_view=_scripted_view):
+                        force_view=_scripted_view,
+                        screenshot=r.request_frame_png):
                     break
 
         # Final report while the window (and therefore the GL context and the
@@ -13189,6 +13452,10 @@ def run(mission_name: Optional[str] = None,
         from engine.quickbattle import spawn as _qb_spawn
         _qb_spawn.set_provider(None)
         _qb_spawn.set_radius_fn(None)
+        from engine.quickbattle import late_arrivals as _qb_late
+        _qb_late.reset()
+        from engine.appc import warp_state as _warp_state
+        _warp_state.set_radius_seeder(None)
         from engine import bridge_selection as _bs
         _bs.set_player_type_resolver(None)
         shutdown_audio()

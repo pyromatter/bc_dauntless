@@ -937,6 +937,16 @@ def _reset_leakable_engine_globals():
         _mods.configure(None)
     except Exception:
         pass
+    # Warp-in: radius seeder hook + live dial values are module globals.
+    try:
+        from engine.appc import warp_in_dials as _warp_in_dials
+        from engine.appc import warp_state as _warp_state_mod
+        _warp_in_dials.reset()
+        from engine.appc import warp_in_flash as _warp_in_flash
+        _warp_in_flash.reset()
+        _warp_state_mod.set_radius_seeder(None)
+    except Exception:
+        pass
     # Warp preload: begin/active/end hold one module-global Preload.
     try:
         from engine import warp_preload as _warp_preload
@@ -958,6 +968,15 @@ def _reset_leakable_engine_globals():
     try:
         from engine.appc import ships as _ships
         del _ships._pending_alert_levels[:]
+    except Exception:
+        pass
+    # Attach queue (engine/appc/attach_templates.py): a test that queues
+    # without draining would attach its template to a later test's ship, and
+    # the per-leaf attach record decides which SPV lights are renameable.
+    try:
+        from engine.appc import attach_templates as _attach_templates
+        del _attach_templates._queue[:]
+        _attach_templates._attached.clear()
     except Exception:
         pass
     # Swapped-module split: fixtures that re-import an SDK module
@@ -1035,6 +1054,14 @@ def _reset_leakable_engine_globals():
         from engine.quickbattle import spawn as _qb_spawn
         _qb_spawn.set_provider(None)
         _qb_spawn.set_radius_fn(None)
+    except Exception:
+        pass
+    # Quick Battle late arrivals: pending orders, the scheduling module and
+    # the injected RNG are module-global; a leaked entry skews the next
+    # battle's pending_enemy_count (and a stale key could spawn into it).
+    try:
+        from engine.quickbattle import late_arrivals as _qb_late
+        _qb_late.reset()
     except Exception:
         pass
     # Same leak hazard, the home-ship RecreatePlayer resolver: a process
@@ -1123,7 +1150,7 @@ def _reset_leakable_engine_globals():
         _hl._note_static_backdrops([])
     except Exception:
         pass
-    # Hit-feedback emission throttles. All three are keyed by id(ship) and
+    # Hit-feedback emission throttle. It is keyed by id(ship) and
     # id() is a RECYCLED address, so a dead ship's entry is inherited by a
     # LATER test's ship that happens to land there. Every decal test pins the
     # clock to the same instant, so an inherited entry makes `now - last == 0`
@@ -1134,8 +1161,18 @@ def _reset_leakable_engine_globals():
     try:
         from engine.appc import hit_feedback as _hf
         _hf._last_decal_emit.clear()
-        _hf._last_carve_time.clear()
-        _hf._pending_carve_strength.clear()
+        from engine.appc import hull_wear as _hw
+        _hw.reset()
+    except Exception:
+        pass
+    # Developer Options -> "Hull damage" rows mutate module globals
+    # (hull_wear.PHASER_RATE / COLLISION_MIN_HULL_DAMAGE, death_cascade's
+    # BLAST_SIZE_TIERS, plating_dials' _defaults / _dials, the tuning
+    # module's near mirror), and plating_dials.register() swaps in native
+    # defaults. Pure-Python reset: never pushes to the native host.
+    try:
+        from engine import dev_hull_damage_tuning as _hdt
+        _hdt.reset_python_state()
     except Exception:
         pass
     # Camera shake: the Modern VFX row flips a module global, so a test that
@@ -1323,15 +1360,24 @@ def _reset_leakable_engine_globals():
         ("engine.appc.ship_death", "_active"),
         ("engine.appc.object_lifetime", "_timed"),
         ("engine.appc.visible_damage", "_pending"),
+        ("engine.appc.internal_blast", "_pending"),
+        ("engine.appc.warp_core_breach", "_growing"),
+        # The single-fire guarantee's queue + set: a ship armed or breached
+        # by one test would never detonate (or detonate) in a later one.
+        ("engine.appc.warp_core_breach", "_armed"),
+        ("engine.appc.warp_core_breach", "_breached"),
         ("engine.audio.attached_sources", "_attached"),
         ("engine.audio.hum_allocator", "_humming"),
         # Detached hull chunks + the per-ship breakup throttle: a chunk left
         # live by one test is yielded by collisions.iter_collidables() in
-        # every later test, and a stale _pending entry re-runs a split on a
-        # ship that no longer exists.
+        # every later test, and a stale _pending_wear entry re-runs a split
+        # on a ship that no longer exists.
         ("engine.appc.debris_chunk", "_live"),
-        ("engine.appc.hull_breakup", "_pending"),
-        ("engine.appc.hull_breakup", "_last_check"),
+        ("engine.appc.hull_breakup", "_pending_wear"),
+        ("engine.appc.hull_breakup", "_last_wear_check"),
+        ("engine.appc.hull_breakup", "_severed"),
+        ("engine.appc.hull_breakup", "_part_labels"),
+        ("engine.appc.hull_breakup", "_awaiting"),
     ):
         try:
             _m = sys.modules.get(_mod)

@@ -355,11 +355,14 @@ class QuickBattleSetupPanel(Panel):
     def _group_summary(g) -> str:
         if g.player:
             return "Friendly · escorts form up beside you"
+        direction = "Random" if g.warp_in_min > 0 else _DIRECTION_LABEL[g.direction]
         text = "%s · %s · %s (%g km)" % (
-            _ALLEGIANCE_LABEL[g.allegiance], _DIRECTION_LABEL[g.direction],
+            _ALLEGIANCE_LABEL[g.allegiance], direction,
             _DISTANCE_LABEL[g.distance], sc.DISTANCE_KM[g.distance])
         if g.difficulty != "medium":
             text += " · " + _DIFFICULTY_LABEL[g.difficulty]
+        if g.warp_in_min > 0:
+            text += " · warps in at %d min" % g.warp_in_min
         return text
 
     def _entry_payload(self, e) -> dict:
@@ -390,6 +393,7 @@ class QuickBattleSetupPanel(Panel):
             "groups": [{"id": g.id, "name": g.name, "player": g.player,
                         "allegiance": g.allegiance, "direction": g.direction,
                         "distance": g.distance, "difficulty": g.difficulty,
+                        "warp_in_min": g.warp_in_min,
                         "summary": self._group_summary(g),
                         "entries": [self._entry_payload(e) for e in g.entries]}
                        for g in s.groups],
@@ -494,7 +498,8 @@ class QuickBattleSetupPanel(Panel):
     def _on_add(self, arg) -> bool:
         """`<ship>` adds one to the target; `<ship>:<gid>:<n>` (the sheet's
         group picker and stepper) adds n, 1..ADD_MAX, to that group, which
-        becomes the target. A successful add closes the ship sheet."""
+        becomes the target. Each new row takes the class's least-used named
+        ship (sc.next_variant). A successful add closes the ship sheet."""
         raw, _, rest = arg.partition(":")
         ce = self._ce(unquote(raw))
         gid, n = self._target, 1
@@ -507,13 +512,15 @@ class QuickBattleSetupPanel(Panel):
         if ce is None or self._scenario.group(gid) is None or not 1 <= n <= self.ADD_MAX:
             return False
         for _ in range(n):
-            self._scenario.add_ship(gid, ce.ship_id)
+            self._scenario.add_ship(gid, ce.ship_id,
+                                    sc.next_variant(self._scenario, ce))
         self._target = gid
         self._selected = None
         self._after_change()
         return True
 
     def _on_set_player(self, arg) -> bool:
+        """Like a successful add, a successful set-player closes the sheet."""
         ce = self._ce(unquote(arg))
         if ce is None or not sc.can_be_player(ce, None):
             return False
@@ -522,6 +529,7 @@ class QuickBattleSetupPanel(Panel):
         except Exception as e:                # never out of dispatch_event
             _log.warning("quickbattle set-player %s failed: %s", ce.ship_id, e)
             return False
+        self._selected = None
         self._after_change()
         return True
 
@@ -543,12 +551,19 @@ class QuickBattleSetupPanel(Panel):
             return False
         self._draft = {"group": g.id, "allegiance": g.allegiance,
                        "direction": g.direction, "distance": g.distance,
-                       "difficulty": g.difficulty}
+                       "difficulty": g.difficulty, "warp_in": g.warp_in_min}
         return True
 
     def _on_draft(self, arg) -> bool:
         field, _, value = arg.partition(":")
-        if self._draft is None or value not in _DRAFT_FIELDS.get(field, ()):
+        if self._draft is None:
+            return False
+        if field == "warp_in":
+            # whole minutes, any size: an integer path beside the id lists
+            if not (value.isascii() and value.isdigit()):
+                return False
+            value = int(value)
+        elif value not in _DRAFT_FIELDS.get(field, ()):
             return False
         g = self._scenario.group(self._draft["group"])
         if g is None or (g.player and field != "difficulty"):
@@ -561,7 +576,8 @@ class QuickBattleSetupPanel(Panel):
         if d is None:
             return False
         ok = self._scenario.update_details(d["group"], d["allegiance"], d["direction"],
-                                           d["distance"], d["difficulty"])
+                                           d["distance"], d["difficulty"],
+                                           warp_in_min=d["warp_in"])
         self._draft = None
         if ok:
             self._after_change()

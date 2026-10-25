@@ -36,3 +36,50 @@ def test_e_quickbattle_player_type_resolver_leaks():
 def test_f_the_quickbattle_player_type_resolver_did_not_leak():
     from engine import bridge_selection
     assert bridge_selection._player_type_resolver is None
+
+
+class _Ship:
+    pass
+
+
+def test_g_a_warp_core_breach_leaves_armed_and_breached_ships():
+    from engine.appc import warp_core_breach
+    warp_core_breach.arm(_Ship())
+    warp_core_breach._breached.add(_Ship())
+    warp_core_breach._growing.append({"ship": _Ship(), "age": 0.0, "next": 0})
+    assert warp_core_breach._armed and warp_core_breach._breached
+
+
+def test_h_the_warp_core_breach_state_did_not_leak():
+    from engine.appc import warp_core_breach
+    assert warp_core_breach._armed == []
+    assert warp_core_breach._breached == set()
+    assert warp_core_breach._growing == []
+
+
+def test_i_cached_structure_part_labels_leak():
+    from engine.appc import hull_breakup
+    hull_breakup._part_labels[77] = (1, {(0.0, 0.0, 0.0, 1.0): 0})
+
+
+def test_j_the_structure_part_labels_did_not_leak():
+    from engine.appc import hull_breakup
+    assert hull_breakup._part_labels == {}
+
+
+def test_k_quickbattle_late_arrivals_leak():
+    from engine.quickbattle import late_arrivals
+    from engine.quickbattle.scenario import SpawnOrder
+    order = SpawnOrder("g", "e", "Galor", "Galor", "Galor", None, None, "enemy",
+                       "fore", 100.0, 0.5, warp_in_s=60.0)
+    late_arrivals._pending[1] = {"orders": [(1, order)], "timer": -1}
+    late_arrivals._qb = object()
+    late_arrivals.set_rng(None)
+    assert late_arrivals.pending_enemy_count() == 1
+
+
+def test_l_the_quickbattle_late_arrivals_did_not_leak():
+    from engine.quickbattle import late_arrivals
+    assert late_arrivals.pending_enemy_count() == 0
+    assert late_arrivals._qb is None
+    assert late_arrivals._rng is not None

@@ -56,6 +56,8 @@ embed_shader(SHADER_ROCK_SPECK_VS shaders/rock_speck.vert rock_speck_vs)
 embed_shader(SHADER_ROCK_SPECK_FS shaders/rock_speck.frag rock_speck_fs)
 embed_shader(SHADER_ROCK_PUFF_VS shaders/rock_puff.vert rock_puff_vs)
 embed_shader(SHADER_ROCK_PUFF_FS shaders/rock_puff.frag rock_puff_fs)
+embed_shader(SHADER_ROCK_PUFF_HASH_VS shaders/rock_puff_hash.vert rock_puff_hash_vs)
+embed_shader(SHADER_ROCK_PUFF_HASH_FS shaders/rock_puff_hash.frag rock_puff_hash_fs)
 embed_shader(SHADER_BACKDROP_VS shaders/backdrop.vert backdrop_vs)
 embed_shader(SHADER_BACKDROP_FS shaders/backdrop.frag backdrop_fs)
 embed_shader(SHADER_SUN_VS shaders/sun.vert sun_vs)
@@ -77,6 +79,8 @@ embed_shader(SHADER_NEBULA_UPSAMPLE_FS shaders/nebula_upsample.frag nebula_upsam
 embed_shader(SHADER_SYSTEM_NEBULA_FS shaders/system_nebula.frag system_nebula_fs)
 embed_shader(SHADER_NEBULA_GODRAY_VS shaders/nebula_godray.vert nebula_godray_vs)
 embed_shader(SHADER_NEBULA_GODRAY_FS shaders/nebula_godray.frag nebula_godray_fs)
+embed_shader(SHADER_NEBULA_GODRAY_MASK_FS shaders/nebula_godray_mask.frag nebula_godray_mask_fs)
+embed_shader(SHADER_NEBULA_GODRAY_COMPOSITE_FS shaders/nebula_godray_composite.frag nebula_godray_composite_fs)
 embed_shader(SHADER_SHIELD_VS shaders/shield.vert shield_vs)
 embed_shader(SHADER_SHIELD_FS shaders/shield.frag shield_fs)
 embed_shader(SHADER_LENS_FLARE_VS shaders/lens_flare.vert lens_flare_vs)
@@ -99,8 +103,8 @@ embed_shader(SHADER_PHASER_VS shaders/phaser.vert phaser_vs)
 embed_shader(SHADER_PHASER_FS shaders/phaser.frag phaser_fs)
 embed_shader(SHADER_HOLOGRAM_VS shaders/hologram.vert hologram_vs)
 embed_shader(SHADER_HOLOGRAM_FS shaders/hologram.frag hologram_fs)
-embed_shader(SHADER_BREACH_VS shaders/breach.vert breach_vs)
-embed_shader(SHADER_BREACH_FS shaders/breach.frag breach_fs)
+embed_shader(SHADER_HULL_INTERIOR_VS shaders/hull_interior.vert hull_interior_vs)
+embed_shader(SHADER_HULL_INTERIOR_FS shaders/hull_interior.frag hull_interior_fs)
 embed_shader(SHADER_SUBSYSTEM_PIN_VS shaders/subsystem_pin.vert subsystem_pin_vs)
 embed_shader(SHADER_SUBSYSTEM_PIN_FS shaders/subsystem_pin.frag subsystem_pin_fs)
 embed_shader(SHADER_TARGET_RETICLE_VS shaders/target_reticle.vert target_reticle_vs)
@@ -116,6 +120,8 @@ embed_shader(SHADER_BRDF_LUT_VS shaders/brdf_lut.vert brdf_lut_vs)
 embed_shader(SHADER_BRDF_LUT_FS shaders/brdf_lut.frag brdf_lut_fs)
 embed_shader(SHADER_VS_STATIC_VS shaders/viewscreen_static.vert viewscreen_static_vs)
 embed_shader(SHADER_VS_STATIC_FS shaders/viewscreen_static.frag viewscreen_static_fs)
+embed_shader(SHADER_VS_BARS_VS shaders/viewscreen_bars.vert viewscreen_bars_vs)
+embed_shader(SHADER_VS_BARS_FS shaders/viewscreen_bars.frag viewscreen_bars_fs)
 embed_shader(SHADER_SKINNED_BRIDGE_VS shaders/skinned_bridge.vert skinned_bridge_vs)
 embed_shader(SHADER_RESOLVE_VS shaders/resolve.vert resolve_vs)
 embed_shader(SHADER_RESOLVE_FS shaders/resolve.frag resolve_fs)
@@ -131,12 +137,16 @@ embed_shader(SHADER_SMAA_BLEND_VS  shaders/smaa_blend.vert  smaa_blend_vs)
 embed_shader(SHADER_SMAA_BLEND_FS  shaders/smaa_blend.frag  smaa_blend_fs)
 embed_shader(SHADER_SHADOW_VS shaders/shadow.vert shadow_vs)
 embed_shader(SHADER_SHADOW_FS shaders/shadow.frag shadow_fs)
+embed_shader(SHADER_SHADOW_PARTS_VS shaders/shadow_parts.vert shadow_parts_vs)
+embed_shader(SHADER_SHADOW_PARTS_FS shaders/shadow_parts.frag shadow_parts_fs)
 embed_shader(SHADER_NONFINITE_PROBE_FS shaders/nonfinite_probe.frag nonfinite_probe_fs)
 embed_shader(SHADER_BLOOM_PREFILTER_FS shaders/bloom_prefilter.frag bloom_prefilter_fs)
 embed_shader(SHADER_BLOOM_DOWN_FS shaders/bloom_down.frag bloom_down_fs)
 embed_shader(SHADER_BLOOM_UP_FS shaders/bloom_up.frag bloom_up_fs)
 embed_shader(SHADER_SHOCKWAVE_VS shaders/shockwave.vert shockwave_vs)
 embed_shader(SHADER_SHOCKWAVE_FS shaders/shockwave.frag shockwave_fs)
+embed_shader(SHADER_WARP_IN_FLASH_VS shaders/warp_in_flash.vert warp_in_flash_vs)
+embed_shader(SHADER_WARP_IN_FLASH_FS shaders/warp_in_flash.frag warp_in_flash_fs)
 embed_shader(SHADER_SKYBOX_VS shaders/skybox.vert skybox_vs)
 embed_shader(SHADER_SKYBOX_FS shaders/skybox.frag skybox_fs)
 embed_shader(SHADER_CLOAK_REFRACTION_VS shaders/cloak_refraction.vert cloak_refraction_vs)
@@ -193,9 +203,12 @@ add_library(renderer STATIC
     planet_detail_pass.cc
     atmosphere_pass.cc
     system_nebula_pass.cc
+    nebula_noise.cc
     system_nebula_cache.cc
     nebula_godray_pass.cc
     shockwave_pass.cc
+    warp_in_flash_shape.cc
+    warp_in_flash_pass.cc
     aabb.cc
     model_parts.cc
     glow_region.cc
@@ -219,11 +232,16 @@ add_library(renderer STATIC
     cloak_pass.cc
     breach_venting.cc
     breach_debris.cc
-    breach_pass.cc
+    hull_interior_pass.cc
+    hull_interior_policy.cc
     model_draw_helpers.cc
     scuff_texture.cc
-    carve_field_cache.cc
-    instance_field_cache.cc
+    hull_fill_cache.cc
+    model_textures.cc
+    structure_parts_cache.cc
+    plating_damage.cc
+    part_severance_check.cc
+    part_severance_jobs.cc
     subsystem_pin_pass.cc
     debug_volume_pass.cc
     gizmo_pass.cc
@@ -235,6 +253,7 @@ add_library(renderer STATIC
     bridge_probe.cc
     bridge_probe_array.cc
     viewscreen_static_pass.cc
+    viewscreen_bars_pass.cc
     light_matrix.cc
     shadow_map_target.cc
 )
@@ -244,3 +263,5 @@ target_include_directories(renderer
 )
 target_compile_features(renderer PUBLIC cxx_std_20)
 target_link_libraries(renderer PUBLIC assets scenegraph voxel glad glfw glm)
+# nlohmann/json reads the viewscreen bars font metrics (viewscreen_bars_pass.cc).
+target_link_libraries(renderer PRIVATE nlohmann_json::nlohmann_json)

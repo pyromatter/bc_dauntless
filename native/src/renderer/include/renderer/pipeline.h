@@ -17,9 +17,16 @@ public:
     Shader& impostor_shader() noexcept   { return *impostor_; }
     /// opaque.frag compiled with PLANET_SURFACE: the surface-detail target planet.
     Shader& planet_shader() noexcept     { return *planet_; }
+    /// opaque.frag compiled with PLATING: a hull carrying plating wear
+    /// (SPIKE, damage redesign; renderer/plating_damage.h).
+    Shader& plating_shader() noexcept    { return *plating_; }
     Shader& speck_shader() noexcept      { return *speck_; }
     Shader& rock_speck_shader() noexcept { return *rock_speck_; }
     Shader& rock_puff_shader() noexcept  { return *rock_puff_; }
+    /// Bakes rock_puff.frag's lattice hash table (FarPass, once).
+    Shader& rock_puff_hash_shader() noexcept { return *rock_puff_hash_; }
+    /// The texture unit rock_puff.frag reads the hash table from.
+    static constexpr int kRockPuffHashUnit = 13;
     Shader& backdrop_shader() noexcept   { return *backdrop_; }
     Shader& sun_shader() noexcept        { return *sun_; }
     Shader& sun_flare_shader() noexcept  { return *sun_flare_; }
@@ -31,6 +38,8 @@ public:
     Shader& nebula_upsample_shader() noexcept { return *nebula_upsample_; }
     Shader& system_nebula_shader() noexcept { return *system_nebula_; }
     Shader& nebula_godray_shader() noexcept { return *nebula_godray_; }
+    Shader& nebula_godray_mask_shader() noexcept { return *nebula_godray_mask_; }
+    Shader& nebula_godray_composite_shader() noexcept { return *nebula_godray_composite_; }
     Shader& shield_shader() noexcept     { return *shield_; }
     Shader& lens_flare_shader() noexcept { return *lens_flare_; }
     Shader& torpedo_shader() noexcept    { return *torpedo_; }
@@ -41,15 +50,21 @@ public:
     Shader& nebula_wake_shader() noexcept { return *nebula_wake_; }
     Shader& phaser_shader() noexcept          { return *phaser_; }
     Shader& hologram_shader() noexcept        { return *hologram_; }
-    Shader& breach_shader() noexcept          { return *breach_; }
+    // hull_interior.vert + .frag: decks and rooms behind a plating cut.
+    Shader& hull_interior_shader() noexcept   { return *hull_interior_; }
     Shader& subsystem_pin_shader() noexcept   { return *subsystem_pin_; }
     Shader& target_reticle_shader() noexcept  { return *target_reticle_; }
     Shader& starmap_shader() noexcept         { return *starmap_; }
     Shader& bridge_shader() noexcept          { return *bridge_; }
     Shader& skinned_bridge_shader() noexcept  { return *skinned_bridge_; }
     Shader& viewscreen_static_shader() noexcept { return *viewscreen_static_; }
+    Shader& viewscreen_bars_shader() noexcept { return *viewscreen_bars_; }
     Shader& shadow_depth_shader() noexcept    { return *shadow_depth_; }
+    // The shadow caster for an instance with severed / shown structure parts
+    // (shadow_parts.vert/.frag): discards the hidden parts' fragments.
+    Shader& shadow_parts_shader() noexcept    { return *shadow_parts_; }
     Shader& shockwave_shader() noexcept       { return *shockwave_; }
+    Shader& warp_in_flash_shader() noexcept   { return *warp_in_flash_; }
     Shader& skybox_shader() noexcept          { return *skybox_; }
     Shader& cloak_refraction_shader() noexcept { return *cloak_refraction_; }
 
@@ -59,9 +74,11 @@ private:
     std::unique_ptr<Shader> minor_;
     std::unique_ptr<Shader> impostor_;
     std::unique_ptr<Shader> planet_;
+    std::unique_ptr<Shader> plating_;
     std::unique_ptr<Shader> speck_;
     std::unique_ptr<Shader> rock_speck_;
     std::unique_ptr<Shader> rock_puff_;
+    std::unique_ptr<Shader> rock_puff_hash_;
     std::unique_ptr<Shader> backdrop_;
     std::unique_ptr<Shader> sun_;
     std::unique_ptr<Shader> sun_flare_;
@@ -73,6 +90,8 @@ private:
     std::unique_ptr<Shader> nebula_upsample_;
     std::unique_ptr<Shader> system_nebula_;
     std::unique_ptr<Shader> nebula_godray_;
+    std::unique_ptr<Shader> nebula_godray_mask_;
+    std::unique_ptr<Shader> nebula_godray_composite_;
     std::unique_ptr<Shader> shield_;
     std::unique_ptr<Shader> lens_flare_;
     std::unique_ptr<Shader> torpedo_;
@@ -83,15 +102,18 @@ private:
     std::unique_ptr<Shader> nebula_wake_;
     std::unique_ptr<Shader> phaser_;
     std::unique_ptr<Shader> hologram_;
-    std::unique_ptr<Shader> breach_;
+    std::unique_ptr<Shader> hull_interior_;
     std::unique_ptr<Shader> subsystem_pin_;
     std::unique_ptr<Shader> target_reticle_;
     std::unique_ptr<Shader> starmap_;
     std::unique_ptr<Shader> bridge_;
     std::unique_ptr<Shader> skinned_bridge_;
     std::unique_ptr<Shader> viewscreen_static_;
+    std::unique_ptr<Shader> viewscreen_bars_;
     std::unique_ptr<Shader> shadow_depth_;
+    std::unique_ptr<Shader> shadow_parts_;
     std::unique_ptr<Shader> shockwave_;
+    std::unique_ptr<Shader> warp_in_flash_;
     std::unique_ptr<Shader> skybox_;
     std::unique_ptr<Shader> cloak_refraction_;
 };

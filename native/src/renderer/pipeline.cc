@@ -16,6 +16,8 @@
 #include "embedded_rock_speck_fs.h"
 #include "embedded_rock_puff_vs.h"
 #include "embedded_rock_puff_fs.h"
+#include "embedded_rock_puff_hash_vs.h"
+#include "embedded_rock_puff_hash_fs.h"
 #include "embedded_backdrop_vs.h"
 #include "embedded_backdrop_fs.h"
 #include "embedded_sun_vs.h"
@@ -36,6 +38,8 @@
 #include "embedded_system_nebula_fs.h"
 #include "embedded_nebula_godray_vs.h"
 #include "embedded_nebula_godray_fs.h"
+#include "embedded_nebula_godray_mask_fs.h"
+#include "embedded_nebula_godray_composite_fs.h"
 #include "embedded_shield_vs.h"
 #include "embedded_shield_fs.h"
 #include "embedded_lens_flare_vs.h"
@@ -56,8 +60,8 @@
 #include "embedded_phaser_fs.h"
 #include "embedded_hologram_vs.h"
 #include "embedded_hologram_fs.h"
-#include "embedded_breach_vs.h"
-#include "embedded_breach_fs.h"
+#include "embedded_hull_interior_vs.h"
+#include "embedded_hull_interior_fs.h"
 #include "embedded_subsystem_pin_vs.h"
 #include "embedded_subsystem_pin_fs.h"
 #include "embedded_target_reticle_vs.h"
@@ -69,10 +73,16 @@
 #include "embedded_skinned_bridge_vs.h"
 #include "embedded_viewscreen_static_vs.h"
 #include "embedded_viewscreen_static_fs.h"
+#include "embedded_viewscreen_bars_vs.h"
+#include "embedded_viewscreen_bars_fs.h"
 #include "embedded_shadow_vs.h"
 #include "embedded_shadow_fs.h"
+#include "embedded_shadow_parts_vs.h"
+#include "embedded_shadow_parts_fs.h"
 #include "embedded_shockwave_vs.h"
 #include "embedded_shockwave_fs.h"
+#include "embedded_warp_in_flash_vs.h"
+#include "embedded_warp_in_flash_fs.h"
 #include "embedded_skybox_vs.h"
 #include "embedded_skybox_fs.h"
 #include "embedded_cloak_refraction_vs.h"
@@ -109,17 +119,23 @@ Pipeline::Pipeline() {
     // sampling + land shading); every other program keeps the plain source.
     planet_ = std::make_unique<Shader>(shader_src::opaque_vs,
                                        with_define(shader_src::opaque_fs, "PLANET_SURFACE"));
+    // SPIKE (damage redesign): layered hull damage. A hull with plating wear
+    // draws with the SAME opaque.frag compiled with PLATING (the plating
+    // layer, its compact damage list and the near-damage early-out); every
+    // other hull keeps the stock program, which carries none of it.
+    plating_ = std::make_unique<Shader>(shader_src::opaque_vs,
+                                        with_define(shader_src::opaque_fs, "PLATING"));
     // opaque.frag's collision-scuff normal map (renderer/scuff_texture.h)
     // lives on unit 7 for the program's whole life. Assigned HERE, once, not
     // per draw: every path that draws with this program (draw_model, the
-    // carve-stencil pass, the hull-clip / cloak parity test rigs) would
+    // plating mark, the cloak parity test rig) would
     // otherwise leave it at unit 0 with the base texture. Harmless for two
     // sampler2Ds, but the predecessor was a samplerBuffer and two sampler
     // TYPES on one unit is GL_INVALID_OPERATION at draw -- keep the habit.
     // Same for the hull-decal masks: u_decal_mask0..3 live on units 8..11
     // (draw_model binds the textures there once per model, frame.cc).
     for (Shader* sh : {opaque_.get(), skinned_.get(), minor_.get(), impostor_.get(),
-                       planet_.get()}) {
+                       planet_.get(), plating_.get()}) {
         sh->use();
         sh->set_int("u_scuff_map", 7);
         sh->set_int("u_decal_mask0", 8);
@@ -134,6 +150,11 @@ Pipeline::Pipeline() {
     speck_ = std::make_unique<Shader>(shader_src::speck_vs, shader_src::speck_fs);
     rock_speck_ = std::make_unique<Shader>(shader_src::rock_speck_vs, shader_src::rock_speck_fs);
     rock_puff_ = std::make_unique<Shader>(shader_src::rock_puff_vs, shader_src::rock_puff_fs);
+    // The puff noise's hash table lives on its own unit (FarPass binds it).
+    rock_puff_->use();
+    rock_puff_->set_int("u_puff_hash", kRockPuffHashUnit);
+    rock_puff_hash_ = std::make_unique<Shader>(shader_src::rock_puff_hash_vs,
+                                               shader_src::rock_puff_hash_fs);
     backdrop_ = std::make_unique<Shader>(shader_src::backdrop_vs, shader_src::backdrop_fs);
     sun_ = std::make_unique<Shader>(shader_src::sun_vs, shader_src::sun_fs);
     sun_flare_ = std::make_unique<Shader>(shader_src::sun_flare_vs, shader_src::sun_flare_fs);
@@ -147,6 +168,8 @@ Pipeline::Pipeline() {
     // System-scale nebula haze: same fullscreen-triangle vertex shader.
     system_nebula_ = std::make_unique<Shader>(shader_src::nebula_volumetric_vs, shader_src::system_nebula_fs);
     nebula_godray_ = std::make_unique<Shader>(shader_src::nebula_godray_vs, shader_src::nebula_godray_fs);
+    nebula_godray_mask_ = std::make_unique<Shader>(shader_src::nebula_godray_vs, shader_src::nebula_godray_mask_fs);
+    nebula_godray_composite_ = std::make_unique<Shader>(shader_src::nebula_godray_vs, shader_src::nebula_godray_composite_fs);
     shield_ = std::make_unique<Shader>(shader_src::shield_vs, shader_src::shield_fs);
     lens_flare_ = std::make_unique<Shader>(shader_src::lens_flare_vs, shader_src::lens_flare_fs);
     torpedo_    = std::make_unique<Shader>(shader_src::torpedo_vs,    shader_src::torpedo_fs);
@@ -157,7 +180,7 @@ Pipeline::Pipeline() {
     nebula_wake_ = std::make_unique<Shader>(shader_src::nebula_wake_vs, shader_src::nebula_wake_fs);
     phaser_        = std::make_unique<Shader>(shader_src::phaser_vs,        shader_src::phaser_fs);
     hologram_      = std::make_unique<Shader>(shader_src::hologram_vs,      shader_src::hologram_fs);
-    breach_        = std::make_unique<Shader>(shader_src::breach_vs,        shader_src::breach_fs);
+    hull_interior_ = std::make_unique<Shader>(shader_src::hull_interior_vs, shader_src::hull_interior_fs);
     subsystem_pin_ = std::make_unique<Shader>(shader_src::subsystem_pin_vs, shader_src::subsystem_pin_fs);
     target_reticle_ = std::make_unique<Shader>(shader_src::target_reticle_vs, shader_src::target_reticle_fs);
     starmap_       = std::make_unique<Shader>(shader_src::starmap_vs,        shader_src::starmap_fs);
@@ -165,10 +188,17 @@ Pipeline::Pipeline() {
     skinned_bridge_ = std::make_unique<Shader>(shader_src::skinned_bridge_vs, shader_src::bridge_fs);
     viewscreen_static_ = std::make_unique<Shader>(
         shader_src::viewscreen_static_vs, shader_src::viewscreen_static_fs);
+    viewscreen_bars_ = std::make_unique<Shader>(
+        shader_src::viewscreen_bars_vs, shader_src::viewscreen_bars_fs);
     shadow_depth_ = std::make_unique<Shader>(
         shader_src::shadow_vs, shader_src::shadow_fs);
+    // Part-mask caster: only instances with severed / shown parts.
+    shadow_parts_ = std::make_unique<Shader>(
+        shader_src::shadow_parts_vs, shader_src::shadow_parts_fs);
     shockwave_ = std::make_unique<Shader>(shader_src::shockwave_vs,
                                           shader_src::shockwave_fs);
+    warp_in_flash_ = std::make_unique<Shader>(shader_src::warp_in_flash_vs,
+                                              shader_src::warp_in_flash_fs);
     skybox_ = std::make_unique<Shader>(shader_src::skybox_vs, shader_src::skybox_fs);
     cloak_refraction_ = std::make_unique<Shader>(
         shader_src::cloak_refraction_vs, shader_src::cloak_refraction_fs);

@@ -1,10 +1,10 @@
 // native/src/renderer/system_nebula_pass.cc
 #include "renderer/system_nebula_pass.h"
 
+#include "renderer/nebula_noise.h"
 #include "renderer/nebula_pass.h"   // NebulaVolume
 #include "renderer/frame.h"          // Lighting
 #include "renderer/pipeline.h"
-#include "renderer/render_origin.h"
 
 #include <scenegraph/camera.h>
 
@@ -24,14 +24,12 @@ namespace {
 // compile-time constant: it isn't part of the Task 7 dev-tuning surface.
 constexpr int   kSteps = 64;               // near-field geometric steps
 
-// History is reset when the camera moves "a lot" between frames — temporal
-// reprojection only holds up for small deltas. Generous thresholds: ghosting
-// is the failure mode, so when in doubt we throw history away.
-constexpr float kMaxEyeDeltaGu = 30.0f;    // GU of camera translation per frame
-constexpr float kTemporalWeight = 0.90f;   // history blend; higher → faster noise
-                                           // convergence (ghosting bounded by reset)
-constexpr float kDitherAmount = 0.5f;      // half-step jitter — less per-frame
-                                           // variance for temporal to resolve
+// No temporal history (2026-10-19): blending 90% of the previous frame,
+// reprojected from one assumed depth, smeared the haze across the screen on
+// every camera sweep and left trails behind moving hulls. With it off, Mark
+// saw no shimmer in the thin Vesuvi haze or the dense Belaruz dust cloud.
+// Each frame is its own march (SystemNebulaPassTest.TurningTheCamera...).
+constexpr float kDitherAmount = 0.5f;      // half-step jitter of the step offsets
 }  // namespace
 
 NebulaDrawPlan plan_nebula_draws(bool volumetric_setting, bool has_profile,
@@ -51,6 +49,10 @@ SystemNebulaPass::~SystemNebulaPass() {
     if (vao_ != 0) {
         glDeleteVertexArrays(1, &vao_);
         vao_ = 0;
+    }
+    if (lattice_tex_ != 0) {
+        glDeleteTextures(1, &lattice_tex_);
+        lattice_tex_ = 0;
     }
     destroy_half_targets();
     destroy_profile_textures();
@@ -104,7 +106,6 @@ void SystemNebulaPass::set_profile(const atmosphere::RadialProfile& profile,
     table_S_ = make_float_texture(GL_RGB32F, GL_RGB, atm::kTableR, atm::kTableMu,
                                   &built->inscatter[0].x);
     has_profile_ = true;
-    have_history_ = false;   // a new atmosphere: last frame's cloud is stale
     ++profile_rebuild_count_;
 }
 
@@ -121,7 +122,7 @@ void SystemNebulaPass::set_dials(const Dials& dials) {
         if (has_profile_) {
             // Re-upload with the SAME profile, updated LookParams -- exactly
             // what a fresh set_profile(profile_, look_) does, including the
-            // rebuild counter and the temporal-history reset.
+            // rebuild counter.
             set_profile(profile_, look_);
         }
     }
@@ -138,7 +139,6 @@ void SystemNebulaPass::clear_profile() {
     profile_ = atmosphere::RadialProfile{};
     clear_star();
     flashes_.clear();
-    have_history_ = false;
 }
 
 void SystemNebulaPass::initialize_gl() {
@@ -147,40 +147,51 @@ void SystemNebulaPass::initialize_gl() {
     // gl_VertexID in the vertex shader, but core profile still requires a
     // bound VAO for glDrawArrays.
     glGenVertexArrays(1, &vao_);
+
+    // The haze lanes' value-noise lattice (nebula_noise.h): REPEAT so the
+    // shader's wrapped cell blends across the seam, LINEAR so one fetch at
+    // i + smoothstep(f) is the smoothstep blend of the 8 corners. R16F keeps
+    // linear filtering on every GL 4.1 driver (R32F filtering is optional).
+    const int n = nebula_noise::kLatticeN;
+    const std::vector<float> lattice = nebula_noise::bake_hash_lattice(n);
+    glGenTextures(1, &lattice_tex_);
+    glBindTexture(GL_TEXTURE_3D, lattice_tex_);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_R16F, n, n, n, 0, GL_RED, GL_FLOAT, lattice.data());
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_REPEAT);
+    glBindTexture(GL_TEXTURE_3D, 0);
     initialized_ = true;
 }
 
 void SystemNebulaPass::destroy_half_targets() {
-    for (int i = 0; i < 2; ++i) {
-        if (half_tex_[i]) { glDeleteTextures(1, &half_tex_[i]); half_tex_[i] = 0; }
-        if (half_fbo_[i]) { glDeleteFramebuffers(1, &half_fbo_[i]); half_fbo_[i] = 0; }
-    }
+    if (half_tex_) { glDeleteTextures(1, &half_tex_); half_tex_ = 0; }
+    if (half_fbo_) { glDeleteFramebuffers(1, &half_fbo_); half_fbo_ = 0; }
     half_w_ = half_h_ = 0;
-    have_history_ = false;
 }
 
 void SystemNebulaPass::ensure_half_targets(int w, int h) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    if (w == half_w_ && h == half_h_ && half_fbo_[0] != 0) return;
-    destroy_half_targets();   // also clears history (different size => no reuse)
+    if (w == half_w_ && h == half_h_ && half_fbo_ != 0) return;
+    destroy_half_targets();
     half_w_ = w; half_h_ = h;
-    for (int i = 0; i < 2; ++i) {
-        glGenTextures(1, &half_tex_[i]);
-        glBindTexture(GL_TEXTURE_2D, half_tex_[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
-        // LINEAR so the temporal reprojection bilinearly samples the previous
-        // frame; the upsample does its own depth-aware tap selection.
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenTextures(1, &half_tex_);
+    glBindTexture(GL_TEXTURE_2D, half_tex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+    // LINEAR; the upsample does its own depth-aware tap selection.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        glGenFramebuffers(1, &half_fbo_[i]);
-        glBindFramebuffer(GL_FRAMEBUFFER, half_fbo_[i]);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, half_tex_[i], 0);
-    }
+    glGenFramebuffers(1, &half_fbo_);
+    glBindFramebuffer(GL_FRAMEBUFFER, half_fbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, half_tex_, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
@@ -245,25 +256,8 @@ void SystemNebulaPass::render(const scenegraph::Camera& /*camera*/,
     const int hh = std::max(1, full_h / 4);
     ensure_half_targets(hw, hh);
 
-    // ── Temporal validity ──────────────────────────────────────────────────
-    // Reset history on a large camera delta (warp / big cut). The current
-    // proj*view is reconstructed from inv_view_proj; we only need the previous
-    // one for the reprojection, which is stored in prev_view_proj_.
-    const glm::mat4 view_proj = glm::inverse(inv_view_proj);
-    // The WORLD eye's travel, and last frame's matrix in THIS frame's render
-    // space: the floating origin moves with the camera (render_origin.h).
-    const float eye_delta = glm::length(
-        render_origin::eye_travel(eye, prev_eye_, origin, prev_origin_));
-    const glm::mat4 prev_view_proj =
-        render_origin::rebase_prev_viewproj(prev_view_proj_, prev_origin_,
-                                            origin);
-    const bool temporal_ok = have_history_ && (eye_delta <= kMaxEyeDeltaGu);
-
     // ── PASS A: raymarch into the half-res target (overwrite, no blend) ─────
-    cur_ ^= 1;                       // write target ping-pongs each frame
-    const int prev_idx = cur_ ^ 1;   // previous frame's cloud
-
-    glBindFramebuffer(GL_FRAMEBUFFER, half_fbo_[cur_]);
+    glBindFramebuffer(GL_FRAMEBUFFER, half_fbo_);
     glViewport(0, 0, hw, hh);
     glDisable(GL_BLEND);             // overwrite: the shader composes premultiplied
     glDisable(GL_DEPTH_TEST);
@@ -330,24 +324,16 @@ void SystemNebulaPass::render(const scenegraph::Camera& /*camera*/,
         march.set_vec3_array("u_flash_col", flash_col, flash_count);
     }
 
-    // Perf-path dials: dither step-offset + temporal.
-    // u_jitter animates the dither pattern slightly so it doesn't sit static.
+    // Dither step-offset; u_jitter animates the pattern slightly so it
+    // doesn't sit static (as live-checked without history, 2026-10-19).
     march.set_vec2("u_jitter", glm::vec2(std::fmod(time * 31.0f, 64.0f),
                                          std::fmod(time * 17.0f, 64.0f)));
     march.set_float("u_dither_amount", kDitherAmount);
-    march.set_float("u_temporal_weight", temporal_ok ? kTemporalWeight : 0.0f);
-    march.set_mat4("u_prev_view_proj", prev_view_proj);
-    march.set_vec2("u_half_texel",
-                   glm::vec2(1.0f / static_cast<float>(hw),
-                             1.0f / static_cast<float>(hh)));
 
-    // Texture units: 0 = full-res HDR depth, 1 = previous half-res cloud.
+    // Texture unit 0 = full-res HDR depth.
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, hdr_depth_tex);
     march.set_int("u_depth", 0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, half_tex_[prev_idx]);
-    march.set_int("u_prev", 1);
     // 2 = radial (density, tau_star), 3 = far-field optical depth,
     // 4 = far-field inscatter.
     glActiveTexture(GL_TEXTURE2);
@@ -359,6 +345,10 @@ void SystemNebulaPass::render(const scenegraph::Camera& /*camera*/,
     glActiveTexture(GL_TEXTURE4);
     glBindTexture(GL_TEXTURE_2D, table_S_);
     march.set_int("u_table_S", 4);
+    // 5 = the haze lanes' noise lattice.
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_3D, lattice_tex_);
+    march.set_int("u_lattice", 5);
 
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -383,7 +373,7 @@ void SystemNebulaPass::render(const scenegraph::Camera& /*camera*/,
     // silhouettes, lower blends smoother (hides the low-res grid better).
     up.set_float("u_depth_sharpness", 64.0f);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, half_tex_[cur_]);
+    glBindTexture(GL_TEXTURE_2D, half_tex_);
     up.set_int("u_cloud", 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, hdr_depth_tex);
@@ -392,7 +382,9 @@ void SystemNebulaPass::render(const scenegraph::Camera& /*camera*/,
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
 
-    // Unbind the profile units so no later pass inherits them.
+    // Unbind the lattice and the profile units so no later pass inherits them.
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_3D, 0);
     for (GLenum unit : {GL_TEXTURE4, GL_TEXTURE3, GL_TEXTURE2}) {
         glActiveTexture(unit);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -402,12 +394,6 @@ void SystemNebulaPass::render(const scenegraph::Camera& /*camera*/,
     // Leave texture unit 1 unbound / active unit back to 0 (common default).
     glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(GL_TEXTURE0);
-
-    // ── Update temporal history for next frame ─────────────────────────────
-    prev_view_proj_ = view_proj;
-    prev_eye_ = eye;
-    prev_origin_ = origin;
-    have_history_ = true;
 
     // ─── RESTORE CANONICAL GL STATE ──────────────────────────────────────────
     // Leave the pipeline as the next pass (lens flare / torpedo / phaser)

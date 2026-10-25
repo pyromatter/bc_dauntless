@@ -6,6 +6,7 @@ import pytest
 from engine import mods
 import engine.appc.override_routing as r
 from engine.appc import mod_hardpoint_writer as mw
+from tests.helpers.symlinks import requires_symlinks
 
 SRC = ('import App\n'
        'PortWarp = App.EngineProperty_Create("Port Warp")\n'
@@ -53,7 +54,7 @@ def test_write_edits_in_place_and_backs_up_once(tmp_path):
     f = _mod_tree(tmp_path)
     t = r.ModHardpointFileTarget(str(f))
     t.write("refit", [("Port Warp", "SetRadius", (0.5,))])
-    assert "PortWarp.SetRadius(0.500000)" in f.read_text()
+    assert "PortWarp.SetRadius(0.500000)" in f.read_text(encoding="utf-8")
     orig = tmp_path / "M" / "Scripts" / "ships" / "Hardpoints" / "refit.py.orig"
     assert orig.read_bytes() == SRC.encode()
     t.write("refit", [("Port Warp", "SetRadius", (0.7,))])
@@ -112,6 +113,7 @@ def test_non_finite_edit_leaves_the_file_untouched(tmp_path):
     assert not (f.parent / "refit.py.tmp").exists()
 
 
+@requires_symlinks
 def test_write_through_a_symlink_keeps_the_link(tmp_path):
     real = _mod_tree(tmp_path)
     link = tmp_path / "link_refit.py"
@@ -120,4 +122,4 @@ def test_write_through_a_symlink_keeps_the_link(tmp_path):
         "refit", [("Port Warp", "SetRadius", (0.5,))])
     assert link.is_symlink()
     assert os.readlink(link) == str(real)
-    assert "PortWarp.SetRadius(0.500000)" in real.read_text()
+    assert "PortWarp.SetRadius(0.500000)" in real.read_text(encoding="utf-8")

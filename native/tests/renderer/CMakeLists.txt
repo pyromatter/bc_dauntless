@@ -5,6 +5,11 @@ add_executable(renderer_tests
     pipeline_test.cc
     frame_test.cc
     frame_timer_test.cc
+    plating_damage_test.cc
+    part_severance_check_test.cc
+    structure_parts_cache_test.cc
+    plating_render_test.cc
+    hull_interior_test.cc
     geosphere_draw_test.cc
     atmosphere_pass_test.cc
     atmosphere_surface_test.cc
@@ -45,6 +50,7 @@ add_executable(renderer_tests
     planet_detail_pass_test.cc
     planet_detail_bench_test.cc
     system_nebula_pass_test.cc
+    nebula_noise_test.cc
     system_nebula_cache_test.cc
     motion_blur_shutter_test.cc
     letterbox_pass_test.cc
@@ -60,10 +66,8 @@ add_executable(renderer_tests
     glow_region_test.cc
     ray_trace_test.cc
     shield_state_test.cc
-    carve_backing_test.cc
-    carve_cavity_test.cc
-    hull_volume_cache_root_test.cc
-    instance_field_cache_test.cc
+    warp_in_flash_shape_test.cc
+    warp_in_flash_pass_test.cc
     skin_shield_test.cc
     lens_flare_pass_test.cc
     bridge_pass_test.cc
@@ -71,6 +75,7 @@ add_executable(renderer_tests
     bridge_probe_schedule_test.cc
     bridge_lighting_test.cc
     bridge_pbr_test.cc
+    bridge_light_cull_test.cc
     bridge_ao_test.cc
     bridge_highlight_test.cc
     bridge_pbr_frame_test.cc
@@ -94,18 +99,15 @@ add_executable(renderer_tests
     particle_math_test.cc
     particle_pass_test.cc
     asset_path_test.cc
-    hull_clip_test.cc
-    hull_field_clip_test.cc
+    model_textures_test.cc
+    opaque_degenerate_normal_test.cc
     cloak_pass_test.cc
-    breach_pass_test.cc
     breach_venting_test.cc
     breach_debris_test.cc
-    breach_field_sampling_test.cc
-    hull_cut_decision_sync_test.cc
-    breach_raymarch_test.cc
     comm_pass_test.cc
     viewscreen_brightness_test.cc
     viewscreen_static_pass_test.cc
+    viewscreen_bars_pass_test.cc
     light_matrix_test.cc
     shadow_map_target_test.cc
     torpedo_anim_test.cc
@@ -125,9 +127,9 @@ target_link_libraries(renderer_tests
         GTest::gtest_main
 )
 
-# breach_field_sampling_test.cc reads the .frag sources straight off disk (it
-# is a text-level drift guard, not a GL test) and needs the project root to
-# find them from wherever the test binary runs.
+# Tests that read project files off disk (the mesh fixes, the undamaged-hull
+# reference in data/, shader sources) need the project root to find them from
+# wherever the test binary runs.
 target_compile_definitions(renderer_tests PRIVATE
     OPEN_STBC_PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
 
@@ -150,6 +152,7 @@ target_include_directories(renderer_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/native/tests/assets/gpu  # reuse gl_fixture for offscreen contexts
     ${CMAKE_SOURCE_DIR}/native/src/assets/src    # model_build.h (model_parts_test.cc)
     ${CMAKE_SOURCE_DIR}/native/tests             # support/content_root.h
+    ${CMAKE_BINARY_DIR}/native/src/renderer      # embedded_*_{vs,fs}.h (shader source guards)
 )
 
 gtest_discover_tests(renderer_tests

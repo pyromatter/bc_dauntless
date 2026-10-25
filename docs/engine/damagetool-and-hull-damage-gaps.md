@@ -1,5 +1,19 @@
 # DamageTool & Hull-Damage Gaps
 
+> **Superseded (2026-10-22).** The voxel carve this document's gaps are measured
+> against is **deleted** (layered hull damage, phase 4): `hull_carve.py`,
+> `HullCarveField`, the breach pass and `Damage1-4.tga` are gone, so every
+> "our carve" claim and code reference below describes code that no longer
+> exists. Visible hull damage is now the layered system — see
+> [`2026-10-21-layered-hull-damage-production-design.md`](../superpowers/specs/2026-10-21-layered-hull-damage-production-design.md)
+> (§10, as built) and
+> [`2026-10-22-layered-damage-p4-finish-design.md`](../superpowers/specs/2026-10-22-layered-damage-p4-finish-design.md),
+> and the "Layered hull damage" row in `CLAUDE.md`. Authored DamageTool volumes
+> (`AddObjectDamageVolume`) and `AddDamage` each become one Internal record in
+> the layered store (`engine/appc/visible_damage.py`). The analysis of BC's own
+> `DamageTool.exe` (its metaball field and `BinaryVoxel` mask) is still
+> accurate as a description of BC; keep it for that.
+
 > **Gap claims re-verified against code 2026-08-09** — all accurate, no corrections
 > needed. Checked: Gap 1 (`engine/appc/visible_damage.py` exists),
 > Gap 2 (`engine/appc/hull_carve.py` carries `strength` / `influ_radius` /
@@ -198,9 +212,13 @@ size for the 10 stations that already set `DamageRadMod`; reverted to absolute +
 modifier on 2026-06-30.)
 
 (Note: the older `ShipProperty.SetDamageResolution` per-ship value — Galaxy 10,
-Akira 8, kessokmine 2 … — is still stored-but-unused in `engine/appc/ships.py:460`; it is
-BC's `SetSurfaceDamageRes`, the carve **granularity** knob, complementary to these
-modifiers.)
+Akira 8, kessokmine 2 … — is BC's `SetSurfaceDamageRes`, the carve **granularity** knob,
+complementary to these modifiers. It sets the cell of the hull's damage lattice
+(`engine/appc/hull_volume.py:_ship_resolution`). Since 2026-10-18 a hull with
+`DamageRadMod` > ∛2 bakes with its cell scaled by `DamageRadMod / ∛2`
+(`effective_resolution`), because the authored value is sized for ship-sized holes:
+FedOutpost 13.4M → about 90k cells. The lattice is capped at 2^22 cells
+(`kMaxFieldCells`). `perf-register.md` P-4, SIG-036, SIG-037.)
 
 ### Collision scuffs (below-iso, non-carving hits)
 A collision that never crosses the carve iso previously left no visible mark at all.
@@ -224,6 +242,9 @@ threshold are unchanged, and a hit that does cross the iso still carves as befor
   Textures/Effects/Damage.tga*"). So the cavity-interior look is sourced from the
   **wrong asset** — a concrete renderer follow-up: point it at the real
   `Textures/Effects/Damage.tga` (single image), not the HUD glyph set.
+  A better answer than any single texture was tried on 2026-10-20 and gave
+  decent results in game: procedural decks and rooms via interior mapping
+  ([findings](breach-interior-mapping-spike-findings.md); not merged).
 - **OBB tree vs live mesh raycast:** BC pre-baked OBB trees per NIF (`USE_OBBS` extra
   data); we raycast the live mesh in `hit_feedback`. Modern hardware makes this a
   non-issue, and it explains some otherwise-mysterious NIF extra-data bytes.

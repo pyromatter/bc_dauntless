@@ -177,7 +177,7 @@ def test_both_sdk_loaders_route_region_modules():
     or fails asymmetrically."""
     gate = '_qual.startswith(("ships.", "Systems."))'
     for rel in ("tools/mission_harness.py", "tests/conftest.py"):
-        assert gate in (PROJECT_ROOT / rel).read_text(), f"{rel} does not route Systems.*"
+        assert gate in (PROJECT_ROOT / rel).read_text(encoding="utf-8"), f"{rel} does not route Systems.*"
 
 
 def test_realizing_an_unmapped_region_set_raises_the_alarm():
@@ -254,8 +254,7 @@ def test_mission_load_realize_raises_the_alarm_for_a_hand_built_set():
     realize_set_objects, so it needs its own check_realized call, once per
     set, before planet_natural_scale is populated for that set's planets.
 
-    Drives _realize_session directly (mirrors tests/unit/test_hull_volume_
-    wiring.py's Site 2 fixture, minus the QuickBattle cascade, which builds
+    Drives _realize_session directly (no QuickBattle cascade, which builds
     its own named set and would drown out "Ona1"): a hand-built "Ona1" set,
     unmapped, with no player anywhere, made the rendered set so it is the
     viewed set _live_sets() returns."""

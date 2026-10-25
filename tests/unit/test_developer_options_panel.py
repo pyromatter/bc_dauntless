@@ -117,7 +117,9 @@ def test_render_payload_shape(panel):
         {"id": "combat", "label": "Combat"},
         {"id": "lighting", "label": "Lighting"},
         {"id": "environments", "label": "Environments"},
+        {"id": "hull_damage", "label": "Hull damage"},
         {"id": "diagnostics", "label": "Diagnostics"},
+        {"id": "characters", "label": "Characters"},
     ]
     assert body["selected_tab"] == "combat"
     assert body["focused"] == -1  # nothing keyboard-focused on first paint
@@ -129,7 +131,7 @@ def test_render_payload_shape(panel):
         "normal_maps": True, "normal_flip_g": True, "normal_strength": 1.0,
         "bridge_pbr": True,
         "bridge_debug_view": "Off",
-        "profiler": False, "rock_catalogue": True, "dial_group": "nebula",
+        "profiler": False, "perf_monitor": False, "rock_catalogue": True, "dial_group": "nebula",
         "minor_rocks": True, "far_tier": True,
         "rock_specks": True, "rock_puffs": True,
         "planet_geosphere": True,
@@ -207,7 +209,9 @@ def test_focusables_order(panel):
         ("tab", "combat"),
         ("tab", "lighting"),
         ("tab", "environments"),
+        ("tab", "hull_damage"),
         ("tab", "diagnostics"),
+        ("tab", "characters"),
         ("ctrl", "god_mode"),
         ("ctrl", "double_weapons"),
         ("ctrl", "no_npc_shields"),

@@ -21,7 +21,7 @@ def test_save_load_round_trip_and_sorted_names(tmp_path):
     assert p.names() == ["Alpha", "zeta"]
     again = _store(tmp_path)                      # re-read from disk
     assert sc.same_setup(again.load("zeta"), s)
-    raw = json.loads((tmp_path / "quickbattle_presets.json").read_text())
+    raw = json.loads((tmp_path / "quickbattle_presets.json").read_text(encoding="utf-8"))
     assert raw["presets"]["zeta"]["saved_at"]
 
 
@@ -52,3 +52,12 @@ def test_default_path_is_beside_settings_and_resolved_at_use(monkeypatch, tmp_pa
     monkeypatch.setattr(settings_store, "default_settings_path",
                         lambda: tmp_path / "settings.json")
     assert presets.default_presets_path() == tmp_path / "quickbattle_presets.json"
+
+
+def test_preset_keeps_warp_in_delay(tmp_path):
+    p = _store(tmp_path)
+    s = sc.default_scenario()
+    assert s.update_details(s.groups[1].id, "enemy", "fore", "standard", "medium",
+                            warp_in_min=4)
+    assert p.save("late", s)
+    assert _store(tmp_path).load("late").groups[1].warp_in_min == 4

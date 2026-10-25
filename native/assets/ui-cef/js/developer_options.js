@@ -1,6 +1,7 @@
 // Developer Options panel render fn. Driven by Python via
 // cef_execute_javascript:
-//   setDeveloperOptions({visible:true, tabs, selected_tab, focused, settings});
+//   setDeveloperOptions({visible:true, tabs, selected_tab, focused, settings,
+//                        hull_damage});
 //   setDeveloperOptions({visible:false});
 // Click events fire dauntlessEvent('developer-options/<verb>:<arg>').
 // Reuses the cp-* classes from css/configuration_panel.css so the look
@@ -48,8 +49,14 @@ function _doFocusableList(state) {
         out.push({kind: 'ctrl', target: 'surface_debug'});
         out.push({kind: 'ctrl', target: 'reload_surfaces'});
     }
+    if (state.selected_tab === 'hull_damage') {
+        for (const r of (state.hull_damage || [])) {
+            out.push({kind: 'ctrl', target: r.key});
+        }
+    }
     if (state.selected_tab === 'diagnostics') {
         out.push({kind: 'ctrl', target: 'profiler'});
+        out.push({kind: 'ctrl', target: 'perf_monitor'});
         out.push({kind: 'ctrl', target: 'dial_group'});
     }
     return out;
@@ -144,6 +151,8 @@ function _doRenderDiagnosticsBody(state, focusables) {
           + 'report to the terminal every 120 frames (~2 s at 60 fps) until '
           + 'switched off. See docs/engine/frame-profiler.md before drawing a '
           + 'conclusion from it.</div>';
+    html += _doToggleRow('Performance Monitor', 'perf_monitor', s.perf_monitor,
+                         isFoc('perf_monitor'));
     html += _doValueRow('Dial keys (/ L O act on)', 'dial_group',
                         String(s.dial_group), isFoc('dial_group'));
     return html;
@@ -200,6 +209,47 @@ function _doRenderEnvironmentsBody(state, focusables) {
     return html;
 }
 
+// Hull damage tab: the rows come from Python (engine/dev_hull_damage_tuning.py)
+// in display order, {key, label, kind, value}. A value row shows its current
+// value and cycles it on click; the interior row is a toggle; the reset row is
+// a one-shot action. The / L O dial keys ("plating" group) fine-step the same
+// values.
+function _doRenderHullDamageBody(state, focusables) {
+    const focused = focusables[state.focused] || {};
+    const isFoc = (target) => focused.kind === 'ctrl' && focused.target === target;
+    let html = '';
+    html += '<div class="cp-row cp-capture-hint">Each value steps through five presets '
+          + 'around its default. Session only; the / L O dial keys (group '
+          + '"plating") fine-step the same values.</div>';
+    for (const r of (state.hull_damage || [])) {
+        if (r.kind === 'toggle') {
+            html += _doToggleRow(r.label, r.key, r.value, isFoc(r.key));
+        } else if (r.kind === 'action') {
+            html += _doActionRow(r.label, r.key, 'Reset', isFoc(r.key));
+        } else {
+            html += _doValueRow(r.label, r.key, String(r.value), isFoc(r.key));
+        }
+    }
+    return html;
+}
+
+// Characters tab: one Show row per SDK character, mouse only (none of these
+// rows are in the keyboard focus list, here or in the Python panel).
+// Each row stages the character on its comm set and turns the viewscreen to it.
+function _doRenderCharactersBody(state) {
+    const current = state.viewscreen_character;
+    let html = '';
+    html += '<div class="cp-row cp-capture-hint">Puts the character on the bridge '
+          + 'viewscreen the way a mission does, on the set the SDK stages them '
+          + 'on. Close this menu to look.</div>';
+    html += _doActionRow('Viewscreen Off', 'viewscreen_off', 'Off', false);
+    for (const name of (state.characters || [])) {
+        html += _doActionRow(name, 'show_character:' + name,
+                             name === current ? 'Showing' : 'Show', false);
+    }
+    return html;
+}
+
 function setDeveloperOptions(state) {
     const root = document.getElementById('developer-options-panel');
     if (!root) return;
@@ -216,7 +266,9 @@ function setDeveloperOptions(state) {
             (state.selected_tab === 'combat')       ? _doRenderCombatBody(state, focusables)
           : (state.selected_tab === 'lighting')     ? _doRenderLightingBody(state, focusables)
           : (state.selected_tab === 'environments') ? _doRenderEnvironmentsBody(state, focusables)
+          : (state.selected_tab === 'hull_damage')  ? _doRenderHullDamageBody(state, focusables)
           : (state.selected_tab === 'diagnostics')  ? _doRenderDiagnosticsBody(state, focusables)
+          : (state.selected_tab === 'characters')   ? _doRenderCharactersBody(state)
           : '';
     }
     root.style.display = 'flex';

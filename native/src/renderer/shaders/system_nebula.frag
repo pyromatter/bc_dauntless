@@ -12,6 +12,7 @@ uniform sampler2D u_depth;
 uniform sampler2D u_radial;     // RG: density(r), tau_star(r); u = sqrt(r/far)
 uniform sampler2D u_table_tau;  // far-field OPTICAL DEPTH [u(r), (mu+1)/2]
 uniform sampler2D u_table_S;    // far-field inscatter
+uniform sampler3D u_lattice;    // hash13 of each cell, kLatticeN^3, REPEAT + LINEAR
 uniform mat4  u_inv_view_proj;
 uniform vec3  u_eye;
 uniform vec3  u_star;           // render-space star centre
@@ -50,11 +51,7 @@ uniform float u_clump_ext[8];      // 1/visibility per GU per unit clump density
 uniform int   u_flash_count;
 uniform vec3  u_flash_dir[4];
 uniform vec3  u_flash_col[4];
-// temporal (same contract as nebula_volumetric.frag)
-uniform sampler2D u_prev;
-uniform mat4  u_prev_view_proj;
-uniform float u_temporal_weight;
-uniform vec2  u_half_texel;
+// dither (no temporal history since 2026-10-19: system_nebula_pass.cc)
 uniform float u_dither_amount;
 uniform vec2  u_jitter;
 
@@ -76,6 +73,18 @@ float vnoise(vec3 p){
                mix(mix(n001,n101,f.x),mix(n011,n111,f.x),f.y), f.z);
 }
 float fbm(vec3 p){ float a=0.5,s=0.0; for(int k=0;k<5;k++){ s+=a*vnoise(p); p*=2.02; a*=0.5; } return s; }
+
+// --- the same value noise read from the baked lattice (renderer/nebula_noise.h):
+// one trilinear fetch at i + smoothstep(f) instead of 8 hashes. Exactly vnoise
+// inside [0, kLatticeN-1), repeating with period kLatticeN past it. Haze lanes
+// only: the clump noise keeps fbm(), which its gameplay twin mirrors.
+const float kLatticeN = 64.0;   // renderer::nebula_noise::kLatticeN
+float vnoise_lattice(vec3 p){
+    vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+    i=mod(i, kLatticeN);   // small coordinates: no precision loss far out
+    return texture(u_lattice, (i+f+0.5)/kLatticeN).r;
+}
+float fbm_lattice(vec3 p){ float a=0.5,s=0.0; for(int k=0;k<5;k++){ s+=a*vnoise_lattice(p); p*=2.02; a*=0.5; } return s; }
 
 const float PI = 3.14159265;
 float hg(float g, float c){ float g2=g*g; return (1.0-g2)/(4.0*PI*pow(max(1e-6,1.0+g2-2.0*g*c),1.5)); }
@@ -135,7 +144,7 @@ bool clump_interval(int i, vec3 o, vec3 dir, out float t0, out float t1){
     return t1 > t0;
 }
 float lanes(vec3 p){
-    float n = fbm((p+u_noise_origin)/u_lane_size);          // ~0.5 mean
+    float n = fbm_lattice((p+u_noise_origin)/u_lane_size);  // ~0.5 mean
     return max(0.0, mix(1.0, 2.0*n, u_lane_contrast));
 }
 float sky_lanes(vec3 dir){ return max(0.0, mix(1.0, 2.0*fbm(dir*6.0+13.0), u_lane_contrast)); }
@@ -278,23 +287,6 @@ void main(){
     vec3 transm = g_transm; vec3 lit = g_lit;
     float alpha = 1.0 - dot(transm, vec3(1.0/3.0));
     vec4 cur = vec4(lit, alpha);   // premultiplied
-
-    // ── Conservative temporal reprojection (nebula_volumetric.frag) ────────
-    // Anchored at the midpoint of the near-field span: a real forward point
-    // that reprojects correctly wherever the camera is.
-    if(u_temporal_weight > 0.0){
-        vec3 cloud_p = u_eye + dir * (0.5 * near_end);
-        vec4 pc = u_prev_view_proj * vec4(cloud_p, 1.0);
-        if(pc.w > 0.0){
-            vec2 prev_uv = (pc.xy / pc.w) * 0.5 + 0.5;
-            // On-screen guard with a one-texel border (bilinear safety).
-            if(all(greaterThanEqual(prev_uv, u_half_texel)) &&
-               all(lessThanEqual(prev_uv, vec2(1.0) - u_half_texel))){
-                vec4 hist = texture(u_prev, prev_uv);
-                cur = mix(cur, hist, u_temporal_weight);
-            }
-        }
-    }
 
     frag = cur;   // premultiplied (lit, alpha)
 }

@@ -22,6 +22,7 @@ class _LoadCall:
     search: object
     reps: object
     kwargs: dict = field(default_factory=dict)
+    decals: object = None
 
 
 class _FakeRenderer:
@@ -35,7 +36,7 @@ class _FakeRenderer:
         self.load_calls: list[_LoadCall] = []
 
     def load_model(self, path, search, texture_replacements=None, decals=None, **kwargs):
-        self.load_calls.append(_LoadCall(path, search, texture_replacements, dict(kwargs)))
+        self.load_calls.append(_LoadCall(path, search, texture_replacements, dict(kwargs), decals))
         return 100
 
     def model_aabb(self, h):
@@ -169,8 +170,7 @@ def test_ship_load_key_legacy_unchanged():
 # ---- Seam 2: _MissionLoader._realize_session (QuickBattle boot path) ------
 
 def test_realize_session_redirects_stock_asteroid(monkeypatch):
-    """Drives _realize_session the same way test_hull_volume_wiring.py does:
-    via the real QuickBattle boot cascade (load_quickbattle), which realizes
+    """Drives _realize_session via the real QuickBattle boot cascade (load_quickbattle), which realizes
     exactly one ship (the player). _ship_nif_path is monkeypatched so that
     ship resolves to a real game-root stock-asteroid path."""
     from tools import mission_harness
@@ -202,7 +202,7 @@ class _GltfFailingRenderer(_FakeRenderer):
     committed catalogue must not make the asteroid vanish."""
 
     def load_model(self, path, search, texture_replacements=None, decals=None, **kwargs):
-        self.load_calls.append(_LoadCall(path, search, texture_replacements, dict(kwargs)))
+        self.load_calls.append(_LoadCall(path, search, texture_replacements, dict(kwargs), decals))
         if str(path).endswith(".gltf"):
             raise RuntimeError("simulated glTF load failure")
         return 100
@@ -248,7 +248,9 @@ def test_failed_rock_load_falls_back_to_stock_in_realize_session(monkeypatch):
     assert last.path.lower().endswith("asteroid1.nif")
     assert "scale" not in last.kwargs
     # The stock handle is cached under the legacy key (no rock, no scale).
-    legacy_key = hl._ship_load_key(_stock_asteroid_path(), last.reps)
+    # The QuickBattle player is a Galaxy, whose hull-name decals are part of
+    # its key exactly as host_loop builds it.
+    legacy_key = hl._ship_load_key(_stock_asteroid_path(), last.reps, last.decals)
     assert controller.nif_to_handle.get(legacy_key) == 100
     assert _stock_asteroid_path() in controller.nif_to_extent
 

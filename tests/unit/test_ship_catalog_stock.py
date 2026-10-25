@@ -22,11 +22,14 @@ def _clean():
 T, A, S, U = "tactical", "auxiliary", "station", "automated"
 # ship_id, title, species, role, playable, era, icon, variant names
 APPENDIX = [
-    ("Akira", "Akira", "Federation", T, True, "DS9", "Akira", ["USS Geronimo", "USS Devore"]),
+    ("Akira", "Akira", "Federation", T, True, "DS9", "Akira", ["USS Geronimo", "USS Devore",
+                                                                "USS Thunderchild", "USS Akira", "USS Spector"]),
     ("Ambassador", "Ambassador", "Federation", T, True, "DS9", "Ambassador", ["USS Zhukov", "USS Excalibur"]),
-    ("Galaxy", "Galaxy", "Federation", T, True, "DS9", "Galaxy", ["USS Dauntless", "USS San Francisco", "USS Venture"]),
-    ("Nebula", "Nebula", "Federation", T, True, "DS9", "Nebula", ["USS Berkeley", "USS Prometheus", "USS Khitomer", "USS Nightingale"]),
-    ("Sovereign", "Sovereign", "Federation", T, True, "DS9", "Sovereign", ["USS Sovereign", "USS Enterprise"]),
+    ("Galaxy", "Galaxy", "Federation", T, True, "DS9", "Galaxy", ["USS Dauntless", "USS San Francisco", "USS Venture",
+                                                                  "USS Galaxy", "USS Challenger", "USS Magellan", "USS Syracuse", "USS Trinculo"]),
+    ("Nebula", "Nebula", "Federation", T, True, "DS9", "Nebula", ["USS Berkeley", "USS Prometheus", "USS Khitomer", "USS Nightingale",
+                                                                  "USS Nebula", "USS Endeavour", "USS Leeds", "USS Monitor", "USS Sutherland", "USS T'Kumbra"]),
+    ("Sovereign", "Sovereign", "Federation", T, True, "DS9", "Sovereign", ["USS Sovereign", "USS Enterprise", "USS Ark Royal"]),
     ("Shuttle", "Shuttle", "Federation", A, True, "DS9", "FedShuttle", []),
     ("EscapePod", "Escape Pod", "Federation", A, False, "DS9", "LifeBoat", []),
     ("FedStarbase", "Fed Starbase", "Federation", S, False, "DS9", "FedStarbase", []),
@@ -85,11 +88,16 @@ def test_fed_variant_registries_and_the_enterprise_script():
     by_id = {d.shipFile: parse_dauntless(d.dauntless).variants
              for d in shipdef_overrides.stock_definitions()}
     assert [(v.registry, v.script) for v in by_id["Sovereign"]] == [
-        ("Sovereign", None), ("Enterprise", "Enterprise")]
-    assert [v.registry for v in by_id["Galaxy"]] == ["Dauntless", "SanFrancisco", "Venture"]
-    assert [v.registry for v in by_id["Nebula"]] == ["Berkeley", "Prometheus", "Khitomer", "Nightingale"]
+        ("Sovereign", None), ("Enterprise", "Enterprise"), ("ArkRoyal", None)]
+    assert [v.registry for v in by_id["Galaxy"]] == [
+        "Dauntless", "SanFrancisco", "Venture",
+        "Galaxy", "Challenger", "Magellan", "Syracuse", "Trinculo"]
+    assert [v.registry for v in by_id["Nebula"]] == [
+        "Berkeley", "Prometheus", "Khitomer", "Nightingale",
+        "Nebula", "Endeavour", "Leeds", "Monitor", "Sutherland", "TKumbra"]
     assert [(v.registry, v.script) for v in by_id["Akira"]] == [
-        ("Geronimo", None), ("Devore", None)]
+        ("Geronimo", None), ("Devore", None),
+        ("Thunderchild", None), ("Akira", None), ("Spector", None)]
     assert [v.registry for v in by_id["Ambassador"]] == ["Zhukov", "Excalibur"]
 
 
@@ -108,7 +116,7 @@ def test_dict_literals_are_python_15_safe():
     still load in the original BC's Python 1.5: no True/False, no f-strings
     inside any `<X>.dauntless = {...}` literal. (The module's own plumbing,
     e.g. `_listed=False`, is engine code and is not checked.)"""
-    tree = ast.parse(Path(shipdef_overrides.__file__).read_text())
+    tree = ast.parse(Path(shipdef_overrides.__file__).read_text(encoding="utf-8"))
     literals = [n.value for n in ast.walk(tree)
                 if isinstance(n, ast.Assign)
                 and any(isinstance(t, ast.Attribute) and t.attr == "dauntless"
