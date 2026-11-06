@@ -4,7 +4,8 @@ Every path that creates a mapped region set -- warp arrival
 (warp.ChangeRenderedSetAction), MissionLib.SetupSpaceSet, a mission calling
 Systems.X.Y.Initialize() directly (E7M3 does eight), and system loading --
 ends in that region module's Initialize(). So that call is wrapped: BC's body
-runs unchanged, then apply_map.apply_to_set. Installed from the SDK loaders'
+runs unchanged, then apply_map.apply_to_set, then
+home_stations.place_for_set, then arrival_points.add_for_set. Installed from the SDK loaders'
 post-exec hook (engine/appc/sdk_overrides.py), the same place ship-data
 overrides are installed.
 
@@ -12,10 +13,17 @@ Not at AddObjectToSet: BC's <Region>_S.py adds a body THEN calls
 PlaceObjectByName, which would overwrite a position applied at the add.
 
 Ordering is load-bearing: the map must be applied before anything realizes the
-set, because host_loop's planet_natural_scale caches GetRadius() at realize --
+set, because host_loop's planet_natural_scale caches GetBaseRadius() at realize --
 applied after, a body is DRAWN at BC's radius and TARGETED at the map's.
 check_realized() is the alarm for that: a set whose name resolves to a system
 but which apply_to_set never marked.
+
+Home stations are placed after the map, but what matters is that they are
+placed before realize: the set must hold a station by the time it is first
+drawn. The map does not constrain them -- apply_to_set moves bodies, never the
+waypoint a station's point is read from. Unlike apply_to_set, a
+failure there is caught and printed as one line -- placing a station must
+never break a region.
 
 A BROKEN MAP INDEX BLINDS THE WRAP AND THE ALARM TOGETHER -- accepted. Both
 ask resolve.system_of(), so if the index cannot be read, the wrap's lookup
@@ -52,6 +60,8 @@ def mark_mapped(pSet) -> None:
     check_realized reads, rather than a guess from its bodies' radii. The only
     writer of the flag, so its attribute name is spelled once."""
     setattr(pSet, _FLAG_ATTR, True)
+    from engine.appc import native_combat
+    native_combat.push_set_frame(pSet)   # the frame is now the system's
 
 
 def on_region_module_exec(module, qualname: str) -> None:
@@ -82,10 +92,46 @@ def on_region_module_exec(module, qualname: str) -> None:
         pSet = App.g_kSetManager.GetSet(set_name)
         if pSet is not None:
             apply_map.apply_to_set(pSet, set_name)
+            _place_home_stations(pSet, set_name)
+            _add_arrival_points(pSet, set_name)
+            _build_shuttle_lane(pSet, set_name)
         return result
 
     setattr(Initialize, _WRAPPED_ATTR, True)
     module.Initialize = Initialize
+
+
+def _place_home_stations(pSet, set_name: str) -> None:
+    """Place the set's home stations. Unlike apply_to_set this never raises:
+    placing a station must never break a region."""
+    try:
+        from engine.systems import home_stations
+        home_stations.place_for_set(pSet, set_name)
+    except Exception as exc:  # noqa: BLE001 - a station must not break a region
+        print(f"[home-stations] {set_name}: placement failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+
+
+def _add_arrival_points(pSet, set_name: str) -> None:
+    """Add the set's moved warp arrival point (engine/systems/arrival_points).
+    Never raises, for the same reason as the stations."""
+    try:
+        from engine.systems import arrival_points
+        arrival_points.add_for_set(pSet, set_name)
+    except Exception as exc:  # noqa: BLE001 - an arrival point must not break a region
+        print(f"[arrival-points] {set_name}: failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+
+
+def _build_shuttle_lane(pSet, set_name: str) -> None:
+    """Tell the Tau Ceti shuttle service a region was built (lane waypoint,
+    roster start). Never raises, for the same reason as the stations."""
+    try:
+        from engine.systems import shuttle_service
+        shuttle_service.on_region_built(pSet, set_name)
+    except Exception as exc:  # noqa: BLE001 - the shuttles must not break a region
+        print(f"[shuttles] {set_name}: failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
 
 
 def check_realized(pSet) -> bool:

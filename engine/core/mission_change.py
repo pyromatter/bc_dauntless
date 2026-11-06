@@ -191,6 +191,13 @@ def _clear_for_next_mission(game, old_mission, old_episode) -> None:
     for _name, pSet in doomed:
         gone.add(id(pSet))
         gone.update(id(o) for o in pSet._objects.values())
+    # NPCs a blind warp parked in the kept warp set go with the old mission
+    # (warp._parked_blind: a chosen behaviour, BC's is unknown). Their
+    # handlers are dropped with the mission's; the ships themselves are
+    # deleted below, once no old-mission handler can hear it.
+    warp_set = App.g_kSetManager.GetSet(warp._WARP_TRANSIT_SET_NAME)
+    parked = warp.parked_blind_warpers(warp_set)
+    gone.update(id(o) for o in parked)
 
     # MissionLib first, as reset_sdk_globals does (CallWaiting sees the bridge).
     host_loop._reset_missionlib_state()
@@ -210,10 +217,32 @@ def _clear_for_next_mission(game, old_mission, old_episode) -> None:
     # specs spawned there. Same reset the dev swap does (_drain_pending_swap).
     from engine.rocks import death as rock_death
     rock_death.reset()
+    # Effects held for the tick boundary -- a condition write's or a hit's,
+    # the death check among them -- name the old mission's ships
+    # (engine/appc/effect_queue.py): dropped like the dev swap drops them.
+    # The survivors (the player parked in "warp", the bridge set) lose
+    # theirs too, unfiltered. No hit lands on a ship in transit, but its
+    # repair bay may still raise a subsystem since the last boundary, and
+    # that write's watcher crossing or ET_SUBSYSTEM_OPERATIONAL is dropped
+    # here (unverified whether it matters to any script; native damage
+    # task review M2). Filter the survivors' entries out of this reset if
+    # it does.
+    from engine.appc import effect_queue
+    effect_queue.reset()
+    # The native mirror's pending frees and off-main pushes land before the
+    # next mission builds a row (spec 2026-11-03 ruling R2).
+    from engine.appc import native_combat
+    native_combat.drain()
 
     host_loop._reset_timers(keep=survivors)
     host_loop._reset_action_registry(keep=survivors)
     _drop_event_handlers(gone)
+    for ship in parked:
+        try:
+            warp_set.DeleteObjectFromSet(ship.GetName())
+        except Exception:
+            traceback.print_exc()
+        warp.forget_parked_blind(ship)
     host_loop._reset_session_scratch()
     host_loop._reset_system_loader_state()
     _drop_waypoints_outside(kept_sets)

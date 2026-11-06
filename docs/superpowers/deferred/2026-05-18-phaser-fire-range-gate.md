@@ -1,6 +1,6 @@
 # Deferred: don't fire phasers at out-of-range targets
 
-**Status:** RESOLVED 2026-06-02 on `feature/damage-vfx-bridge-feedback`, then **revised 2026-06-04**. Neither Option 1 nor Option 2 turned out to match BC. The stock game uses a **single engine-wide constant** for the fire gate (`PHASER_MAX_RANGE_GU = 700 GU ≈ 122.5 km`), independent of any bank's `MaxDamageDistance`. `MaxDamageDistance` controls inverse-square damage falloff shape only. See [`docs/gameplay/combat-and-damage.md`](../../docs/gameplay/combat-and-damage.md#phaser-fire-range-vs-damage-falloff) and [`engine/appc/subsystems.py:PHASER_MAX_RANGE_GU`](../../../engine/appc/subsystems.py). Prior text below kept for archaeology.
+**Status:** RESOLVED 2026-06-02 on `feature/damage-vfx-bridge-feedback`, then **revised 2026-06-04**. Neither Option 1 nor Option 2 turned out to match BC. The stock game uses a **single engine-wide constant** for the fire gate (`PHASER_MAX_RANGE_GU = 700 GU ≈ 122.5 km`), independent of any bank's `MaxDamageDistance`. `MaxDamageDistance` controls inverse-square damage falloff shape only. See [`docs/reference/gameplay/combat-and-damage.md`](../../docs/gameplay/combat-and-damage.md#phaser-fire-range-vs-damage-falloff) and [`engine/appc/subsystems.py:PHASER_MAX_RANGE_GU`](../../../engine/appc/subsystems.py). Prior text below kept for archaeology.
 
 **Original status:** deferred 2026-05-18.  PR 2c lets the player fire phasers at
 any target the lock accepts, regardless of distance.  We render the
@@ -64,6 +64,7 @@ behaviour.
 ## Related work
 
 - [`docs/superpowers/specs/2026-05-14-phaser-combat-design.md`](../specs/2026-05-14-phaser-combat-design.md) — PR 2c spec.
-- [`docs/instrumented_experiments/2026-05-15-damage-routing-investigation.md`](../../instrumented_experiments/2026-05-15-damage-routing-investigation.md)
-  — once the routing instrumentation captures BC's actual range behaviour
-  we'll know whether option (1) or (2) is correct.
+- stbc-oracle behaviour bible §2.1 (`../stbc-oracle/docs/bc-behaviour-bible.md`)
+  — measured: damage falls off as `min(1, MaxDamageDistance / range)` and is
+  still non-zero at 600 GU (3× MaxDamageDistance), so BC applies no hard
+  range cut-off on the damage side.

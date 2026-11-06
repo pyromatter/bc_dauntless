@@ -10,11 +10,9 @@ calibration that happened to be close to the truth because Galaxy's
 MPE-authored GetRadius coincidentally landed near 0.01 × the NIF
 extent.
 
-See ``docs/instrumented_experiments/hardpoint_handling_research.md``
+See ``docs/reference/instrumented_experiments/hardpoint_handling_research.md``
 section "Bug E" for the full investigation.
 """
-import importlib
-
 from engine import host_loop
 
 
@@ -24,9 +22,12 @@ def test_bc_model_scale_constant_is_flat_zero_zero_one():
 
 
 def test_nif_to_world_constant_removed():
-    """Confirms the bogus calibration constant has been retired so a
-    re-import can't accidentally reintroduce a per-class divergence."""
-    importlib.reload(host_loop)
+    """Confirms the bogus calibration constant has been retired.
+
+    No importlib.reload: re-executing host_loop mid-session replaces every
+    module function, and native combat's guards (native damage's unchanged
+    check) then read the fresh functions as patches and hand every later
+    test's damage back to Python."""
     assert not hasattr(host_loop, "NIF_TO_WORLD")
 
 

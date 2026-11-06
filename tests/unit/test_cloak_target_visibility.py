@@ -34,6 +34,14 @@ from engine.appc.perception import perceived_by
 from engine.appc.target_menu import STTargetMenu_CreateW, STSubsystemMenu
 from tests.helpers.cloak_geometry import inside_gu, outside_gu, sensorless_gu
 
+# A test marked native_switch_zero checks the Python sensor rules with a
+# double only the Python sees (a monkeypatched flag or dial entry, a fake
+# nebula or cache spy): DAUNTLESS_NATIVE_COMBAT=0, now the switch defaults on
+# (fire control native only, R1; tests/helpers/native_off.py). Every other
+# test here runs on the default.
+import pytest  # noqa: E402
+from tests.helpers.native_off import native_switch_zero  # noqa: E402,F401
+
 
 def _pump(menu, player):
     """One frame of the contact push — the same call host_loop._pump_contacts
@@ -92,6 +100,7 @@ def test_is_hidden_by_cloak_predicate():
     assert not is_hidden_by_cloak(plain)
 
 
+@pytest.mark.usefixtures("native_switch_zero")
 def test_cloaked_ship_marked_not_visible_for_radar(monkeypatch):
     """STOCK-BC BEHAVIOUR, held under ENHANCED_SENSOR_CONTEST = False — see the
     module docstring. The enemy sits inside the cloak
@@ -131,6 +140,7 @@ def test_cloaked_ship_stays_on_radar_inside_the_bubble():
     assert not _enemy_visible(menu, enemy)
 
 
+@pytest.mark.usefixtures("native_switch_zero")
 def test_cloaked_ship_dropped_from_target_list_view(monkeypatch):
     """STOCK-BC BEHAVIOUR, held under ENHANCED_SENSOR_CONTEST = False — see the
     module docstring and the companion below."""
@@ -149,7 +159,7 @@ def test_cloaked_ship_dropped_from_target_list_view(monkeypatch):
         from engine.ui.target_list_view import TargetListView
         view = TargetListView()
         _pump(menu, player)
-        rows_before = view._snapshot()[3]
+        rows_before = view._snapshot()[5]
         names_before = {r[0] for r in rows_before}
         assert "Enemy" in names_before
 
@@ -158,7 +168,7 @@ def test_cloaked_ship_dropped_from_target_list_view(monkeypatch):
         # drops the row -- which is the production path, run every frame.
         enemy.GetCloakingSubsystem().InstantCloak()
         _pump(menu, player)
-        rows_after = view._snapshot()[3]
+        rows_after = view._snapshot()[5]
         names_after = {r[0] for r in rows_after}
         assert "Enemy" not in names_after
     finally:
@@ -184,15 +194,16 @@ def test_cloaked_ship_stays_in_target_list_view_inside_the_bubble():
         view = TargetListView()
         enemy.GetCloakingSubsystem().InstantCloak()
         _pump(menu, player)
-        assert "Enemy" in {r[0] for r in view._snapshot()[3]}
+        assert "Enemy" in {r[0] for r in view._snapshot()[5]}
 
         enemy.SetTranslateXYZ(0, outside_gu(sensorless_gu()), 0)
         _pump(menu, player)
-        assert "Enemy" not in {r[0] for r in view._snapshot()[3]}
+        assert "Enemy" not in {r[0] for r in view._snapshot()[5]}
     finally:
         _gmod._current_game = saved
 
 
+@pytest.mark.usefixtures("native_switch_zero")
 def test_player_lock_drops_cloaked_target(monkeypatch):
     """A player lock on a ship that finishes cloaking is dropped.
 

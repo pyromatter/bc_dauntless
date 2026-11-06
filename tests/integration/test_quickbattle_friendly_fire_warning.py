@@ -15,7 +15,7 @@ It guards the WHOLE chain, which had two independent breaks:
    QuickBattle's warning handler listens for) was unreachable. QuickBattle never
    calls SetMaxFriendlyFire; it relies on the engine default, which a real BC
    save from E8M1 (a mission that sets neither value) pins at 5000.0 /
-   300.0 warning points — docs/engine/bcs-save-format.md.
+   300.0 warning points — docs/reference/engine/bcs-save-format.md.
 
 Shooting ENEMIES never warns, in BC or here: QuickBattle's friendly group holds
 only the player and ships added on the Friendly side (QuickBattle.py:2778-2782).
@@ -26,6 +26,7 @@ import App
 from engine.appc import combat
 from engine.appc.math import TGPoint3
 from engine.core.loop import GameLoop
+from engine.appc import effect_queue
 
 
 def _boot_quickbattle(monkeypatch):
@@ -50,6 +51,7 @@ def _shoot(player, target, weapon_type="phaser", damage=100.0, shots=1):
         combat.apply_hit(target, damage=damage,
                          hit_point=TGPoint3(0.0, 1.0, 0.0), source=player,
                          weapon_type=weapon_type)
+        effect_queue.boundary()             # the tick boundary
 
 
 @pytest.fixture

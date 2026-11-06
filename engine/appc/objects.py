@@ -11,6 +11,8 @@ import math
 import random
 import weakref
 
+from engine.appc import native_combat
+from engine.appc import object_types as _object_types
 from engine.appc.events import TGEventHandlerObject
 from engine.appc.math import TGPoint3, TGMatrix3
 from engine.appc.transform_store import get_store
@@ -65,19 +67,29 @@ class _ObjectNodeRef(_NodeStub):
         return "<_ObjectNodeRef %r>" % (owner.GetName() if owner else None)
 
 
-def _release_transform_slot(store, handle) -> None:
-    """Free an object's transform slot. Registered via weakref.finalize, so it
-    runs on collection even when the object is part of a cycle."""
-    try:
-        store.free(*handle)
-    except Exception:
-        # A store reset (tests) or interpreter teardown can invalidate the
-        # handle first; a failed release must never propagate out of a
-        # finalizer.
-        pass
+def _release_transform_slot(store, handle, nslot=None) -> None:
+    """Free an object's transform slot and its native combat mirror row.
+    Registered via weakref.finalize, so it runs on collection even when the
+    object is part of a cycle. Both are RECORDED, as one entry, and freed
+    at native_combat's next drain point (a kernel may be computing on them:
+    spec 2026-11-03-kernels-off-the-lock, ruling R2). Never raises."""
+    native_combat.defer_free(nslot, store, handle)
+
+
+_ISTYPEOF_CACHE: dict = {}
+_ISTYPEOF_GEN = -1
 
 
 class ObjectClass(TGEventHandlerObject):
+    # Mirrored into the native combat row on every write (native_combat).
+    _radius = native_combat.NativeField(float)
+    _scale = native_combat.NativeField(float)
+    _containing_set = native_combat.NativeRefField("Set")
+    # The hardpoint leaf (ShipClass sets it; articulation.leaf_for caches
+    # it): a write marks the row for the part-slot resolution (native_combat
+    # THE PENDING SET). Absent until written.
+    _articulation_leaf = native_combat.PartLeafField()
+
     def __init__(self):
         super().__init__()
         self._name: str = ""
@@ -98,11 +110,15 @@ class ObjectClass(TGEventHandlerObject):
         # fail loudly instead of reading whatever object recycled the index.
         _store = get_store()
         self._xform = _store.alloc()
+        # The native combat mirror row (engine/appc/native_combat.py). Freed
+        # by the same finalizer as the transform slot.
+        native_combat.register(self, "Object", finalize=False)
         # weakref.finalize, NOT __del__: ObjectClass instances sit in
         # reference cycles (they are event handlers and the event manager
         # holds refs back), and __del__ on a cycle member is unreliable.
         self._xform_finalizer = weakref.finalize(
-            self, _release_transform_slot, _store, self._xform)
+            self, _release_transform_slot, _store, self._xform,
+            self.__dict__.get("_nslot"))
         # Not atexit: at interpreter shutdown every still-live object's slot
         # would otherwise be freed one call at a time into the native
         # extension, in the least predictable part of teardown, for no
@@ -159,9 +175,30 @@ class ObjectClass(TGEventHandlerObject):
         # isinstance(..., type) guard turns that into 0.
         # Sun(Planet): a Sun IsTypeOf CT_PLANET and CT_SUN; a plain Planet
         # IsTypeOf CT_SUN is 0 — this is what filters suns out of the orbit menu.
-        from engine.appc import object_types
-        cls = object_types.resolve_class(cls)
-        return 1 if isinstance(cls, type) and isinstance(self, cls) else 0
+        global _ISTYPEOF_GEN
+        tc = type(cls)
+        if tc is not int and not isinstance(cls, type):
+            # bool/float hash equal to an int tag, and each App.CT_<undefined>
+            # lookup is a fresh stub: neither may share or fill the cache.
+            c = _object_types.resolve_class(cls)
+            return 1 if isinstance(c, type) and isinstance(self, c) else 0
+        # Direct attribute read, not generation(): this is the hot path.
+        gen = _object_types._GENERATION
+        if gen != _ISTYPEOF_GEN:
+            _ISTYPEOF_CACHE.clear()
+            _ISTYPEOF_GEN = gen
+        # Keyed by type(self): a runtime class swap gets its new answers.
+        key = (type(self), cls)
+        ans = _ISTYPEOF_CACHE.get(key)
+        if ans is not None:
+            return ans
+        c = _object_types.resolve_class(cls)
+        ans = 1 if isinstance(c, type) and isinstance(self, c) else 0
+        # resolve_class may populate the registry (bumping the generation);
+        # only cache if it did not move under us.
+        if _object_types._GENERATION == gen:
+            _ISTYPEOF_CACHE[key] = ans
+        return ans
 
     def GetName(self) -> str:
         return self._name
@@ -182,7 +219,7 @@ class ObjectClass(TGEventHandlerObject):
         bookkeeping before the object is necessarily in a set.  In BC the
         initial name is set inside Appc at construction rather than through a
         broadcasting script call, so rename-only is the faithful reading as
-        well as the quiet one.  See docs/engine/event-emitter-gaps.md #3.
+        well as the quiet one.  See docs/reference/engine/event-emitter-gaps.md #3.
         """
         old = self._name
         self._name = name
@@ -201,9 +238,28 @@ class ObjectClass(TGEventHandlerObject):
         self._script = script
 
     def GetRadius(self) -> float:
+        """The radius as DRAWN: base x GetScale(), as BC's (CameraModes.md
+        s3.1; the scaled-GetRadius audit). A non-positive or non-finite scale
+        counts as 1, the same guard as collisions.world_radius. Readers that
+        apply the scale themselves read GetBaseRadius()."""
+        r = self._radius
+        s = self._scale
+        if s > 0.0 and math.isfinite(s):
+            return r * s
+        return r
+
+    def GetBaseRadius(self) -> float:
+        """The unscaled radius that SetRadius() sets. Engine surface, not SDK:
+        BC has no such call. Readers that apply GetScale() themselves read
+        this, so they never double-scale. On a ProximityCheck, which overrides
+        GetRadius/SetRadius with its trigger radius, the inherited
+        GetBaseRadius returns the check's unused ``_radius`` (0.0)."""
         return self._radius
 
     def SetRadius(self, r: float) -> None:
+        """Sets the UNSCALED base radius; GetRadius() then returns base x
+        GetScale(). BC has no ObjectClass.SetRadius: this is engine surface
+        (the host calls it from the model, hardpoints may author it)."""
         self._radius = float(r)
 
     def GetScale(self) -> float:
@@ -359,7 +415,19 @@ class ObjectClass(TGEventHandlerObject):
         this object's set — the same sample the nebula hull discharges use);
         headless or instance-less objects fall back to a uniform random point
         on the bounding sphere (GetRadius() is already world-scale), and a
-        radius-less object degrades to its world location."""
+        radius-less object degrades to its world location.
+
+        The draw comes from the module random (gameplay: a death blast's
+        damage point), or from the presentation generator while a
+        presentation scope is open (a death script's debris, a blast that
+        only shows): engine/appc/presentation_rng.py."""
+        from engine.appc import presentation_rng
+        rng = presentation_rng if presentation_rng.in_scope() else random
+        return self._random_point_on_model(rng)
+
+    def _random_point_on_model(self, rng) -> TGPoint3:
+        """GetRandomPointOnModel drawing from `rng` (anything with
+        ``randrange`` and ``gauss``: the module random or presentation_rng)."""
         from engine.appc import render_instances
         iid = render_instances.instance_for(self)
         if iid is not None:
@@ -372,7 +440,7 @@ class ObjectClass(TGEventHandlerObject):
                 # The renderer reports VIEW coordinates; BC gets the point in
                 # this object's own set (Plan 2's rule).
                 from engine.systems import frames
-                x, y, z = pts[random.randrange(len(pts))]
+                x, y, z = pts[rng.randrange(len(pts))]
                 return frames.shifted(
                     TGPoint3(float(x), float(y), float(z)),
                     frames.view_offset(frames.containing_set(self)), -1.0)
@@ -380,9 +448,9 @@ class ObjectClass(TGEventHandlerObject):
         radius = self.GetRadius()
         if radius <= 0.0:
             return center
-        dx = random.gauss(0.0, 1.0)
-        dy = random.gauss(0.0, 1.0)
-        dz = random.gauss(0.0, 1.0)
+        dx = rng.gauss(0.0, 1.0)
+        dy = rng.gauss(0.0, 1.0)
+        dz = rng.gauss(0.0, 1.0)
         norm = math.sqrt(dx * dx + dy * dy + dz * dz)
         if norm < 1e-12:
             return center
@@ -608,6 +676,21 @@ class PhysicsObjectClass(ObjectClass):
     DIRECTION_MODEL_SPACE = 0
     DIRECTION_WORLD_SPACE = 1
 
+    # Mirrored into the native combat row on every write (native_combat).
+    # Always rebound (SetVelocity), never mutated in place. Its row keeps
+    # `_velocity_state` beside the vector (native_combat.VelocityField).
+    _velocity = native_combat.VelocityField()
+    # GetMass: the native tractor force's input (tractor_force.h).
+    _mass = native_combat.NativeField(float)
+    # The native motion kernel's inputs (native motion phase 2): the
+    # scripted spin a drifter flies (rebound by SetAngularVelocity), the
+    # frame it was set in (absent until then: the row's default is
+    # DIRECTION_WORLD_SPACE, getattr's default in drift.step) and
+    # SetStatic's flag.
+    _angular_velocity = native_combat.NativeField(native_combat.POINT_OR_NONE)
+    _angular_space = native_combat.AngularSpaceField()
+    _static = native_combat.NativeField(bool)
+
     def __init__(self):
         super().__init__()
         self._velocity: TGPoint3 = TGPoint3(0.0, 0.0, 0.0)
@@ -629,13 +712,27 @@ class PhysicsObjectClass(ObjectClass):
         return TGPoint3(self._velocity.x, self._velocity.y, self._velocity.z)
 
     def GetAccelerationTG(self) -> TGPoint3:
-        """Phase 1: kinematic model stores no acceleration on the object —
-        acceleration is the integrator's per-tick ramp. Returns a fresh
-        zero vec so callers can mutate without leaking state. SDK Intercept
-        uses this as the `a` arg to GetPredictedPosition; with a = 0 the
-        prediction degenerates to p + v·t, correct at near-constant
-        velocity."""
-        return TGPoint3(0.0, 0.0, 0.0)
+        """World-space acceleration the ship's controller commanded on its last
+        motion tick: the motion law's own step / dt (Mark 2026-11-06), recorded
+        by ship_motion.step_vector_velocity -- the AI integrator and the
+        player's helm both run it -- and zero (ship_motion._no_thrust) for a
+        tick the law did not fly (immobile, warp flight, arriving, drifting).
+        Not dv/dt: a direct velocity write (a warp drop-out, a dash stop, a
+        scripted SetVelocity) gives no one-tick spike. Zero for an object
+        never stepped.
+
+        BC returns the real acceleration, sideways components included while
+        turning (stbc-oracle results_mac/probe_accel_gk.json: measured as dv/dt,
+        up to ~1.9 GU/s^2; while the law alone moves the ship its step IS that
+        dv/dt). FireScript.PredictTargetLocation feeds it to
+        GetPredictedPosition, so a turning target's predicted point swings off
+        its current one and the AI's 10-degree torpedo window opens less often;
+        a constant zero made the AI fire 21-32% more torpedoes than BC's.
+        Returns a fresh vec so callers can mutate without leaking state."""
+        a = self.__dict__.get("_acceleration")
+        if a is None:
+            return TGPoint3(0.0, 0.0, 0.0)
+        return TGPoint3(a[0], a[1], a[2])
 
     def SetAngularVelocity(self, v: TGPoint3, space: int = DIRECTION_WORLD_SPACE) -> None:
         self._angular_velocity = TGPoint3(v.x, v.y, v.z)
@@ -796,8 +893,9 @@ def _is_targetable(subsystem) -> bool:
 def _route_zero_crossing(ship, subsystem, crossed_zero: bool) -> None:
     """On a subsystem crossing >0 -> 0, arm the warp-core breach (when the
     subsystem is the ship's PowerSubsystem) or schedule the hull-death cascade
-    (when it is the hull). No-op otherwise. Kept separate from the critical ->
-    ship_death.begin path, which is unchanged.
+    (when it is the hull). No-op otherwise. Run by the boundary death check
+    (engine/appc/death_check.py), never inside the write, and only for a ship
+    that is not invincible then (ruling R5).
 
     See docs/superpowers/specs/2026-06-20-warp-core-breach-design.md.
     """
@@ -819,6 +917,38 @@ def _route_zero_crossing(ship, subsystem, crossed_zero: bool) -> None:
         subsystem_cascade.schedule(ship)
 
 
+def _begin_death(ship, killer=None) -> None:
+    """The one death entry for a critical subsystem at 0: a rock's death
+    (engine/rocks/death.py) or a ship's (ship_death.begin). Called by the
+    boundary death check (engine/appc/death_check.py)."""
+    from engine.rocks.rock import is_rock
+    if is_rock(ship):
+        from engine.rocks import death as rock_death
+        rock_death.begin(ship, killer=killer)
+    else:
+        from engine.appc import ship_death
+        ship_death.begin(ship, killer=killer)
+
+
+def write_condition(ship, subsystem, value: float, killer=None) -> None:
+    """THE condition write with the critical-at-0 path (rulings M3, M5):
+    write `value`, then note the write for the boundary death check, which
+    routes a zero crossing and begins a death there. A real ShipSubsystem
+    does both in its own _set_condition (so SetCondition from a script is the
+    same write); a subsystem without one (a fake) is written through its
+    SetCondition and noted here. `ship` is who the write is charged to (the
+    DamageSystem receiver), `killer` the firing ship."""
+    # Looked up on the TYPE: a TGObject answers any instance attribute with a
+    # truthy _Stub, which would swallow the write.
+    if callable(getattr(type(subsystem), "_set_condition", None)):
+        subsystem._set_condition(value, killer=killer, ship=ship)
+        return
+    from engine.appc import death_check
+    before = subsystem.GetCondition()
+    subsystem.SetCondition(value)
+    death_check.note_write(ship, subsystem, before, killer)
+
+
 class DamageableObject(PhysicsObjectClass):
     """Placeholder — hull/shield damage state lives here in Phase 2.
 
@@ -827,6 +957,17 @@ class DamageableObject(PhysicsObjectClass):
     loadspacehelper.py:87).  ``SetupProperties()`` then walks the set to
     plumb template values onto the live ship + subsystem instances.
     """
+
+    # Mirrored into the native combat row on every write (native_combat).
+    _dying = native_combat.NativeField(bool)
+    _dead = native_combat.NativeField(bool)
+    _life_time = native_combat.NativeField(float)
+
+    # The death splash (SetSplashDamage), mirrored with the hit's other
+    # inputs (native damage Task 4); ship_death reads it at delivery, in
+    # Python.
+    _splash_damage = native_combat.NativeField(float)
+    _splash_damage_radius = native_combat.NativeField(float)
 
     def __init__(self):
         super().__init__()
@@ -980,7 +1121,7 @@ class DamageableObject(PhysicsObjectClass):
     # methods route authored + runtime visible damage into Internal hull-damage
     # records via engine.appc.visible_damage (deferred until the ship's render
     # instance is realized). See
-    # docs/engine/damagetool-and-hull-damage-gaps.md.
+    # docs/reference/engine/damagetool-and-hull-damage-gaps.md.
 
     def AddObjectDamageVolume(self, x, y, z, influRad, strength) -> None:
         """Authored body-frame damage sphere (SDK pre-wreck Damage*.py scripts)."""
@@ -1049,10 +1190,12 @@ class DamageableObject(PhysicsObjectClass):
             pass
 
     def DamageSystem(self, subsystem, amount: float, source=None) -> None:
-        """Apply damage to a subsystem, flooring condition at zero. If the
-        subsystem is critical and reaches zero, start the ship death
-        sequence (covers hull AND warp core via SetCritical(1)). A >0 -> 0
-        crossing also arms the warp-core breach / schedules the hull cascade.
+        """Apply damage to a subsystem, flooring condition at zero, through
+        the one condition write (write_condition). A critical subsystem left
+        at zero kills the ship (hull AND warp core via SetCritical(1)), and a
+        >0 -> 0 crossing arms the warp-core breach / schedules the hull
+        cascade -- both at the tick boundary, unless the ship is invincible
+        by then (engine/appc/death_check.py, rulings M3, M5, R5).
 
         `source` (SDK-compatible optional 3rd arg — real callers pass 2) is the
         firing ship; combat.apply_hit threads it in so a fatal blow attributes
@@ -1062,41 +1205,25 @@ class DamageableObject(PhysicsObjectClass):
         amt = float(amount)
         if amt <= 0.0:
             return
+        # Native combat on: the native DamageSystem stands in (native damage
+        # Task 3), else -- or when it hands back -- the reference below.
+        if native_combat._switch and native_combat.damage_system(
+                self, subsystem, amt, source):
+            return
         cur = subsystem.GetCondition()
-        new_cond = max(0.0, cur - amt)
-        subsystem.SetCondition(new_cond)
-        _route_zero_crossing(self, subsystem, cur > 0.0 and new_cond <= 0.0)
-        if new_cond <= 0.0 and _is_critical(subsystem) \
-                and not self.IsDying() and not self.IsDead():
-            from engine.rocks.rock import is_rock
-            if is_rock(self):
-                from engine.rocks import death as rock_death
-                rock_death.begin(self, killer=source)
-            else:
-                from engine.appc import ship_death
-                ship_death.begin(self, killer=source)
+        write_condition(self, subsystem, max(0.0, cur - amt), killer=source)
 
     def DestroySystem(self, subsystem) -> None:
         """Force a subsystem to zero condition (mirrors SDK
-        pShip.DestroySystem). Ship death is a side effect only when the
-        subsystem is critical; DestroySystem(pSensors) just zeroes sensors. A
-        >0 -> 0 crossing arms the warp-core breach / schedules the cascade."""
+        pShip.DestroySystem) through the one condition write. Ship death is a
+        side effect only when the subsystem is critical; DestroySystem(pSensors)
+        just zeroes sensors. Death and the zero crossing run at the tick
+        boundary (engine/appc/death_check.py)."""
         if subsystem is None:
             return
-        cur = subsystem.GetCondition()
-        subsystem.SetCondition(0.0)
+        write_condition(self, subsystem, 0.0)
         if hasattr(subsystem, "SetDestroyed"):
             subsystem.SetDestroyed(True)
-        _route_zero_crossing(self, subsystem, cur > 0.0)
-        if _is_critical(subsystem) \
-                and not self.IsDying() and not self.IsDead():
-            from engine.rocks.rock import is_rock
-            if is_rock(self):
-                from engine.rocks import death as rock_death
-                rock_death.begin(self)
-            else:
-                from engine.appc import ship_death
-                ship_death.begin(self)
 
 
 class ObjectGroup(TGEventHandlerObject):
@@ -1114,6 +1241,14 @@ class ObjectGroup(TGEventHandlerObject):
     # object's name. Weak: a mission's condition drops its group when the
     # condition dies, and the registry must not keep it (or its handlers) alive.
     _live: "weakref.WeakSet" = weakref.WeakSet()
+    # name -> the groups that may hold it (a superset: every group whose
+    # AddName added it and whose RemoveName / RemoveAllNames has not dropped
+    # it since). Weak, like _live: a dead group leaves by itself.
+    # broadcast_membership reads it to skip the scan of `_live` when no
+    # live group can watch the name (phase 6 A3: every expiring torpedo's).
+    # `_names` is written ONLY by AddName, RemoveName and RemoveAllNames;
+    # a new writer must keep this index too.
+    _by_name: "dict[str, weakref.WeakSet]" = {}
 
     def __init__(self):
         super().__init__()
@@ -1130,14 +1265,21 @@ class ObjectGroup(TGEventHandlerObject):
     def AddName(self, name: str) -> None:
         if name not in self._names:
             self._names.append(name)
+            groups = ObjectGroup._by_name.get(name)
+            if groups is None:
+                groups = ObjectGroup._by_name[name] = weakref.WeakSet()
+            groups.add(self)
         self._event_flags.setdefault(name, set()).update(self._default_flags)
 
     def RemoveName(self, name: str) -> None:
         if name in self._names:
             self._names.remove(name)
+            _unindex_name(name, self)
         self._event_flags.pop(name, None)
 
     def RemoveAllNames(self) -> None:
+        for name in self._names:
+            _unindex_name(name, self)
         self._names.clear()
         self._event_flags.clear()
 
@@ -1253,8 +1395,26 @@ class ObjectGroup(TGEventHandlerObject):
         name = obj.GetName() if hasattr(obj, "GetName") else None
         if not name:
             return
-        import App
         flag = cls.ENTERED_SET if entered else cls.EXITED_SET
+        # The name index (_by_name): when no live group holding the name has
+        # the flag, the scan below would post nothing (and no handler could
+        # run to change that), so it is skipped. Otherwise the scan runs
+        # exactly as before, over `_live` in its own order: the delivery
+        # order, and a handler's mid-broadcast AddName / RemoveName on a
+        # later group, are what they were.
+        groups = ObjectGroup._by_name.get(name)
+        if not groups:
+            if groups is not None:      # every group holding it died
+                del ObjectGroup._by_name[name]
+            return
+        live = cls._live
+        for group in list(groups):
+            if (group in live and name in group._names
+                    and flag in group._event_flags.get(name, ())):
+                break
+        else:
+            return
+        import App
         et = (App.ET_OBJECT_GROUP_OBJECT_ENTERED_SET if entered
               else App.ET_OBJECT_GROUP_OBJECT_EXITED_SET)
         for group in list(cls._live):
@@ -1272,6 +1432,16 @@ class ObjectGroup(TGEventHandlerObject):
             except Exception:
                 App.g_kEventManager._log_broadcast_failure(
                     "ObjectGroup membership -> %s" % type(group).__name__, evt)
+
+
+def _unindex_name(name, group) -> None:
+    """`group` no longer holds `name`: drop it from ObjectGroup._by_name
+    (and the name's entry once no group is left in it)."""
+    groups = ObjectGroup._by_name.get(name)
+    if groups is not None:
+        groups.discard(group)
+        if not groups:
+            del ObjectGroup._by_name[name]
 
 
 class ObjectGroupWithInfo(ObjectGroup):
@@ -1413,6 +1583,12 @@ def broadcast_object_deleted(obj) -> None:
     every caller is a single plain call: matching BC's own policy of
     reporting a Python handler exception and continuing, the same ruling as
     ObjectGroup.broadcast_membership above."""
+    # Gone from the world: an effect-queue entry naming it is skipped at
+    # delivery (native damage, THE GONE-OBJECT RULE in
+    # engine/appc/effect_queue.py).
+    d = getattr(obj, "__dict__", None)
+    if d is not None:
+        d["_deleted"] = True
     import App
     evt = App.TGEvent_Create()
     evt.SetEventType(App.ET_DELETE_OBJECT_PUBLIC)

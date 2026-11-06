@@ -1,5 +1,5 @@
 """Task 9: pins the whole pipeline to BC's deficit table
-(docs/gameplay/ship-subsystems.md:370-386).
+(docs/reference/gameplay/ship-subsystems.md:370-386).
 
 Galaxy authored values
   output 1000 / main 250,000 / backup 80,000 / conduits 1200+200
@@ -36,6 +36,7 @@ from engine.appc.subsystems import (
 from engine.appc.properties import (
     PowerProperty, ImpulseEngineProperty, ShieldProperty,
 )
+from tests.helpers.subsystem_stage import tick_subsystem
 
 # Galaxy authored power values (galaxy.py:763-767)
 _OUTPUT          = 1000.0
@@ -127,7 +128,7 @@ def test_galaxy_drain_time_matches_bc():
     """Galaxy with PSM_MAIN_FIRST consumers only (total draw 1051 pw/s,
     deficit 51 pw/s) drains the main battery in 250000/51 ≈ 4902 s.
 
-    The test runs at dt=1.0 (one simulation second per tick) so each Update()
+    The test runs at dt=1.0 (one simulation second per tick) so each stage tick
     fires exactly one power interval.  This keeps the iteration count to ~4902
     (< 5000) and eliminates floating-point accumulation skew from sub-second
     ticks.
@@ -163,7 +164,7 @@ def test_galaxy_drain_time_matches_bc():
     max_seconds = expected_drain_time * 2.0   # safety cap (never reached)
 
     while power.GetMainBatteryPower() > 0.0 and seconds < max_seconds:
-        power.Update(dt)
+        tick_subsystem(power, dt)
         seconds += dt
 
     assert seconds < max_seconds, (
@@ -246,17 +247,20 @@ def test_q10_red_alert_sliders_125_tractor_held_split():
     tractor.SetNormalPowerPerSecond(_DRAW_TRACTOR)
     tractor.SetPowerPercentageWanted(1.25)   # slider does NOT scale the siphon
     tractor.TurnOn()
-    tractor._any_child_firing = lambda: True  # beam held
+    from engine.appc.weapon_subsystems import TractorBeam
+    beam = TractorBeam("Tractor Beam 1")
+    tractor.AddChildSubsystem(beam)
+    beam._firing = True                      # beam held
     ship.AddPoweredConsumer(tractor)
 
     # Seed the first interval budget, then measure a clean window well before any
     # battery empties.  dt=1.0 -> one interval per Update.
-    power.Update(1.0)
+    tick_subsystem(power, 1.0)
     main0 = power.GetMainBatteryPower()
     backup0 = power.GetBackupBatteryPower()
     window = 10
     for _ in range(window):
-        power.Update(1.0)
+        tick_subsystem(power, 1.0)
     main_rate = (power.GetMainBatteryPower() - main0) / window
     backup_rate = (power.GetBackupBatteryPower() - backup0) / window
 

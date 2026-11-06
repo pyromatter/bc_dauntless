@@ -301,8 +301,9 @@ class DecalsPaneMixin:
         """The ship's radius in body (NIF) units, the placement frame: the
         model's own bounds (|aabb centre| + |half extents|, host_loop's
         `_model_extent_from_aabb`, the same extent realize derives a missing
-        radius from) when the instance has a model; else GetRadius(), which
-        is UNSCALED GU, over BC_MODEL_SCALE -- never divided by GetScale()."""
+        radius from) when the instance has a model; else GetBaseRadius()
+        (unscaled GU, not GetRadius(), which is base x scale), over
+        BC_MODEL_SCALE -- never divided by GetScale()."""
         from engine import host_io
         from engine.host_loop import BC_MODEL_SCALE, _model_extent_from_aabb
         iid = self._decal_iid()
@@ -317,7 +318,7 @@ class DecalsPaneMixin:
                         return r
             except Exception:
                 pass
-        r = float(ship.GetRadius()) if hasattr(ship, "GetRadius") else 0.0
+        r = float(ship.GetBaseRadius()) if hasattr(ship, "GetBaseRadius") else 0.0
         r /= BC_MODEL_SCALE
         return r if r > 0.0 else 1.0
 
@@ -615,7 +616,8 @@ class DecalsPaneMixin:
             hit, mesh = hit[:3], hit[3]
         else:
             try:
-                hit = host_io.ray_trace_mesh(iid, (o.x, o.y, o.z), direction, cam.far)
+                hit = host_io.ray_trace_mesh(iid, (o.x, o.y, o.z), direction,
+                                             cam.far, drawn=True)
             except Exception:
                 hit = None
         if hit is None:
@@ -624,8 +626,10 @@ class DecalsPaneMixin:
         # The hit is in VIEW coordinates, which is what world_to_body takes
         # (the host_io Python wrapper subtracts the instance translation,
         # then the native call inverts the instance's own world_linear).
+        # Both ask for the DRAWN pose: the author clicks what is drawn.
         try:
-            body = host_io.world_to_body(iid, (px, py, pz), tuple(normal))
+            body = host_io.world_to_body(iid, (px, py, pz), tuple(normal),
+                                         drawn=True)
         except Exception:
             body = None
         if body is None:

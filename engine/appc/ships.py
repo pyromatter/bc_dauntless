@@ -1,8 +1,52 @@
 from engine.appc.objects import DamageableObject
 from engine.appc.math import TGPoint3
 from engine.appc.subsystems import PoweredSubsystem, impulse_output_fraction
+from engine.appc import native_combat, passive_weapons
 import engine.dev_mode as dev_mode
 
+
+def _frame_rotation(f0, u0, f1, u1):
+    """World rotation vector (axis * angle) taking the orthonormal frame
+    (f0, u0) onto (f1, u1); both pairs unit and perpendicular."""
+    import math as _math
+    r0, r1 = f0.Cross(u0), f1.Cross(u1)
+    a0, a1 = (r0, f0, u0), (r1, f1, u1)
+    # M = T C^T, with C, T the matrices whose columns are the frame axes.
+    # Bit-exactness with kernel M (motion_step.cc) relies on Python 3.11's
+    # sum() adding floats plainly left to right; 3.12+ sums floats with
+    # compensated (Neumaier) summation, which can differ in the last bit --
+    # the native motion differential (test_native_motion_differential.py)
+    # would catch it.
+    m = [[sum((a1[k].x, a1[k].y, a1[k].z)[i] * (a0[k].x, a0[k].y, a0[k].z)[j] for k in range(3))
+          for j in range(3)] for i in range(3)]
+    c = (m[0][0] + m[1][1] + m[2][2] - 1.0) * 0.5
+    c = 1.0 if c > 1.0 else (-1.0 if c < -1.0 else c)
+    angle = _math.acos(c)
+    if angle < 1e-9:
+        return 0.0, 0.0, 0.0
+    x, y, z = m[2][1] - m[1][2], m[0][2] - m[2][0], m[1][0] - m[0][1]
+    n = _math.sqrt(x * x + y * y + z * z)
+    if n < 1e-6:
+        # angle ~ pi: the axis from the symmetric part, signs from the largest.
+        d = [max(0.0, (m[i][i] + 1.0) * 0.5) for i in range(3)]
+        i = d.index(max(d))
+        ax = [0.0, 0.0, 0.0]
+        ax[i] = _math.sqrt(d[i])
+        for j in range(3):
+            if j != i:
+                ax[j] = (m[i][j] + m[j][i]) * 0.25 / ax[i]
+        x, y, z = ax
+        n = _math.sqrt(x * x + y * y + z * z)
+    k = angle / n
+    return x * k, y * k, z * k
+
+
+def _to_body(R, v):
+    """Rᵀ·v: a world vector in the body frame (R's columns are the body axes)."""
+    c0, c1, c2 = R.GetCol(0), R.GetCol(1), R.GetCol(2)
+    return TGPoint3(c0.x * v.x + c0.y * v.y + c0.z * v.z,
+                    c1.x * v.x + c1.y * v.y + c1.z * v.z,
+                    c2.x * v.x + c2.y * v.y + c2.z * v.z)
 
 class ShipClass(DamageableObject):
     WG_INVALID = 0
@@ -13,6 +57,86 @@ class ShipClass(DamageableObject):
     GREEN_ALERT = 0
     YELLOW_ALERT = 1
     RED_ALERT = 2
+
+    # Mirrored into the native combat row on every write (native_combat).
+    # _hull is the reference rocks.rock.effective_radius reads via GetHull().
+    # Every GetSubsystems slot also re-pushes the ship's mount order
+    # (native_combat.push_mount_order): NativeMountRefField for the mirrored
+    # ones, MountSlotField for the rest.
+    _sensor_subsystem = native_combat.NativeMountRefField("Subsystem")
+    _cloaking_subsystem = native_combat.NativeMountRefField("Subsystem")
+    _hull = native_combat.NativeMountRefField("Subsystem")
+    # The weapon systems K1 reads (set by SetupProperties / Set*System).
+    _phaser_system = native_combat.NativeMountRefField("Subsystem")
+    _pulse_weapon_system = native_combat.NativeMountRefField("Subsystem")
+    _tractor_beam_system = native_combat.NativeMountRefField("Subsystem")
+    _torpedo_system = native_combat.NativeMountRefField("Subsystem")
+    # Mirrored for the motion kernel; a NativeMountRefField re-pushes the
+    # mount order on a change, as the MountSlotField it replaced did.
+    _impulse_engine_subsystem = native_combat.NativeMountRefField("Subsystem")
+    _warp_engine_subsystem = native_combat.WarpSlotField()
+    # The native power piece's plant and its pump's consumers, in attach
+    # order (subsystem_step.h THE POWER PIECE). _powered_consumers is
+    # appended in place by _attach_subsystem, which pushes it.
+    _power_subsystem = native_combat.NativeMountRefField("Subsystem")
+    # Rebind, or push_field after an in-place edit.
+    _powered_consumers = native_combat.NativeRefList("Subsystem")
+    # The native repair piece's bay (subsystem_step.h THE REPAIR PIECE).
+    _repair_subsystem = native_combat.NativeMountRefField("Subsystem")
+    # articulation.tick_ship's rigless early-out, as generation + 1 (0:
+    # not known rigless); the native ARTICULATION piece skips a ship whose
+    # value equals the pushed ARTICULATION_GEN + 1. ⚠️ The native skip never
+    # re-reads the ship's rig: code that changes what tick_ship would find
+    # (reassigning `_articulation_leaf`, a new rig) after a rigless verdict
+    # must bump the articulated-part generation (native_combat.
+    # bump_part_gen) or set `_rigless_gen = 0`, or the ship stays skipped.
+    _rigless_gen = native_combat.NativeField(int)
+    # What the K2 beam kernel reads: the lock, the Manual Aim offset, the
+    # shield generator and the cached hull box (all rebound, never mutated).
+    _target_subsystem = native_combat.NativeRefField("Subsystem")
+    _use_target_offset = native_combat.NativeField(bool)
+    _manual_target_offset = native_combat.NativeField(native_combat.OFFSET)
+    _shield_subsystem = native_combat.NativeMountRefField("Subsystem")
+    _shield_hull_box = native_combat.HullBoxField()
+    # SetHurtable(0) makes the ship immune (IsImmuneToDamage): the native
+    # hit reads it (native damage Task 3).
+    _hurtable = native_combat.NativeField(bool)
+    # SetInvincible(1): the ship cannot die (ruling M1). Mirrored with the
+    # hit's other inputs (native damage Task 4); the death check reads it at
+    # delivery, in Python. A Subsystem field has the name, so the key is
+    # qualified.
+    _invincible = native_combat.NativeField(bool, key="Object._invincible")
+    # A rebind may change has_posed_parts (native_combat.PosedPartsField).
+    _articulation_poses = native_combat.PosedPartsField()
+    # The native motion kernel's inputs (native motion phase 2). Python
+    # stays the authority. `_current_angular_velocity` is ramped IN PLACE
+    # (ship_motion, host_loop._PlayerControl): each such writer pushes
+    # (native_combat.push_field) after its component writes.
+    # KNOWN, NOT GUARDED: the mirror float()s what it is given, so a string
+    # written straight into `_current_speed` (or into a component of one of
+    # the points below) mirrors as a number the kernel flies, where Python
+    # would raise in the ramp. No engine writer does this (every setter
+    # stores a float); no behaviour change is made for it.
+    _current_speed = native_combat.NativeField(float)
+    _current_angular_velocity = native_combat.NativeField(
+        native_combat.POINT_OR_NONE)
+    _drift_velocity = native_combat.NativeOptionalField(
+        native_combat.POINT_OR_NONE, absent=None)
+    _target_angular_velocity_setpoint = native_combat.NativeField(
+        native_combat.POINT_OR_NONE)
+    _speed_setpoint = native_combat.SpeedSetpointField()
+    # The motion law's state (ship_motion.step_vector_velocity, the angular
+    # law): the velocity vector, `(vx, vy, vz, speed)` or None; its
+    # commanded acceleration, `(ax, ay, az)` or None (GetAccelerationTG);
+    # the keyboard turn fraction; and the stored turn goal's spec (kernel M
+    # steers it: native_combat.TurnGoalField).
+    _motion_vel = native_combat.MotionVelField()
+    _acceleration = native_combat.AccelerationField()
+    _target_angular_velocity_fraction = native_combat.NativeField(
+        native_combat.POINT_OR_NONE)
+    _turn_goal = native_combat.TurnGoalField()
+    _stationary = native_combat.NativeField(bool)
+    _insystem_warp_transit = native_combat.PresenceField()
 
     def __init__(self):
         super().__init__()
@@ -43,6 +167,7 @@ class ShipClass(DamageableObject):
         self._shield_subsystem = None
         self._power_subsystem = None
         self._repair_subsystem = None
+        self._rigless_gen = 0
         # Powered consumers in attach order — this list IS the BC draw priority
         # (mirrors BC's linked list of powered subsystems).  PowerSubsystem's
         # per-interval pump walks it in order so earlier-attached systems get
@@ -130,6 +255,14 @@ class ShipClass(DamageableObject):
         # no-setpoint early-out depends on this.
         self._speed_setpoint = None
         self._target_angular_velocity_setpoint = None
+        # The motion law's state (ship_motion): the velocity vector and the
+        # speed it was last stepped to, the acceleration it last commanded,
+        # the keyboard turn fraction, and a stored turn goal (TurnToward* /
+        # TurnDirectionsToDirections).
+        self._motion_vel = None
+        self._acceleration = None
+        self._target_angular_velocity_fraction = None
+        self._turn_goal = None
         self._current_speed: float = 0.0
         self._current_angular_velocity: TGPoint3 = TGPoint3(0.0, 0.0, 0.0)
         # Active in-system warp: a warp_flight.WarpFlight while the ship is
@@ -289,11 +422,22 @@ class ShipClass(DamageableObject):
         this guard avoids breaking them and matches the
         MaxSpeed-populated guard in ship_motion._effective_motion /
         _PlayerControl.GetTargetSpeed.
+
+        The fraction is of the LIVE max speed (GetMaxSpeed: damaged pods x
+        the Engines power slider), as on the player's throttle
+        (_PlayerControl.GetTargetSpeed): measured on stbc.exe, an AI/scripted
+        Galaxy at Engines 125% reaches 7.875 = 1.25 x 6.3 (stbc-oracle
+        `impulse_matrix`). With the engines out (live max 0) the authored max
+        is used, so a one-shot order still holds once they are repaired; the
+        motion cap keeps the ship at the live limit meanwhile.
         """
         ies = self.GetImpulseEngineSubsystem()
         max_speed = ies.GetAuthoredMaxSpeed() if ies is not None else 0.0
         if max_speed > 0.0:
-            speed = float(speed) * max_speed
+            # The live rated output: damaged pods x the Engines slider
+            # (impulse_output_fraction, the GetMaxSpeed derating).
+            rated = max_speed * impulse_output_fraction(ies)
+            speed = float(speed) * (rated if rated > 0.0 else max_speed)
         self.SetSpeed(speed, direction, frame)
 
     def GetSpeedSetpoint(self):
@@ -303,6 +447,48 @@ class ShipClass(DamageableObject):
         # Defensive copy — vec is a TGPoint3 the caller may mutate.
         from engine.appc.math import TGPoint3
         self._target_angular_velocity_setpoint = TGPoint3(vec.x, vec.y, vec.z)
+        self._target_angular_velocity_fraction = None
+        # Any other angular command ends a stored turn goal (it steered only
+        # while it owned the setpoint), so kernel M flies the row again.
+        self._turn_goal = None
+
+    def GetAngularVelocityTG(self) -> TGPoint3:
+        """The ship's actual angular velocity, world space (rad/s). Ships turn
+        through _current_angular_velocity (body frame, ship_motion); the base
+        ObjectClass field this used to return is never written for a ship, so
+        it read (0, 0, 0) mid-turn. The original reports the live rate
+        (stbc-oracle telemetry xm `w`); the drop-and-watch camera predicts the
+        target's rotation from it."""
+        cav = self.__dict__.get("_current_angular_velocity")
+        if cav is None or not (cav.x or cav.y or cav.z):
+            # Not turning under its own controller: a drifter or rock spins by
+            # SetAngularVelocity (engine.appc.drift, rocks.motion) -- that field.
+            return super().GetAngularVelocityTG()
+        v = TGPoint3(cav.x, cav.y, cav.z)
+        v.MultMatrixLeft(self.GetWorldRotation())          # R . w_body
+        return v
+
+    def GetAngularVelocity(self, space: int = None) -> TGPoint3:
+        cav = self.__dict__.get("_current_angular_velocity")
+        if cav is None or not (cav.x or cav.y or cav.z):
+            return super().GetAngularVelocity() if space is None else super().GetAngularVelocity(space)
+        import App
+        if space == getattr(App.PhysicsObjectClass, "DIRECTION_MODEL_SPACE", 1):
+            return TGPoint3(cav.x, cav.y, cav.z)
+        return self.GetAngularVelocityTG()
+
+    def SetTargetAngularVelocityFraction(self, vec) -> None:
+        """BC's player keyboard turn (TacticalInterfaceHandlers.TurnShip): a
+        model-space axis whose length is the fraction of the ship's LIVE max
+        turn rate (damage x Engines power). TurnShip unitizes the sum of the
+        held keys, so a diagonal (yaw + pitch) turns at 0.707 of the rate on
+        each axis, not the full rate on both. Resolved against the live max
+        every tick in ship_motion, as the max changes with power and damage."""
+        from engine.appc.math import TGPoint3
+        frac = TGPoint3(vec.x, vec.y, vec.z)
+        self._target_angular_velocity_fraction = frac
+        self._target_angular_velocity_setpoint = TGPoint3(0.0, 0.0, 0.0)
+        self._turn_goal = None
 
     def GetTargetAngularVelocitySetpoint(self):
         return getattr(self, "_target_angular_velocity_setpoint", None)
@@ -337,6 +523,11 @@ class ShipClass(DamageableObject):
         # Zero-speed setpoint (model-forward dir) so the integrator holds at 0.
         self._speed_setpoint = (0.0, TGPoint3(0.0, 1.0, 0.0), 0)
         self._target_angular_velocity_setpoint = TGPoint3(0.0, 0.0, 0.0)
+        # The fresh setpoint is no goal's: a stored turn goal can never own
+        # it again (ship_motion steers only while `goal[1] is` the setpoint),
+        # so it ends here, as every other angular command ends it -- and
+        # kernel M, which steers any stored goal with a setpoint, agrees.
+        self._turn_goal = None
         self._end_in_system_warp("stopped")     # see SetAI
 
     # ── Pure-math kinematic helpers ──────────────────────────────────────────
@@ -386,36 +577,71 @@ class ShipClass(DamageableObject):
 
     def TurnDirectionsToDirections(self, primary_from, primary_to,
                                    secondary_from=None, secondary_to=None) -> float:
-        """Compute the angular velocity needed to rotate primary_from
-        onto primary_to (and secondary_from onto secondary_to around
-        the primary axis), call SetTargetAngularVelocityDirect, return
-        an estimate of seconds until alignment completes.
+        """Turn so primary_from lands on primary_to (and, given both, secondary_from
+        on secondary_to about it); return an ETA in seconds.
 
-        Called by AI.PlainAI.TurnToOrientation.Update (sdk/.../
-        TurnToOrientation.py) each tick (0.5 s cadence).
+        Called by AI.PlainAI.TurnToOrientation, Defensive and TorpedoRun, and by
+        the TurnToward* family below. The 'from' vectors are body axes as they
+        point now, so they are stored in the BODY frame, the 'to' vectors in the
+        world frame: the ship keeps steering to that goal every physics tick
+        (ship_motion -> _steer_turn_goal) until another angular command replaces
+        it, as the original does -- one TurnTowardLocation call turns the ship
+        exactly as one per frame does (stbc-oracle turnto, *_turnloc*o runs).
+        """
+        R = self.GetWorldRotation()
+        pf = TGPoint3(primary_from.x, primary_from.y, primary_from.z); pf.Unitize()
+        pt = TGPoint3(primary_to.x, primary_to.y, primary_to.z); pt.Unitize()
+        body_pf = _to_body(R, pf)
+        body_sf = st = None
+        if secondary_from is not None and secondary_to is not None:
+            body_sf = _to_body(R, secondary_from)
+            st = TGPoint3(secondary_to.x, secondary_to.y, secondary_to.z)
+        return self._begin_turn_goal(("dirs", body_pf, pt, body_sf, st))
 
-        Algorithm:
-          1. Primary alignment: axis = pf × pt; angle = acos(pf · pt).
-             Degenerate case (vectors collinear, angle ≈ π): pick an
-             arbitrary perpendicular axis (cross with world up; if
-             still collinear, cross with world right).
-          2. Secondary constraint (skipped when secondary_from or
-             secondary_to has magnitude 0): compute signed roll angle
-             between projections of sf and st onto the plane
-             perpendicular to primary_to. Add roll * primary_to to
-             the angular velocity.
-          3. Cap the commanded magnitude at √(2·MaxAngularAccel·θ) so
-             the ship can always decelerate into alignment instead of
-             overshooting and hunting.
-          4. Convert the world-frame axis·angle vector to BODY frame
-             (v_body = Rᵀ·v_world) — the integrator treats the setpoint
-             as body-frame pitch/roll/yaw rates.
-          5. Clamp per-axis magnitude to GetMaxAngularVelocity()
-             (FALLBACK_MAX_ACCEL when the IES isn't populated).
-          6. SetTargetAngularVelocityDirect(angular_velocity).
-          7. Return total_angle / max_angular_velocity (loose
-             estimate; TurnToOrientation uses it only when
-             bDoneOnLineup=1, and that's gated separately).
+    def _begin_turn_goal(self, spec) -> float:
+        self._turn_goal = [spec, None]
+        # Both live limits from ONE derating walk: impulse_output_fraction walks
+        # every engine pod (IsDisabled / GetConditionPercentage), and this runs
+        # for every turning ship on every AI update.
+        ies = self.GetImpulseEngineSubsystem()
+        if ies is not None:
+            imp_f = impulse_output_fraction(ies)
+            max_aa = ies.GetAuthoredMaxAngularAccel() * imp_f
+            max_av = ies.GetAuthoredMaxAngularVelocity() * imp_f
+        else:
+            max_aa = max_av = 0.0
+        primary_angle, roll_angle = self._steer_turn_goal(1.0 / 60.0, max_aa)
+        if max_av and max_av > 1e-9:
+            return float((abs(primary_angle) + abs(roll_angle)) / max_av)
+        return 0.0
+
+    def _turn_goal_vectors(self, spec):
+        """(primary_from, primary_to, secondary_from, secondary_to) in world
+        space for a stored goal, as the ship stands now (None: no goal left)."""
+        R = self.GetWorldRotation()
+        if spec[0] == "loc":
+            p, loc = spec[1], self.GetWorldLocation()
+            d = TGPoint3(p.x - loc.x, p.y - loc.y, p.z - loc.z)
+            if d.Length() < 1e-9:
+                return None
+            d.Unitize()
+            return R.GetCol(1), d, None, None
+        _, body_pf, pt, body_sf, st = spec
+        pf = TGPoint3(body_pf.x, body_pf.y, body_pf.z); pf.MultMatrixLeft(R)
+        sf = None
+        if body_sf is not None:
+            sf = TGPoint3(body_sf.x, body_sf.y, body_sf.z); sf.MultMatrixLeft(R)
+        return pf, pt, sf, st
+
+    def _turn_rotation(self, primary_from, primary_to, secondary_from, secondary_to):
+        """World axis-angle vector from the 'from' frame to the 'to' frame:
+        (av_x, av_y, av_z, primary_angle, roll_angle).
+
+          1. Primary alignment: axis = pf x pt, angle = acos(pf . pt); collinear
+             and opposite turns about the ship's own up.
+          2. Secondary constraint (skipped when either secondary vector is
+             missing or zero): the signed roll between sf and st projected off
+             primary_to, added as roll * primary_to.
         """
         import math as _math
 
@@ -437,12 +663,17 @@ class ShipClass(DamageableObject):
             if primary_angle < 1e-6:
                 axis = TGPoint3(0.0, 0.0, 0.0)
             else:
-                # Pick an arbitrary perpendicular.
-                world_up = TGPoint3(0.0, 0.0, 1.0)
-                candidate = pf.Cross(world_up)
+                # Turn about the ship's own up axis: the original yaws an about-face
+                # (stbc-oracle turnto, Galaxy turnloc180_0: w = (0, 0, +0.37) world,
+                # up stays up). Up projected off pf, so any 'from' axis works; the
+                # world axes only if that degenerates too.
+                cu = self.GetWorldRotation().GetCol(2)
+                k = cu.Dot(pf)
+                candidate = TGPoint3(cu.x - pf.x * k, cu.y - pf.y * k, cu.z - pf.z * k)
                 if candidate.Length() < 1e-6:
-                    world_right = TGPoint3(1.0, 0.0, 0.0)
-                    candidate = pf.Cross(world_right)
+                    candidate = pf.Cross(TGPoint3(0.0, 0.0, 1.0))
+                if candidate.Length() < 1e-6:
+                    candidate = pf.Cross(TGPoint3(1.0, 0.0, 0.0))
                 candidate.Unitize()
                 axis = candidate
         else:
@@ -508,87 +739,78 @@ class ShipClass(DamageableObject):
                 sign_axis = sf_proj.Cross(st_proj)
                 if sign_axis.Dot(pt) < 0.0:
                     roll_angle = -roll_angle
-                av_x += pt.x * roll_angle
-                av_y += pt.y * roll_angle
-                av_z += pt.z * roll_angle
+                # The turn still to go is the single rotation taking the current
+                # (forward, up) frame onto the goal frame: never more than pi.
+                # Adding the nose turn and the roll as two vectors (the old
+                # form) overstates it up to 2x, and with a planned turn that
+                # means a slower, wandering path.
+                k0 = sf.Dot(pf)
+                u0 = TGPoint3(sf.x - pf.x * k0, sf.y - pf.y * k0, sf.z - pf.z * k0)
+                if u0.Unitize() > 1e-9:
+                    av_x, av_y, av_z = _frame_rotation(pf, u0, pt, st_proj)
+                else:
+                    av_x += pt.x * roll_angle
+                    av_y += pt.y * roll_angle
+                    av_z += pt.z * roll_angle
 
-        # 3. Deceleration-aware magnitude. The raw command (|ω| = remaining
-        # angle per second) saturates at MaxAngularVelocity for any large
-        # angle; with a finite MaxAngularAccel the integrator then can't
-        # shed that rate before alignment and the nose overshoots and hunts
-        # (±MaxAngVel²/2·MaxAngAccel each swing — ±19° for a Galaxy). Cap
-        # the command at √(2·a·θ), the highest rate from which the ship can
-        # still stop within the remaining angle; near alignment the
-        # proportional θ/s command is already below the cap and gives the
-        # smooth terminal taper.
-        ies = self.GetImpulseEngineSubsystem()
-        total_angle = (av_x * av_x + av_y * av_y + av_z * av_z) ** 0.5
-        # Both live limits from ONE derating walk. GetMaxAngularAccel and
-        # GetMaxAngularVelocity are each `authored * impulse_output_fraction`,
-        # and that fraction walks every child pod querying IsDisabled /
-        # GetConditionPercentage. This path used to call the accel getter once
-        # and the velocity getter TWICE (guard, then assignment) -- three walks
-        # per call for one answer, 37,545 of them over 150 ticks at 100 ships.
-        #
-        # Bit-exact: same operands, same single multiply, and nothing between
-        # the reads can change the fraction.
-        if ies is not None:
-            # impulse_output_fraction is imported at MODULE scope (line 3,
-            # alongside PoweredSubsystem -- subsystems imports nothing from
-            # here, so there is no cycle). A `from ... import` inside this
-            # branch was a sys.modules lookup plus an attribute fetch on every
-            # turning ship every AI tick, the same pattern this branch deleted
-            # from subsystems._is_offline.
-            _imp_f = impulse_output_fraction(ies)
-            max_aa = ies.GetAuthoredMaxAngularAccel() * _imp_f
-            max_av_live = ies.GetAuthoredMaxAngularVelocity() * _imp_f
-        else:
-            max_aa = 0.0
-            max_av_live = 0.0
-        if max_aa and max_aa > 0.0 and total_angle > 1e-9:
-            stop_cap = _math.sqrt(2.0 * max_aa * total_angle)
-            if stop_cap < total_angle:
-                k = stop_cap / total_angle
-                av_x *= k; av_y *= k; av_z *= k
+        return av_x, av_y, av_z, primary_angle, roll_angle
 
-        # 4. World → body frame. The integrator (ship_motion.
-        # _integrate_rotation) interprets the setpoint as BODY-frame rates
-        # (pitch about body X, roll about body Y, yaw about body Z,
-        # post-multiplied R·Δ). The axis·angle vector built above is WORLD
-        # frame; feeding it through unconverted is only correct near
-        # identity attitude — at an arbitrary attitude the ship turns about
-        # the wrong axes, re-aims, and hunts forever (live symptom: the
-        # nose waves in circles and never lands on the target).
-        # v_body = Rᵀ·v_world; with column-vector R the rows of Rᵀ are the
-        # body axes, so each body component is a column dot product.
+    def _steer_turn_goal(self, dt: float, max_aa: float):
+        """Write the angular setpoint for one tick of the stored turn goal.
+
+        The original plans a cubic: from the angle theta still to turn and the
+        rate w already along it, the time to go tau solves
+        A tau^2 + 2 w tau = 6 theta (A = live MaxAngularAccel), and the ship
+        accelerates at 6 theta / tau^2 - 4 w / tau. From rest that is +A falling
+        linearly to -A over tau = sqrt(6 theta / A): a Galaxy (A = 0.12) turns
+        45 / 90 / 180 deg in 6.3 / 8.9 / 12.5 s, peaking at A tau / 4 =
+        0.19 / 0.27 / 0.37 rad/s -- past its 0.28 MaxAngularVelocity, which this
+        does not cap (stbc-oracle turnto, Galaxy turnloc*: within 1% on every
+        run; the jerk 2A/tau scales as 1/sqrt(theta)).
+
+        The setpoint is w + a * BC_IMPULSE_TAU, from which ship_motion's law
+        steps exactly a * dt. max_aa is the live MaxAngularAccel, passed in by
+        the caller that already has it (ship_motion's _effective_motion).
+        Returns (primary_angle, roll_angle).
+        """
+        import math as _math
+        goal = self.__dict__.get("_turn_goal")
+        vecs = self._turn_goal_vectors(goal[0]) if goal is not None else None
+        if vecs is None:
+            return 0.0, 0.0
+        av_x, av_y, av_z, primary_angle, roll_angle = self._turn_rotation(*vecs)
         R = self.GetWorldRotation()
-        c0, c1, c2 = R.GetCol(0), R.GetCol(1), R.GetCol(2)
-        b_x = c0.x * av_x + c0.y * av_y + c0.z * av_z
-        b_y = c1.x * av_x + c1.y * av_y + c1.z * av_z
-        b_z = c2.x * av_x + c2.y * av_y + c2.z * av_z
-
-        # 5. Clamp per-axis to MaxAngularVelocity. Uses the same
-        # IES-populated guard as ship_motion._effective_motion.
-        if max_av_live > 0.0:
-            max_av = max_av_live
+        cav = self.__dict__.get("_current_angular_velocity")
+        w = TGPoint3(cav.x, cav.y, cav.z) if cav is not None else TGPoint3(0.0, 0.0, 0.0)
+        w.MultMatrixLeft(R)                                  # world
+        theta = (av_x * av_x + av_y * av_y + av_z * av_z) ** 0.5
+        if not max_aa or max_aa <= 0.0:
+            # No authored accel (props, test rigs): turn at the remaining angle per second.
+            ax, ay, az = av_x - w.x, av_y - w.y, av_z - w.z
         else:
-            max_av = 1.0e9  # ship_motion.FALLBACK_MAX_ACCEL parallel
-        def _clamp(v, m):
-            if v > m: return m
-            if v < -m: return -m
-            return v
-        b_x = _clamp(b_x, max_av)
-        b_y = _clamp(b_y, max_av)
-        b_z = _clamp(b_z, max_av)
-
-        # 6. Write the setpoint (body frame).
-        self.SetTargetAngularVelocityDirect(TGPoint3(b_x, b_y, b_z))
-
-        # 7. ETA estimate.
-        eta_angle = abs(primary_angle) + abs(roll_angle)
-        if max_av > 1e-9:
-            return float(eta_angle / max_av)
-        return 0.0
+            ux, uy, uz = (av_x / theta, av_y / theta, av_z / theta) if theta > 1e-9 else (0.0, 0.0, 0.0)
+            w_along = w.x * ux + w.y * uy + w.z * uz
+            tau = (_math.sqrt(max(0.0, w_along * w_along + 6.0 * max_aa * theta)) - w_along) / max_aa
+            if theta < 1e-6 or tau <= dt:
+                ax, ay, az = -w.x / dt, -w.y / dt, -w.z / dt          # land: shed what is left
+            else:
+                k = 6.0 * theta / (tau * tau)
+                ax = k * ux - 4.0 * w.x / tau
+                ay = k * uy - 4.0 * w.y / tau
+                az = k * uz - 4.0 * w.z / tau
+            a = (ax * ax + ay * ay + az * az) ** 0.5
+            if a > max_aa:
+                ax, ay, az = ax * max_aa / a, ay * max_aa / a, az * max_aa / a
+        from engine.appc.ship_motion import BC_IMPULSE_TAU
+        target = _to_body(R, TGPoint3(w.x + ax * BC_IMPULSE_TAU, w.y + ay * BC_IMPULSE_TAU,
+                                      w.z + az * BC_IMPULSE_TAU))
+        # Written directly, not through SetTargetAngularVelocityDirect: the goal
+        # owns this setpoint object, and any other angular command replaces it
+        # (ship_motion only re-steers while they are still the same object).
+        self._target_angular_velocity_setpoint = target
+        self._target_angular_velocity_fraction = None
+        goal[1] = target
+        return primary_angle, roll_angle
 
     def TurnTowardOrientation(self, vForward, vUp):
         """Steer world-forward onto vForward and world-up onto vUp.
@@ -656,10 +878,10 @@ class ShipClass(DamageableObject):
         )
         if diff.Length() < 1e-9:
             return
-        diff.Unitize()
-        forward = self.GetWorldRotation().GetCol(1)
-        zero = TGPoint3(0.0, 0.0, 0.0)
-        self.TurnDirectionsToDirections(forward, diff, zero, zero)
+        # The POINT is the goal: the direction to it is re-taken every tick as
+        # the ship moves (the original tracks it at full impulse too --
+        # stbc-oracle turnto, Galaxy turnloc90_0s / turnloc180_0s).
+        self._begin_turn_goal(("loc", TGPoint3(target_vec.x, target_vec.y, target_vec.z)))
 
     def TurnTowardDifference(self, difference_vec) -> float:
         """Steer through a world-space rotation *delta* and return its ETA.
@@ -723,14 +945,15 @@ class ShipClass(DamageableObject):
         """Begin (or report) a sub-light warp toward `target`.
 
         Multi-frame transit model: when the ship is beyond `distance` of the
-        target AND its nose is on the target (IN_SYSTEM_WARP_FACING_COS),
+        target's surface (its GetRadius() + `distance` from its centre, as
+        BC) AND its nose is on the target (IN_SYSTEM_WARP_FACING_COS),
         begin a WarpFlight (engine/appc/warp_flight.py) toward it and return
         1. Each tick warp_flight.step cruises the ship at
         IN_SYSTEM_WARP_SPEED_GUPS -- straight while the
         line keeps every body's clearance, routed around bodies otherwise
         (BC's contract: AI/Preprocessors.py:1690 skips AvoidObstacles during
         the warp "because the in-system warp check already does that") --
-        until it is `distance` from the target, where the flight ends and
+        until it is `distance` from the target's surface, where the flight ends and
         `_warp_consumed` latches. Positions are compared through the frames
         (a target in another region of the system is reachable). While a transit is active this returns
         1 without re-engaging (SDK bWarping semantics — Intercept skips its
@@ -765,6 +988,14 @@ class ShipClass(DamageableObject):
         target_loc = warp_flight.target_local(self, target)
         if target_loc is None:
             return 0                    # another frame: never interacts
+        # BC measures the standoff from the target's SURFACE: it warps while
+        # distance > target radius + standoff (RE ShipClass::InSystemWarp,
+        # STBC-Reverse-Engineering-1 ship-navigation.md 5.1; the stbc-oracle
+        # warp_* captures, asked 50 GU at a 4.37 GU Galaxy, drop out 52-54 GU
+        # from its centre). From the centre, Intercept's 295 GU put the ship
+        # deep inside our map-rescaled planets (E1M2's Haven: 90 GU in BC's
+        # script, 1800 on the map).
+        stop = float(distance) + max(0.0, float(target.GetRadius()))
         ship_loc = self.GetWorldLocation()
         diff = TGPoint3(
             target_loc[0] - ship_loc.x,
@@ -772,7 +1003,7 @@ class ShipClass(DamageableObject):
             target_loc[2] - ship_loc.z,
         )
         d = diff.Length()
-        if d <= distance:
+        if d <= stop:
             # Already inside the threshold — record convergence so future
             # boundary drifts don't bounce the ship back to the surface.
             self._warp_consumed = True
@@ -784,7 +1015,7 @@ class ShipClass(DamageableObject):
             return 0
         flight = warp_flight.WarpFlight(
             target=target, speed_policy="ai", exit_policy="keep_pre_warp",
-            drop_distance=float(distance))
+            drop_distance=stop)
         # Warp state first (WES_WARP_INITIATED + a parts hold for a rigged
         # ship, else WES_WARPING), then the ET_IN_SYSTEM_WARP announcement.
         warp_flight.begin_ai_warp(self, flight)
@@ -803,7 +1034,7 @@ class ShipClass(DamageableObject):
         Bridge/ScienceMenuHandlers.py:515 (InSystemWarp) reads GetBool() and
         disables/enables the Launch Probe button for the duration of the
         transit; it casts GetDestination() to ShipClass.
-        See docs/engine/event-emitter-gaps.md #11.
+        See docs/reference/engine/event-emitter-gaps.md #11.
         """
         import App
         evt = App.TGBoolEvent_Create()
@@ -834,6 +1065,14 @@ class ShipClass(DamageableObject):
         that wants a specific exit speed (warp_flight._finish's exit_policy;
         dash.py's "body" drop-out keeping engaged impulse speed) re-seeds
         `_velocity` itself immediately AFTER calling this — never before.
+
+        Also drops the motion law's velocity vector (`_motion_vel`, through
+        its descriptor so kernel M's mirror drops it too): the flight owned
+        the motion, so the vector still holds the PRE-warp course at an
+        unchanged speed, and the re-seed contract
+        (ship_motion.step_vector_velocity) would otherwise resume it while
+        the nose points along the drop-out path. With it gone the law
+        re-seeds along the nose.
         """
         flight = self._insystem_warp_transit
         if flight is None:
@@ -842,6 +1081,7 @@ class ShipClass(DamageableObject):
             flight.ended_reason = reason
         self._insystem_warp_transit = None
         self.SetVelocity(TGPoint3(0.0, 0.0, 0.0))
+        self._motion_vel = None
         from engine.appc import warp_flight
         warp_flight.end_ai_warp(self, flight)   # "ai" flights only
         self._post_in_system_warp(False)
@@ -1034,11 +1274,17 @@ class ShipClass(DamageableObject):
         Powered subsystems are also registered as power consumers in attach
         order (the BC draw priority) so PowerSubsystem's per-interval pump can
         walk them.  PowerSubsystem itself inherits ShipSubsystem (it generates
-        power, not consumes it) so it is never registered here."""
+        power, not consumes it) so it is never registered here.
+
+        Every Set*System comes through here, so this is also where the
+        passive weapons walk learns its cached weapon list is stale
+        (engine/appc/passive_weapons.py)."""
+        passive_weapons.invalidate(self)
         if s is not None and hasattr(s, "SetParentShip"):
             s.SetParentShip(self)
         if isinstance(s, PoweredSubsystem) and s not in self._powered_consumers:
             self._powered_consumers.append(s)   # attach order = BC draw priority
+            native_combat.push_field(self, "_powered_consumers")
         return s
 
     def AddPoweredConsumer(self, subsystem) -> None:
@@ -1153,7 +1399,7 @@ class ShipClass(DamageableObject):
         return 1 if (cloak is not None and cloak.IsTryingToCloak()) else 0
     def SetCloakingSubsystem(self, s) -> None: self._cloaking_subsystem = self._attach_subsystem(s)
     def GetHull(self):                            return self._hull
-    def SetHull(self, h) -> None:                 self._hull = h
+    def SetHull(self, h) -> None:                 self._hull = self._attach_subsystem(h)
 
     def GetSubsystems(self) -> list:
         """Return every populated top-level subsystem on this ship.
@@ -1282,7 +1528,9 @@ class ShipClass(DamageableObject):
                 else:
                     receiver = None
                     if self._hull is None:
-                        self._hull = HullSubsystem(prop.GetName() or "Hull")
+                        # Attached, so its damage finds the ship's repair
+                        # queue; children reach the ship through it.
+                        self.SetHull(HullSubsystem(prop.GetName() or "Hull"))
                         self._hull.SetProperty(prop)
                         receiver = self._hull
                     elif self._hull.GetChildSubsystem(prop.GetName()) is None:
@@ -1446,6 +1694,7 @@ class ShipClass(DamageableObject):
             sub = getattr(self, attr)
             if sub is not None and sub.GetProperty() is None:
                 setattr(self, attr, None)
+        passive_weapons.invalidate(self)
 
         # Pass 4 — child weapons.  For each child WeaponProperty in the set,
         # instantiate the matching live subsystem and attach it under the
@@ -1602,6 +1851,9 @@ class ShipClass(DamageableObject):
         # 2026-09-30-rock-class-design.md.
         from engine.rocks.rock import maybe_become_rock
         maybe_become_rock(self)
+        # The script is set by now: tell the native mirror whether this hull
+        # has posed parts (native_combat.push_posed_parts; no-op when off).
+        native_combat.push_posed_parts(self)
 
     @staticmethod
     def _copy_powered_subsystem_fields(prop, subsystem) -> None:
@@ -1761,8 +2013,13 @@ class ShipClass(DamageableObject):
         self._destroy_broken_systems = bool(v)
 
     # Immunity (SDK App.py:5482-5485). Real 0/1 getters so combat.apply_hit
-    # reads a genuine flag, never a truthy _Stub. IsImmuneToDamage() is the
-    # single predicate combat consults: invincible OR not hurtable.
+    # reads a genuine flag, never a truthy _Stub. The two flags mean
+    # different things (spec 2026-11-02-native-damage-design.md, ruling M1 --
+    # the scripts' reading: E3M5 "Set ship invincible so it won't actually
+    # blow up", E3M1's drill, E8M2's Matan disable):
+    #   SetHurtable(0)   -> the ship takes no damage (IsImmuneToDamage);
+    #   SetInvincible(1) -> damage lands, the ship never begins dying
+    #                       (engine/appc/death_check.py).
     def IsInvincible(self) -> int:
         return 1 if self._invincible else 0
 
@@ -1776,9 +2033,11 @@ class ShipClass(DamageableObject):
         self._hurtable = bool(v)
 
     def IsImmuneToDamage(self) -> bool:
-        """True when this ship must take no gameplay damage — the union of
-        both BC immunity flags. Not an SDK method; combat.apply_hit's gate."""
-        return self._invincible or not self._hurtable
+        """True when this ship must take no gameplay damage: SetHurtable(0).
+        Invincibility does NOT make a ship immune -- it only stops its death
+        (ruling M1). Not an SDK method; combat.apply_hit's and radiation's
+        gate."""
+        return not self._hurtable
     # IsDying / SetDying / IsDead / SetDead live on DamageableObject, where BC
     # declares them (App.py:5363-5365).
 
@@ -1910,7 +2169,8 @@ def _resolve_torpedo_ammo(ts_prop, slot: int):
     FireScript.PredictTargetLocation that a launch_speed of 0 would cause. An
     import failure also names the stock photon module as the type's script, the
     same module the launch substitutes, so FireScript.ChooseTorpType can import
-    it.
+    it. A slot with no script names the property's slot-0 script (the type
+    launches that; with none it never launches).
     """
     from engine.appc.subsystems import TorpedoAmmoType
     # Photon defaults — used for the unbound-slot path and any import failure.
@@ -1927,10 +2187,19 @@ def _resolve_torpedo_ammo(ts_prop, slot: int):
             # undeclared slot → unlimited reserve.
             declared_max = ts_prop.GetMaxTorpedoes(slot)
     if not script_name:
+        # A slot with no script launches the property's slot-0 script, as
+        # the deleted Python launch fell back to it (fire control native
+        # only: an ammo type with no script never launches, M6). Named like
+        # the unimportable path's fallback; no slot-0 script, no launch.
+        fallback = None
+        if ts_prop is not None and hasattr(ts_prop, "GetTorpedoScript"):
+            fallback = ts_prop.GetTorpedoScript(0)
         return TorpedoAmmoType("Photon",
                                launch_speed=PHOTON_LAUNCH_SPEED,
                                power_cost=PHOTON_POWER_COST,
-                               max_torpedoes=declared_max)
+                               max_torpedoes=declared_max,
+                               script=fallback if isinstance(fallback, str)
+                               and fallback else None)
     try:
         leaf = script_name.split(".")[-1]
         mod = __import__(script_name, None, None, [leaf])

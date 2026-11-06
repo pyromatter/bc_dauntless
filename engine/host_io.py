@@ -57,7 +57,12 @@ _REQUIRED_BINDINGS = frozenset({
     "transform_set_position", "transform_get_rotation", "transform_set_rotation",
     "transform_get_rotation_col", "transform_get_positions",
     "transform_live_count", "transform_capacity",
-    "set_instance_transform_slot",
+    "set_instance_transform_slot", "set_instance_sim_source",
+    "interp_track", "interp_roll", "interp_reseat", "interp_capture",
+    "interp_snap", "interp_reset_all", "interp_set_live",
+    "interp_handover_begin", "interp_handover_advance",
+    "interp_handover_cancel", "interp_handover_active", "interp_sample",
+    "interp_compose",
     "set_instance_node_transform",
     "clear_instance_node_overrides",
     "set_instance_node_hidden", "instance_model",
@@ -93,7 +98,7 @@ _OPTIONAL_BINDINGS = frozenset({
     "set_bridge_spot_colours", "set_bridge_glow",
     "set_bridge_area_lights", "set_bridge_area_colours", "bridge_mesh_geometry",
     "set_bridge_glow_captures", "set_bridge_probe_layers",
-    "bridge_probe_signatures", "bridge_quality",
+    "bridge_probe_signatures", "bridge_quality", "reload_bridge_panels",
     "set_bridge_probe_state", "set_bridge_layer_values",
 })
 
@@ -407,9 +412,18 @@ def world_to_body(
     instance_id: int,
     world_point: Tuple[float, float, float],
     world_normal: Tuple[float, float, float],
+    drawn: bool = False,
 ) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]:
+    """Body frame of a world point on the SIM pose; `drawn=True` inverts the
+    drawn pose instead (pick tools only -- gameplay never passes it)."""
     if _h is None:
         return None
+    if drawn:
+        t = _h.instance_translation(instance_id, drawn=True)
+        if t is None:
+            return None
+        return _h.world_to_body(instance_id, _relative_to(t, world_point),
+                                world_normal, drawn=True)
     rel = _instance_relative(instance_id, world_point)
     if rel is None:
         return None
@@ -573,10 +587,13 @@ def ray_trace_mesh(
     direction: Tuple[float, float, float],
     max_dist: float,
     rest_pose: bool = False,
+    drawn: bool = False,
 ) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float], float]]:
     """World (view-coordinate) ray in, world hit out; the binding in
     between is instance-relative. `rest_pose=True` traces the model's REST
     geometry (node overrides ignored) -- for authored, rest-frame content.
+    The trace is against the SIM pose (phase 3a); `drawn=True` traces what is
+    drawn instead (pick tools only -- gameplay never passes it).
 
     A stale id still reaches the binding, which raises -- deliberately NOT
     the silent drop the point queries make. Those are fire-and-forget
@@ -586,9 +603,12 @@ def ray_trace_mesh(
     would only hide a stale id behind an ordinary miss."""
     if _h is None:
         return None
-    # The flag rides only when set, so the posed call keeps its shape.
+    # The flags ride only when set, so the plain call keeps its shape.
     kw = {"rest_pose": True} if rest_pose else {}
-    t = _h.instance_translation(instance_id)
+    if drawn:
+        kw["drawn"] = True
+    t = (_h.instance_translation(instance_id, drawn=True) if drawn
+         else _h.instance_translation(instance_id))
     if t is None:
         return _h.ray_trace_mesh(instance_id, origin, direction, max_dist, **kw)
     rel = _relative_to(t, origin)
@@ -610,7 +630,7 @@ def ray_trace_mesh_pick(instance_id, origin, direction, max_dist,
     fn = getattr(_h, "ray_trace_mesh_pick", None) if _h is not None else None
     if fn is None:
         return None
-    t = _h.instance_translation(instance_id)
+    t = _h.instance_translation(instance_id, drawn=True)
     rel = origin if t is None else _relative_to(t, origin)
     hit = fn(instance_id, rel, direction, max_dist, list(exclude_meshes))
     if hit is None:
@@ -678,6 +698,14 @@ def set_bridge_pbr_enabled(on) -> None:
     fn = getattr(_h, "set_bridge_pbr_enabled", None) if _h is not None else None
     if fn is not None:
         fn(bool(on))
+
+
+def reload_bridge_panels() -> None:
+    """Developer reload of the Lottie bridge panels. No-op headless or when
+    the binding is missing."""
+    fn = getattr(_h, "reload_bridge_panels", None) if _h is not None else None
+    if fn is not None:
+        fn()
 
 
 def set_bridge_probe_origin(origin) -> None:
@@ -846,7 +874,7 @@ def bridge_mesh_geometry(instance_id, mesh):
         if got is None:
             return None
         verts, n, area = got
-        t = _h.instance_translation(instance_id)
+        t = _h.instance_translation(instance_id, drawn=True)
     except Exception:  # noqa: BLE001 - a stale id / binary is "no geometry"
         return None
     if t is not None:
@@ -963,7 +991,7 @@ def profiler_set_gpu_enabled(enabled: bool) -> None:
 
     On Apple's GL the queries make the CPU wait for the GPU every frame, which
     adds about the GPU frame time, so a GPU-timed capture is not a frame-time
-    measurement (docs/engine/perf-register.md, M-6). Turn it on only to split
+    measurement (docs/reference/engine/perf-register.md, M-6). Turn it on only to split
     GPU cost between passes.
     """
     fn = getattr(_h, "profiler_set_gpu_enabled", None)
@@ -1156,6 +1184,99 @@ def set_instance_transform_slot(iid, index: int, generation: int,
     _h.set_instance_transform_slot(iid, int(index), int(generation),
                                    float(scale))
     return True
+
+
+def set_instance_sim_source(iid, index: int, generation: int, scale: float,
+                            view_offset) -> bool:
+    """Give render instance `iid` its SIM pose source: transform-store slot
+    (index, generation), uniform `scale` and the per-set VIEW `view_offset`
+    (x, y, z). Gameplay point queries then read that pose, not the drawn one;
+    `index < 0` clears. False headless or for a non-InstanceId (a test
+    double's plain int), as set_instance_transform_slot."""
+    if _h is None:
+        return False
+    if not isinstance(iid, _h.InstanceId):
+        return False
+    ox, oy, oz = view_offset
+    _h.set_instance_sim_source(iid, int(index), int(generation), float(scale),
+                               (float(ox), float(oy), float(oz)))
+    return True
+
+
+# ── Native render interpolation (phase 3c) ──────────────────────────────────
+# The host's render interpolation buffer (engine.core.native_transform_buffer
+# drives these). Per-iid calls no-op headless and on a non-InstanceId (a test
+# double's plain int), as set_instance_sim_source.
+
+def _is_instance(iid) -> bool:
+    return _h is not None and isinstance(iid, _h.InstanceId)
+
+
+def interp_track(iid, track: bool, compose: bool) -> None:
+    if _is_instance(iid):
+        _h.interp_track(iid, bool(track), bool(compose))
+
+
+def interp_roll() -> None:
+    if _h is not None:
+        _h.interp_roll()
+
+
+def interp_reseat() -> None:
+    if _h is not None:
+        _h.interp_reseat()
+
+
+def interp_capture() -> None:
+    if _h is not None:
+        _h.interp_capture()
+
+
+def interp_snap(iid) -> None:
+    if _is_instance(iid):
+        _h.interp_snap(iid)
+
+
+def interp_reset_all() -> None:
+    if _h is not None:
+        _h.interp_reset_all()
+
+
+def interp_set_live(iid, live: bool) -> None:
+    if _is_instance(iid):
+        _h.interp_set_live(iid, bool(live))
+
+
+def interp_handover_begin(iid) -> None:
+    if _is_instance(iid):
+        _h.interp_handover_begin(iid)
+
+
+def interp_handover_advance(dt: float) -> None:
+    if _h is not None:
+        _h.interp_handover_advance(float(dt))
+
+
+def interp_handover_cancel() -> None:
+    if _h is not None:
+        _h.interp_handover_cancel()
+
+
+def interp_handover_active() -> bool:
+    return bool(_h is not None and _h.interp_handover_active())
+
+
+def interp_sample(iid, alpha: float):
+    """((x, y, z), row-major rot9) -- the DRAWN pose, set-local, unscaled --
+    or None (untracked, stale, headless, a non-InstanceId)."""
+    if not _is_instance(iid):
+        return None
+    return _h.interp_sample(iid, float(alpha))
+
+
+def interp_compose(alpha: float) -> None:
+    if _h is not None:
+        _h.interp_compose(float(alpha))
 
 
 def set_instance_node_transform(iid, node_name: str, m16) -> bool:

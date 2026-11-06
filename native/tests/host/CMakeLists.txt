@@ -4,10 +4,14 @@
 add_executable(host_tests
     bridge_highlight_test.cc
     model_identity_maps_test.cc
+    combat_effect_queue_test.cc
 )
 target_link_libraries(host_tests
     PRIVATE
         dauntless_host_core
         GTest::gtest_main
 )
+# model_build.h (assets' private header): the identity-maps test builds a
+# model through the real loader.
+target_include_directories(host_tests PRIVATE ${CMAKE_SOURCE_DIR}/native/src/assets/src)
 gtest_discover_tests(host_tests)

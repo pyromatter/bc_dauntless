@@ -94,17 +94,31 @@ def begin(ship, killer=None) -> None:
         "cascade": death_cascade.begin(ship, duration),
     })
     # Run the mission's authored death script (SDK SetDeathScript) before the
-    # generic fireball, so authored debris VFX/sound lead. Raise-safe.
+    # generic fireball, so authored debris VFX/sound lead. Raise-safe. In the
+    # presentation scope (ruling R1, Mark 2026-11-02): every stock death
+    # script draws only for debris, sparks and sounds; a mod script drawing
+    # for gameplay in it would draw the presentation generator.
     if hasattr(ship, "RunDeathScript"):
         try:
-            ship.RunDeathScript()
+            from engine.appc import presentation_rng
+            with presentation_rng.scope():
+                ship.RunDeathScript()
         except Exception as _e:
             dev_mode.log_swallowed("run death script from begin", _e)
     _broadcast_exploding(ship, killer)
     # Faithful death-explosion collateral: BC's m_splashDamage to everything in
-    # m_splashDamageRadius (loadspacehelper sets it on every ship). Raise-safe;
-    # a no-op for objects with no authored splash. Fired here so EVERY death
-    # (combat, warp-core, scripted) splashes exactly once, at the blast moment.
+    # m_splashDamageRadius (loadspacehelper sets it on every ship). Queued
+    # here so EVERY death (combat, warp-core, scripted) splashes exactly once,
+    # AFTER its ET_OBJECT_EXPLODING handlers ran (native damage M2: E2M2 makes
+    # the partner invincible there); delivered by deliver_splash in the same
+    # flush when the death began in one (engine/appc/effect_queue.py).
+    from engine.appc import effect_queue
+    effect_queue.emit(effect_queue.SPLASH, ship)
+
+
+def deliver_splash(ship) -> None:
+    """SPLASH's delivery: the death splash. Raise-safe; a no-op for objects
+    with no authored splash."""
     try:
         from engine.appc import splash_damage
         splash_damage.apply(ship)
@@ -235,11 +249,22 @@ def _remove(ship) -> None:
     try:
         pSet = ship.GetContainingSet() if hasattr(ship, "GetContainingSet") else None
         if pSet is not None and hasattr(ship, "GetName"):
-            pSet.RemoveObjectFromSet(ship.GetName())
+            name = ship.GetName()
+            # By NAME, but only if the entry is this ship: a rebuilt namesake
+            # (a station recreated after a Quick Battle) must survive.
+            if not hasattr(pSet, "GetObject") or pSet.GetObject(name) is ship:
+                pSet.RemoveObjectFromSet(name)
     except Exception as _e:
         dev_mode.log_swallowed("remove dead ship from set", _e)
     from engine.appc.objects import broadcast_object_deleted
     broadcast_object_deleted(ship)
+
+
+def forget(ship) -> None:
+    """Drop every death-sequence entry for `ship` without touching the ship or
+    its set, so a ship being rebuilt or replaced is never killed or evicted
+    later."""
+    _active[:] = [e for e in _active if e["ship"] is not ship]
 
 
 def retire(ship) -> None:

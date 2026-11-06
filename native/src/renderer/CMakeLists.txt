@@ -210,6 +210,7 @@ add_library(renderer STATIC
     warp_in_flash_shape.cc
     warp_in_flash_pass.cc
     aabb.cc
+    hull_cull.cc
     model_parts.cc
     glow_region.cc
     dynamic_lights.cc
@@ -220,6 +221,7 @@ add_library(renderer STATIC
     lens_flare_pass.cc
     lens_flare_hdr_pass.cc
     torpedo_pass.cc
+    torpedo_sprites.cc
     hit_vfx_pass.cc
     hull_discharge_pass.cc
     running_light_pass.cc
@@ -249,19 +251,40 @@ add_library(renderer STATIC
     starmap_pass.cc
     letterbox_pass.cc
     bridge_pass.cc
+    bridge_panels.cc
     bridge_ao_pass.cc
     bridge_probe.cc
     bridge_probe_array.cc
     viewscreen_static_pass.cc
     viewscreen_bars_pass.cc
+    viewscreen_rtt_size.cc
     light_matrix.cc
     shadow_map_target.cc
+    head_center.cc
 )
 target_include_directories(renderer
     PUBLIC include
     PRIVATE "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_compile_features(renderer PUBLIC cxx_std_20)
+# head_center.cc runs per bridge officer per frame (perf-register SIG-183), so
+# it is optimised in Debug too, and never contracts a multiply-add, so its
+# answer keeps the bits of the -O0 code it came from (head_center_test.cc).
+# MSVC rejects /O2 beside this directory's Debug /RTC1, so there it keeps
+# only the exact-float flag.
+if(MSVC)
+    set_source_files_properties(head_center.cc PROPERTIES
+        COMPILE_OPTIONS "/fp:precise")
+else()
+    set_source_files_properties(head_center.cc PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off;$<$<CONFIG:Debug>:-O2>")
+endif()
 target_link_libraries(renderer PUBLIC assets scenegraph voxel glad glfw glm)
+# Bridge Lottie panels: BridgePass holds a lottie::PanelWorker (bridge_panels.h).
+target_link_libraries(renderer PUBLIC lottie)
+# Phase 5a: window.cc's DAUNTLESS_GL_MP_ENGINE experiment calls CGLEnable.
+if(APPLE)
+    target_link_libraries(renderer PRIVATE "-framework OpenGL")
+endif()
 # nlohmann/json reads the viewscreen bars font metrics (viewscreen_bars_pass.cc).
 target_link_libraries(renderer PRIVATE nlohmann_json::nlohmann_json)

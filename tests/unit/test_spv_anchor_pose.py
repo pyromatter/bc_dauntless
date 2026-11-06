@@ -23,6 +23,7 @@ THREE layers, and the splits matter -- each one shipped broken on its own:
 import pytest
 
 from engine.appc import articulation, part_pose
+from tests.helpers import host_frame_source
 
 # The identity node matrix: what the sync pushes for a part in its NIF pose,
 # and the signal the binding uses to CLEAR the override.
@@ -197,10 +198,9 @@ def _guarded_and_free_articulation_calls():
     sweep has to exist outside that guard, or the SPV can never force a pose.
     """
     import ast
-    import inspect
     from engine import host_loop
 
-    tree = ast.parse(inspect.getsource(host_loop.run))
+    tree = ast.parse(host_frame_source.run_source())
 
     def _is_sim_frozen_guard(node):
         t = node.test
@@ -215,8 +215,9 @@ def _guarded_and_free_articulation_calls():
                 for inner in ast.walk(body_stmt):
                     guarded_nodes.add(id(inner))
 
-    reaching = {"_sync_ship_articulation", "_sync_instance_transforms",
-                "_sync_spv_articulation"}
+    # `_sync_instance_transforms` no longer reaches it (phase 3a: the push
+    # follows the sim tick through `pose_sink`).
+    reaching = {"_sync_ship_articulation", "_sync_spv_articulation"}
     guarded, free = [], []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):

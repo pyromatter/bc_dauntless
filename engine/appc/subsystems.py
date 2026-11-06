@@ -18,9 +18,15 @@ import math as _math
 from engine.appc.events import TGEventHandlerObject
 from engine.appc.float_range_watcher import FloatRangeWatcher
 from engine.appc.math import TGPoint3, TGMatrix3
+from engine.core import step_memo
 from engine.core.ids import implements
 import engine.dev_mode as dev_mode
 from engine.appc import ship_death as _ship_death
+from engine.appc import passive_weapons
+from engine.appc import native_combat
+from engine.appc import death_check as _death_check
+from engine.appc import effect_queue as _effect_queue
+from engine.appc.native_combat import NativeField, NativeRefField
 
 
 def subsystem_world_position(sub, ship=None):
@@ -30,9 +36,31 @@ def subsystem_world_position(sub, ship=None):
     in world units relative to the ship centre. Returns the ship location if
     the subsystem has no 3D mount, and the origin if no ship is resolvable.
 
-    ``ship`` may be passed explicitly (required for the Hull/root subsystem,
-    whose ``_climb_to_ship()`` returns None).
+    ``ship`` may be passed explicitly (``SetHull`` attaches the Hull, so its
+    ``_climb_to_ship()`` reaches its ship; an unattached root returns None).
+
+    Inside an engine.core.step_memo block (the combat step) each mount is
+    computed once: a firing phaser bank asks ~4 times a tick (strip emit
+    point, arc test, aim, beam) and the held-weapon pump again, ~100 rebuilds
+    of ship pose and articulation a tick at 64 ships. Every call still gets a
+    fresh TGPoint3; whatever moves a ship or a part in the step forgets.
     """
+    if step_memo.active():
+        key = (id(sub), id(ship))
+        found = _mounts.get(key)
+        if found is None:
+            p = _subsystem_world_position(sub, ship)
+            found = _mounts[key] = (p.x, p.y, p.z)
+        return TGPoint3(found[0], found[1], found[2])
+    return _subsystem_world_position(sub, ship)
+
+
+# (id(sub), id(ship arg)) -> mount (x, y, z), while a step_memo block is open.
+_mounts = step_memo.table()
+
+
+def _subsystem_world_position(sub, ship):
+    """The computation itself; see subsystem_world_position."""
     if ship is None:
         ship = sub._climb_to_ship() if hasattr(sub, "_climb_to_ship") else None
     if ship is None or not hasattr(ship, "GetWorldLocation"):
@@ -60,38 +88,66 @@ def subsystem_world_position(sub, ship=None):
                     ship_pos.z + offset.z)
 
 
-def target_offset_world(target, offset):
+_RESOLVE = object()
+
+
+def target_offset_world(target, offset, mount_sub=_RESOLVE):
     """World point for a target-local aim `offset` on `target` -- 0x005852A0:
-    target world pos + R·(offset·scale), with the offset first carried by the
-    articulated part it sits on.
+    target world pos + R·(offset·scale), a subsystem mount's offset first
+    carried by the articulated part the mount sits on.
 
-    `offset` is REST frame, target-local, unscaled: what a subsystem lock
-    hands over (`GetPositionTG()`, and the SDK's own
-    `SetTargetOffset(pSubsystem.GetPosition())`). Manual Aim picks off the
-    POSED hull and pulls its pick back to rest before storing it
-    (`part_severance.rest_point_for_live_point`), so every offset arrives in
-    the one frame. Without the articulation step a torpedo locked on a raised
-    Bird of Prey wingtip flew at where the tip would be wings-down.
+    `offset` is target-local and unscaled: what a subsystem lock hands over
+    (`GetPositionTG()`, and the SDK's own
+    `SetTargetOffset(pSubsystem.GetPosition())`), or a Manual Aim pick (the
+    body point the ray hit on the posed hull, stored as it is).
 
-    The ONE copy of this transform: torpedo/pulse tube aim
-    (`weapon_subsystems._resolve_torpedo_aim_point`), in-flight steering
+    Aim points do not follow articulated parts (fire control native only,
+    M5; Mark: "we dont need torpedoes to track articulated parts moving mid
+    flight"). Only an offset that IS a subsystem's authored mount -- bit for
+    bit its `GetPosition()` -- is posed, so a torpedo locked on a raised
+    Bird of Prey wingtip flies at where the tip is drawn. Anything else (a
+    pick, a stale pick, an NPC offset kept across a re-target, an offset
+    within `authored_mount_subsystem`'s 1e-5 of a mount but not on it: M8.5)
+    is a plain body-frame xyz, `body_point_world(target, offset)`.
+
+    The Python copy of this transform: in-flight steering
     (`projectiles._steer_point`) and Manual Aim phasers
-    (`host_loop._phaser_aim_point`) all call it.
+    (`host_loop._phaser_aim_point`) call it; a tube's aim is native. Its
+    native twin is `weapon_geometry.cc` target_offset_world: CHANGE BOTH.
+
+    `mount_sub`: the caller's own `authored_mount_subsystem(target, offset)`
+    answer, when it has one (None: no mount) -- in-flight steering asks
+    every tick for an offset that never changes, and the attribution scans
+    every subsystem.
     """
+    from engine.appc.part_severance import authored_mount_subsystem
+    point = (offset.x, offset.y, offset.z)
+    if mount_sub is _RESOLVE:
+        mount_sub = authored_mount_subsystem(target, point)
+    if mount_sub is None or not _is_own_mount(mount_sub, point):
+        return body_point_world(target, point)
     from engine.appc.articulation import part_transform_point
     from engine.appc import physical_parents
-    from engine.appc.part_severance import authored_mount_subsystem
+    return body_point_world(target, part_transform_point(
+        target, point, prop=physical_parents.property_of(mount_sub)))
+
+
+def _is_own_mount(sub, point) -> bool:
+    """Is `point` `sub`'s own authored mount, `==` per axis (-0.0 matches
+    0.0, a NaN never matches)? M8.5: a point merely within 1e-5 of it is a
+    plain point."""
+    mount = sub.GetPosition()
+    return (mount.GetX() == point[0] and mount.GetY() == point[1]
+            and mount.GetZ() == point[2])
+
+
+def body_point_world(target, point):
+    """World point for a body-frame `point` (x, y, z) already carried by its
+    part: target world pos + R·(point·scale), 0x005852A0's tail. No part
+    pose is applied here -- `target_offset_world` posed a mount first; any
+    other offset is this point as it is."""
     pos = target.GetWorldLocation()
-    point = (offset.x, offset.y, offset.z)
-    # A subsystem lock's offset is an AUTHORED mount: the shared mount rule,
-    # so the shot goes where the mount is drawn. Anything else (a Manual Aim
-    # pick, pulled back to rest by the box rule) keeps the box rule, so the
-    # round trip is exact and no per-tick pick scans the model.
-    mount_sub = authored_mount_subsystem(target, point)
-    px, py, pz = part_transform_point(
-        target, point, authored=mount_sub is not None,
-        prop=(physical_parents.property_of(mount_sub)
-              if mount_sub is not None else None))
+    px, py, pz = point
     scale = float(target.GetScale()) if hasattr(target, "GetScale") else 1.0
     o = TGPoint3(px * scale, py * scale, pz * scale)
     rot = target.GetWorldRotation() if hasattr(target, "GetWorldRotation") else None
@@ -277,14 +333,71 @@ _THRESHOLD_DESTROYED   = 2
 
 
 class ShipSubsystem(TGEventHandlerObject):
+    # Mirrored into the native combat row on every write (native_combat).
+    _condition = NativeField(float)
+    _max_condition = NativeField(float)
+    _disabled_percentage = NativeField(float)
+    _destroyed = NativeField(bool)
+    # Read with `is True` by _is_offline, so mirrored as identity with True.
+    _radiation_out = NativeField(native_combat.IS_TRUE)
+    _radius = NativeField(float, key="Subsystem._radius")
+    _parent_subsystem = NativeRefField("Subsystem")
+    _parent_ship = NativeRefField("Object")
+    # Properties are shared templates with no hook at construction: a
+    # property gets its row the first time a subsystem references it.
+    # A write bumps the part-map generation too: physical_parents.property_of
+    # reads it (native_combat.PartKeyRefField).
+    _property = native_combat.PartKeyRefField("Property", lazy=True)
+    # Weapon-fire inputs (phase 1b): the ordered children (a weapon system's
+    # banks / tubes), the mount geometry and the firing arc.
+    _children = native_combat.NativeRefList("Subsystem")
+    # The mount point part_for_mount keys on: a write bumps the part-map
+    # generation (native_combat.PartKeyField).
+    _position = native_combat.PartKeyField(native_combat.VEC3)
+    _direction = NativeField(native_combat.VEC3)
+    _up = NativeField(native_combat.VEC3)
+    _right = NativeField(native_combat.VEC3)
+    _arc_width_lo = NativeField(float)
+    _arc_width_hi = NativeField(float)
+    _arc_height_lo = NativeField(float)
+    _arc_height_hi = NativeField(float)
+    _arc_set = NativeField(bool)
+    # Phaser-strip length (K2 reads it for the emitter position).
+    _length = NativeField(float)
+    # A phaser bank's pulse damage and R_hit (K2 applies the pulse in the
+    # walk: native damage Task 4), copied from its property.
+    _max_damage = NativeField(float)
+    _max_damage_distance = NativeField(float)
+    _damage_radius_factor = NativeField(float)
+    # In its bay's repair queue (RepairSubsystem._queue keeps it, ruling I3):
+    # a write below max emits REPAIR_ADD only when this is False.
+    # Native damage (Task 3) reads these through the mirror too: the
+    # membership, the threshold state machine's state, the two flags, and
+    # each condition watcher (adopted by CondWatcherField: its check count
+    # and committed value).
+    _in_repair_queue = NativeField(bool)
+    _threshold_state = NativeField(int)
+    _invincible = NativeField(bool)
+    # GetRepairComplexity, which the native repair piece reads per worked
+    # item (subsystem_step.h THE REPAIR PIECE).
+    _repair_complexity = NativeField(float)
+    _critical = NativeField(bool)
+    _combined_watcher = native_combat.CondWatcherField(
+        _effect_queue.WATCH_COMBINED)
+    _condition_watcher = native_combat.CondWatcherField(
+        _effect_queue.WATCH_CONDITION)
+
     def __init__(self, name: str = ""):
         super().__init__()
+        # Registered first, so every field below pushes as it is written.
+        native_combat.register(self, "Subsystem")
         self._name = name
         self._property = None
         self._parent_ship = None
         self._parent_subsystem = None
         self._child_subsystem = None
         self._radiation_out = False
+        self._in_repair_queue = False
         self._children: list["ShipSubsystem"] = []
         self._condition = 1.0
         self._max_condition = 1.0
@@ -653,16 +766,55 @@ class ShipSubsystem(TGEventHandlerObject):
 
     def SetCondition(self, value: float) -> None:
         """Floor at zero. Combat damage routes through here (see
-        engine/appc/objects.py). A decrease below max auto-enqueues this
-        subsystem on the owning ship's repair bay — the synchronous
+        engine/appc/objects.py). Any condition left below max auto-enqueues
+        this subsystem on the owning ship's repair bay — the synchronous
         equivalent of stock's ET_SUBSYSTEM_HIT -> RepairSubsystem::
-        HandleHitEvent chain. AddToRepairList owns all validation
-        (duplicate / destroyed / undamaged reject)."""
-        old = self._condition
+        HandleHitEvent chain. Below max is damaged however it got there, so a
+        raise that stays short of max queues too: a subsystem a script brings
+        back from destroyed is repaired the rest of the way (Mark, 2026-10-23).
+        AddToRepairList owns all validation (duplicate / destroyed / undamaged
+        reject).
+
+        Every condition write, a script's included, is the one write
+        (objects.write_condition): a critical subsystem left at zero kills the
+        ship and a >0 -> 0 crossing routes the breach / hull cascade, both at
+        the tick boundary unless the ship is invincible by then
+        (engine/appc/death_check.py, rulings M3, M5)."""
+        self._set_condition(value)
+
+    def _set_condition(self, value, killer=None, ship=None) -> None:
+        """SetCondition's body. `killer` (the firing ship) and `ship` (whom
+        the write is charged to, default the owning ship) come from
+        DamageableObject.DamageSystem via objects.write_condition.
+
+        With native combat on the native condition chain stands in
+        (native damage Task 3; native_combat.set_condition), else -- or when
+        it hands back -- this body, the reference."""
+        if native_combat._switch and native_combat.set_condition(
+                self, value, killer, ship):
+            return
+        before = self._condition
         self._condition = max(0.0, float(value))
         self._condition_changed()
-        if self._condition < old:
-            self._auto_enqueue_for_repair()
+        if (not self._in_repair_queue
+                and self._condition < self.GetMaxCondition()):
+            # Added at delivery (REPAIR_ADD; native damage M2) -- only when
+            # not queued already (ruling I3): a bay's own tick of an item it
+            # works emits nothing.
+            _effect_queue.emit(_effect_queue.REPAIR_ADD, self)
+        if self._condition <= 0.0:
+            _death_check.note_write(
+                ship if ship is not None else self._owning_ship(),
+                self, before, killer)
+
+    def SetConditionPercentage(self, fraction) -> None:
+        """SDK ShipSubsystem.SetConditionPercentage (App.py:5665): condition =
+        `fraction` x GetMaxCondition(), through SetCondition -- the same write
+        as weapon damage, so it posts the same subsystem events, enqueues the
+        repair and reaches the death check (campaign bug 2, decided
+        2026-11-02). GetMaxCondition, not _max_condition, so the value reads
+        back through GetConditionPercentage (E3M5's 15% clamp compares it)."""
+        self.SetCondition(float(fraction) * self.GetMaxCondition())
 
     def _auto_enqueue_for_repair(self) -> None:
         ship = self._owning_ship()
@@ -703,35 +855,54 @@ class ShipSubsystem(TGEventHandlerObject):
         self._condition_changed()
 
     def _condition_changed(self) -> None:
-        """Push the fresh condition FRACTION into the combined watcher (if one
-        was ever handed out) so its registered threshold crossings fire, then
-        advance the disabled/destroyed/operational state machine.
-        Called from every _condition/_max_condition mutation path — all
-        writes route through SetCondition/SetMaxCondition (combat damage in
-        engine/appc/objects.py calls SetCondition)."""
+        """Push the fresh condition FRACTION into the combined and condition
+        watchers (if ever handed out), then advance the disabled/destroyed/
+        operational state machine. Called from every _condition/
+        _max_condition mutation path — all writes route through SetCondition/
+        SetMaxCondition (combat damage in engine/appc/objects.py calls
+        SetCondition).
+
+        The state changes at once; what it REPORTS is queued to the tick
+        boundary (native damage M2; engine/appc/effect_queue.py, THE DAMAGE
+        KINDS): a watcher with checks commits now and queues COND_WATCH, a
+        state change queues SUBSYS_EVENT."""
+        eq = _effect_queue
         if self._combined_watcher is not None:
-            self._combined_watcher._update(self.GetConditionPercentage())
+            self._combined_watcher._update_queued(
+                self.GetConditionPercentage(), self, eq.WATCH_COMBINED)
         if self._condition_watcher is not None:
-            self._condition_watcher._update(self.GetConditionPercentage())
+            self._condition_watcher._update_queued(
+                self.GetConditionPercentage(), self, eq.WATCH_CONDITION)
         new_state = self._threshold_state_now()
         old_state = self._threshold_state
         if new_state != old_state:
             self._threshold_state = new_state
             if new_state == _THRESHOLD_DESTROYED:
-                self._fire_threshold_event("ET_SUBSYSTEM_DESTROYED")
-                # SPIKE (damage redesign): the blast, drawn only where it
-                # reaches the hull (engine/appc/internal_blast.py).
-                try:
-                    from engine.appc import internal_blast
-                    internal_blast.queue(self)
-                except Exception as _e:
-                    import engine.dev_mode as _dm
-                    _dm.log_swallowed("internal blast queue", _e)
+                eq.emit(eq.SUBSYS_EVENT, self, eq.SUBSYS_DESTROYED)
             elif new_state == _THRESHOLD_DISABLED and old_state == _THRESHOLD_OPERATIONAL:
-                self._fire_threshold_event("ET_SUBSYSTEM_DISABLED")
+                eq.emit(eq.SUBSYS_EVENT, self, eq.SUBSYS_DISABLED)
             elif new_state == _THRESHOLD_OPERATIONAL:
-                self._fire_threshold_event("ET_SUBSYSTEM_OPERATIONAL")
+                eq.emit(eq.SUBSYS_EVENT, self, eq.SUBSYS_OPERATIONAL)
             # destroyed -> disabled (partial repair from zero) is silent.
+
+    def _deliver_threshold_event(self, which) -> None:
+        """SUBSYS_EVENT's delivery: post the threshold event; a destroyed
+        subsystem's also queues its internal blast."""
+        from engine.appc import effect_queue as eq
+        if which == eq.SUBSYS_DESTROYED:
+            self._fire_threshold_event("ET_SUBSYSTEM_DESTROYED")
+            # SPIKE (damage redesign): the blast, drawn only where it
+            # reaches the hull (engine/appc/internal_blast.py).
+            try:
+                from engine.appc import internal_blast
+                internal_blast.queue(self)
+            except Exception as _e:
+                import engine.dev_mode as _dm
+                _dm.log_swallowed("internal blast queue", _e)
+        elif which == eq.SUBSYS_DISABLED:
+            self._fire_threshold_event("ET_SUBSYSTEM_DISABLED")
+        else:
+            self._fire_threshold_event("ET_SUBSYSTEM_OPERATIONAL")
 
     def _threshold_state_now(self) -> int:
         if self.IsDestroyed():
@@ -1083,6 +1254,14 @@ class ShipSubsystem(TGEventHandlerObject):
     def AddChildSubsystem(self, sub: "ShipSubsystem") -> None:
         sub._parent_subsystem = self
         self._children.append(sub)
+        native_combat.push_field(self, "_children")   # an in-place append
+        # A new weapon under a weapon system: the passive weapons walk's cached
+        # list for the owning ship is stale (engine/appc/passive_weapons.py).
+        # A system not yet attached has no ship; attaching it invalidates.
+        ship = self._climb_to_ship()
+        if ship is not None:
+            passive_weapons.invalidate(ship)
+            native_combat.push_mount_order(ship)     # combat._iter_subsystems
 
     def GetCritical(self) -> int:                       return self._critical
     def SetCritical(self, v) -> None:                   self._critical = int(v)
@@ -1197,19 +1376,35 @@ PSM_BACKUP_ONLY = 2
 # bypassing the per-interval conduit budget and UNSCALED by the power-slider
 # percentage (measured 600 flat with sliders 1.25, not 600*1.25). Used by
 # TractorBeamSystem via the DRAWS_DIRECT_FROM_MAIN class flag, which is what
-# _update_power actually branches on.
+# the native pump actually branches on (subsystem_step.h THE POWER PIECE).
 PSM_DIRECT_MAIN = 3
 
 
 class PoweredSubsystem(ShipSubsystem):
     """Powered subsystem — consumes power, has a target power level."""
 
-    POWER_MODE = PSM_MAIN_FIRST
+    # Class constants an instance may override, mirrored for the native
+    # power piece (subsystem_step.h THE POWER PIECE; NativeClassDefault: a
+    # subclass with its own value declares its own, never a plain attribute).
+    POWER_MODE = native_combat.NativeClassDefault(native_combat.INDEX,
+                                                  PSM_MAIN_FIRST)
     # q10 (tools/probes/results/q10_battery_drain.txt): a subsystem whose draw
     # is a DIRECT main-battery steal — bypasses the conduit budget and is NOT
     # scaled by _power_percentage_wanted. Only TractorBeamSystem sets this True;
-    # every conduit-routed consumer leaves it False and uses power._draw().
-    DRAWS_DIRECT_FROM_MAIN = False
+    # every conduit-routed consumer leaves it False and draws by POWER_MODE.
+    DRAWS_DIRECT_FROM_MAIN = native_combat.NativeClassDefault(bool, False)
+
+    # Mirrored: the native power piece reads and writes them (subsystem_
+    # step.h THE POWER PIECE); K0's holding tractor reads _normal_power and
+    # _efficiency (its starvation stop); the motion kernel reads the slider
+    # (impulse_output_fraction).
+    _is_on = native_combat.NativeField(bool)
+    _normal_power = native_combat.NativeField(float)
+    _power_percentage_wanted = native_combat.NativeField(float)
+    _power_wanted = native_combat.NativeField(float)
+    _power_received = native_combat.NativeField(float)
+    _efficiency = native_combat.NativeField(float)
+    _power_factor = native_combat.NativeField(float)
 
     def __init__(self, name: str = ""):
         super().__init__(name)
@@ -1283,52 +1478,12 @@ class PoweredSubsystem(ShipSubsystem):
     def _wants_power(self) -> bool:
         return bool(self._is_on)
 
-    def _update_power(self, dt: float, power) -> None:
-        """Draw this consumer's per-tick demand from ``power`` and record the
-        fed state.  Writes _power_wanted / _power_received / _efficiency
-        (received/wanted → GetPowerPercentage) and _power_factor
-        (received/normal → GetNormalPowerPercentage).
+    # The per-tick draw (the pump's rules for this consumer: not wanting
+    # power zeroes it, a free consumer is full function, DRAWS_DIRECT_FROM_
+    # MAIN steals, every other draws by its POWER_MODE) is NATIVE ONLY:
+    # subsystem_step.h THE POWER PIECE (phase 6 Task 8).
 
-        A consumer that doesn't want power (off / not engaged) is fully zeroed.
-        A "free" consumer (authored 0 pw/s — e.g. warp engines) wants nothing
-        yet runs at full function (efficiency 1.0, factor 1.0)."""
-        dt = float(dt)
-        if dt <= 0.0:
-            return
-        if not self._wants_power():
-            self._power_wanted = 0.0
-            self._power_received = 0.0
-            self._efficiency = 0.0
-            self._power_factor = 0.0
-            return
-        base = self._normal_power * dt
-        if base <= 0.0:
-            # Free consumer (authored 0 pw/s, e.g. warp engines): full function.
-            self._power_wanted = 0.0
-            self._power_received = 0.0
-            self._efficiency = 1.0
-            self._power_factor = 1.0
-            return
-        if self.DRAWS_DIRECT_FROM_MAIN:
-            # q10 direct siphon: the demand reported to PowerDisplay is still the
-            # slider-scaled figure (so the readout math is unchanged), but the
-            # ACTUAL draw is a flat StealPower(base) from the main battery —
-            # bypassing the conduit budget and unscaled by the slider (measured
-            # 600 flat with sliders 1.25). efficiency/factor come from
-            # received/base so the StopFiring starvation gate still engages when
-            # the main battery runs dry.
-            self._power_wanted = base * self._power_percentage_wanted
-            received = power.StealPower(base) if base > 0.0 else 0.0
-            self._power_received = received
-            self._efficiency = received / base if base > 0.0 else 1.0
-            self._power_factor = received / base
-            return
-        wanted = base * self._power_percentage_wanted
-        self._power_wanted = wanted
-        received = power._draw(wanted, self.POWER_MODE) if wanted > 0.0 else 0.0
-        self._power_received = received
-        self._efficiency = received / wanted if wanted > 0.0 else 1.0
-        self._power_factor = received / base
+
 
     # ── Subsystem event emission ─────────────────────────────────────────────
 
@@ -1353,11 +1508,6 @@ class PoweredSubsystem(ShipSubsystem):
             dev_mode.log_swallowed("subsystem event broadcast", _e)
 
 
-# The one getter whose body PowerSubsystem._pump_consumers is allowed to inline
-# as a raw `_power_wanted` read. Anything that overrides GetPowerWanted (as
-# PowerSubsystem itself does) fails the identity test there and gets called.
-_BASE_GET_POWER_WANTED = PoweredSubsystem.GetPowerWanted
-
 
 class HullSubsystem(ShipSubsystem):
     """Live hull state.  Hull isn't a powered subsystem — it just tracks
@@ -1377,6 +1527,14 @@ class HullSubsystem(ShipSubsystem):
 
 
 class SensorSubsystem(PoweredSubsystem):
+    # Mirrored into the native combat row on every write (native_combat).
+    # The two id containers are also mutated IN PLACE: every such site calls
+    # native_combat.push_ids (AddProbe, Add/RemoveKnownObject,
+    # sensor_contacts.on_exited_set's clear).
+    _base_sensor_range = NativeField(float)
+    _probe_ids = NativeField(list)
+    _known_objects = NativeField(set)
+
     def __init__(self, name: str = ""):
         super().__init__(name)
         # Sensors are ON during normal operation — unlike weapons (powered only
@@ -1411,6 +1569,7 @@ class SensorSubsystem(PoweredSubsystem):
     def AddProbe(self, obj_id) -> None:
         """BC AddProbe (@0x00567010): remember a launched probe by object ID."""
         self._probe_ids.append(int(obj_id))
+        native_combat.push_ids(self, "_probe_ids", self._probe_ids)
 
     def probes(self) -> list:
         """The live probes, in launch order. An ID that no longer resolves
@@ -1451,6 +1610,7 @@ class SensorSubsystem(PoweredSubsystem):
         """Register *obj* as a known sensor contact."""
         try:
             self._known_objects.add(obj.GetObjID())
+            native_combat.push_ids(self, "_known_objects", self._known_objects)
         except Exception as _e:
             dev_mode.log_swallowed("AddKnownObject", _e)
 
@@ -1458,6 +1618,7 @@ class SensorSubsystem(PoweredSubsystem):
         """Remove *obj* from known contacts."""
         try:
             self._known_objects.discard(obj.GetObjID())
+            native_combat.push_ids(self, "_known_objects", self._known_objects)
         except Exception as _e:
             dev_mode.log_swallowed("RemoveKnownObject", _e)
 
@@ -1601,6 +1762,16 @@ class SensorSubsystem(PoweredSubsystem):
 class ImpulseEngineSubsystem(PoweredSubsystem):
     """Live impulse-engine state.  Speed/accel limits come from the
     matching ImpulseEngineProperty template via ShipClass.SetupProperties()."""
+
+    # The authored limits, mirrored for the motion kernel (native motion
+    # phase 2): always rebound by the setters below, never mutated. KNOWN,
+    # NOT GUARDED: the mirror float()s them, so a string written straight
+    # into one mirrors as a number where Python would raise; no engine
+    # writer does this (the setters store floats).
+    _max_speed = NativeField(float)
+    _max_accel = NativeField(float)
+    _max_angular_velocity = NativeField(float)
+    _max_angular_accel = NativeField(float)
 
     def __init__(self, name: str = ""):
         super().__init__(name)
@@ -1774,7 +1945,7 @@ class WarpEngineSubsystem(PoweredSubsystem):
         # GetWarpSequence() off it — the event carries no payload, it is a
         # "something changed, go re-check" ping, so it is posted unguarded.
         # Without this the condition only ever evaluated at construction:
-        # correct, but never timely.  See docs/engine/event-emitter-gaps.md #12.
+        # correct, but never timely.  See docs/reference/engine/event-emitter-gaps.md #12.
         import App
         evt = App.TGEvent_Create()
         evt.SetEventType(App.ET_SET_WARP_SEQUENCE)
@@ -1839,6 +2010,8 @@ class WarpEngineSubsystem(PoweredSubsystem):
         self._dewarp_drive = _DewarpDrive(
             self.GetWarpExitLocation(), placement.GetWorldLocation(),
             placement.GetWorldRotation())
+        # K1 reads the slide (FireDumb's hold) from the ship's row.
+        native_combat.push_arriving(ship)
         self._hold_ship(ship, self._dewarp_drive.start)
         self._stop_ship_weapons(ship)
 
@@ -1854,8 +2027,8 @@ class WarpEngineSubsystem(PoweredSubsystem):
     @staticmethod
     def _stop_ship_weapons(ship) -> None:
         """Stop every weapon system already firing when the slide starts --
-        the fire gate only blocks NEW fire, and update_weapons keeps firing a
-        latched target (same reasoning as CloakingSubsystem._stop_weapons).
+        the fire gate only blocks NEW fire, and the fire control walk keeps
+        firing a latched target (same reasoning as CloakingSubsystem._stop_weapons).
         StopFiring on the system clears the latch and stops each bank."""
         for getter in ("GetPhaserSystem", "GetPulseWeaponSystem",
                        "GetTorpedoSystem", "GetTractorBeamSystem"):
@@ -1870,6 +2043,7 @@ class WarpEngineSubsystem(PoweredSubsystem):
     def _end_dewarp_drive(self) -> None:
         self._dewarp_drive = None
         self._placement = None
+        native_combat.push_arriving(self.GetParentShip())
 
     def step_dewarp_drive(self, dt: float) -> None:
         """Advance the warp-in slide by `dt` seconds of game time; on landing
@@ -1929,6 +2103,24 @@ class ShieldSubsystem(PoweredSubsystem):
     LEFT_SHIELDS   = 4
     RIGHT_SHIELDS  = 5
     NUM_SHIELDS    = 6
+
+    # Every rebind re-pushes the derived has_shields flag; SetMaxShields
+    # (the one in-place writer) pushes it itself. The face lists are
+    # mirrored for the native hit (native damage Task 3): every in-place
+    # writer below pushes the list it wrote, before anything it then posts
+    # (damage-map-refresh §6: SetMaxShields, SetCurrentShields, Update's
+    # ramp refresh, offline drain and regen, ApplyDamage).
+    _max_shields = native_combat.HasShieldsField()
+    _current_shields = native_combat.NativeFloatList()
+    _ramp_fraction = native_combat.RampField()
+    # Mirrored for the native shield piece (phase 6 A1, Task 3;
+    # native/src/combat/include/dauntless/combat/subsystem_step.h THE SHIELD
+    # PIECE): the regen rates (SetShieldChargePerSecond writes in place and
+    # pushes), the cadence carry, and the seven watchers (adopted, so each
+    # value and check they take reaches the row).
+    _charge_per_second = native_combat.NativeFloatList()
+    _charge_accum = NativeField(float)
+    _shield_watchers = native_combat.ShieldWatchersField()
 
     def __init__(self, name: str = ""):
         super().__init__(name)
@@ -1999,7 +2191,10 @@ class ShieldSubsystem(PoweredSubsystem):
         v = float(value)
         if self._current_shields[f] == 0.0:
             self._current_shields[f] = v
+            native_combat.push_field(self, "_current_shields")
         self._max_shields[f] = v
+        native_combat.push_has_shields(self)    # in place: no descriptor sees it
+        native_combat.push_field(self, "_max_shields")
 
     def GetCurrentShields(self, face: int) -> float:
         return self._current_shields[int(face)]
@@ -2007,6 +2202,7 @@ class ShieldSubsystem(PoweredSubsystem):
     def SetCurrentShields(self, face: int, value: float) -> None:
         f = int(face)
         self._current_shields[f] = float(value)
+        native_combat.push_field(self, "_current_shields")   # in place
         # Keep the face watcher's value fresh so a Condition reading
         # GetWatchedVariable() right after a damage write sees the new
         # fraction (ConditionSingleShieldBelow.py:122 reads it at setup).
@@ -2045,8 +2241,9 @@ class ShieldSubsystem(PoweredSubsystem):
     # expressed by short-circuiting the QUERIES — see GetSingleShieldPercentage
     # — rather than by destroying the state.
     #
-    # Regen is already gated on IsOn in Update(), so a powered-down generator
-    # holds its charge frozen rather than creeping back up.
+    # Regen is NOT gated on IsOn (stbc-oracle bible §5.3 S5; the native
+    # shield piece, subsystem_step.h THE SHIELD PIECE): a powered-down
+    # generator keeps regenerating the charge it is preserving.
 
     def TurnOff(self) -> None:
         """Power down the generator. Face charge is PRESERVED, not drained —
@@ -2055,8 +2252,9 @@ class ShieldSubsystem(PoweredSubsystem):
 
     def TurnOn(self) -> None:
         """Power up the generator. Face charge is RESTORED as it was, not
-        snapped to max. Refilling is regen's job (Update), and waiting for it
-        is the only way to get shields back."""
+        snapped to max. Refilling is regen's job (the native shield piece,
+        subsystem_step.h THE SHIELD PIECE), and waiting for it is the only
+        way to get shields back."""
         super().TurnOn()
 
     def GetNumShields(self) -> int:
@@ -2131,92 +2329,24 @@ class ShieldSubsystem(PoweredSubsystem):
 
     def SetShieldChargePerSecond(self, face: int, value: float) -> None:
         self._charge_per_second[int(face)] = float(value)
+        native_combat.push_field(self, "_charge_per_second")   # in place
 
-    def Update(self, dt: float) -> None:
-        """Per-tick regen: current += charge_per_second * dt, clamped to max.
-
-        Faces with max==0 are skipped so unshielded faces never accumulate.
-
-        Disabled-generator gate (Project 5 §4.4): when _is_offline(self),
-        skip the whole loop. _charge_per_second values are NOT mutated;
-        repair restores regen at the original rates on the next call.
-
-        Neither the alert level nor the generator's power setting gates or
-        scales regen. Measured on the original exe (stbc-oracle bible §5.3,
-        S5): a face preset to 50 % climbs at 9.2–9.5/s at red, yellow AND
-        green alert (`regen_{red,yellow,green}_face50`), and at 50 %
-        generator power wanted (`regen_power50_face50`). So a powered-down
-        (green) generator keeps regenerating the charge it is preserving,
-        and the power factor does not enter the rate. What a reactor that
-        cannot supply NormalPowerPerSecond does is bible §10 open — not
-        modelled here either way.
-        """
-        # ── BC's 0.5 s charge cadence ────────────────────────────────────
-        # ShieldClass's tick (0x0056A230, vtable slot 25) accumulates elapsed
-        # time into +0x154 and, while that accumulator is BELOW 0.5 (threshold
-        # at 0x008E529C), delegates to the PoweredSubsystem update and returns.
-        # The per-facing charge work happens once per 0.5 s of accumulated
-        # time, NOT per frame -- stbc-reference spec/ShieldFacingDamage.md
-        # section 6.1. We were running the whole per-facing loop at 60 Hz, i.e.
-        # 30x more often than the original.
-        #
-        # The accumulator is reset unconditionally once the threshold is
-        # crossed (BC step 3, before the disabled/off branch at step 5), so a
-        # ship that is offline or powered down for a while cannot bank time and
-        # then apply it as a burst when it comes back.
-        #
-        # Charge RATE is unchanged: the same per-second maths runs against the
-        # accumulated dt, so the total charge over any interval is what it was.
-        # Only the granularity changes -- regen now steps every 0.5 s, which is
-        # what the original did.
-        self._charge_accum = self._charge_accum + float(dt)
-        if self._charge_accum < SHIELD_CHARGE_PERIOD_S:
-            return
-        dt = self._charge_accum
-        self._charge_accum = 0.0
-        # The charge tick is where the ramp's fraction is refreshed.
-        for f in range(self.NUM_SHIELDS):
-            mx = self._max_shields[f]
-            self._ramp_fraction[f] = (self._current_shields[f] / mx) if mx > 0.0 else 0.0
-
-        if _is_offline(self):
-            # A disabled (or destroyed) generator does not merely stop
-            # regenerating — every face drops to zero and stays there.
-            # Measured on the original exe (stbc-oracle bible §5.3 S6,
-            # `regen_gen{50,20}_face50`): with the generator's condition
-            # below its DisabledPercentage, all six faces read 0 at once and
-            # nothing comes back until it is repaired; then regen refills
-            # them from zero. The generator is binary: healthy ⇒ shields,
-            # disabled ⇒ none.
-            if any(self._current_shields):
-                for f in range(self.NUM_SHIELDS):
-                    self._current_shields[f] = 0.0
-                for f in range(self.NUM_SHIELDS):
-                    self._shield_watchers[f]._update(self.GetSingleShieldPercentage(f))
-                self._shield_watchers[self.NUM_SHIELDS]._update(
-                    self.GetShieldPercentage())
-            return
-        # No IsOn gate: a lowered (green-alert) or cloaked ship's hidden
-        # charge keeps regenerating — the cloak case was a 2026-07-08 live
-        # fix, the green case is the S5 capture above; they are the same rule.
-        dt = float(dt)
-        for f in range(self.NUM_SHIELDS):
-            mx = self._max_shields[f]
-            if mx == 0.0:
-                continue
-            new = self._current_shields[f] + self._charge_per_second[f] * dt
-            if new > mx:
-                new = mx
-            self._current_shields[f] = new
-        # Drive each face watcher with its FRACTION so
-        # Conditions/ConditionSingleShieldBelow.py fires its
-        # ET_AI_SHIELD_WATCHER crossing event; the combined watcher (index
-        # NUM_SHIELDS) follows with the overall fraction — this is also where
-        # both catch up after direct ApplyDamage face mutations.
-        for f in range(self.NUM_SHIELDS):
-            self._shield_watchers[f]._update(self.GetSingleShieldPercentage(f))
-        self._shield_watchers[self.NUM_SHIELDS]._update(
-            self.GetShieldPercentage())
+    # ── The per-tick regen is NATIVE ONLY (phase 6 Task 8) ──────────────
+    # native/src/combat/include/dauntless/combat/subsystem_step.h THE SHIELD
+    # PIECE is the one implementation (the Python Update was deleted). What
+    # it does, and the evidence for it:
+    # * BC's 0.5 s charge cadence: ShieldClass's tick (0x0056A230, vtable
+    #   slot 25) accumulates elapsed time into +0x154 and does the per-face
+    #   charge work once the accumulator reaches 0.5 (0x008E529C), resetting
+    #   it unconditionally (stbc-reference spec/ShieldFacingDamage.md §6.1);
+    #   the rate is per second against the accumulated dt.
+    # * The charge tick refreshes `_ramp_fraction` (ApplyDamage's fraction).
+    # * Disabled or destroyed (_is_offline): every face drops to zero and
+    #   stays there until repaired (stbc-oracle bible §5.3 S6).
+    # * No alert-level, IsOn or power-setting gate on regen (bible §5.3 S5:
+    #   9.2-9.5/s at red, yellow and green alike, and at 50 % power).
+    # * Each face watcher is fed its fraction, then the combined watcher
+    #   (Conditions/ConditionSingleShieldBelow.py's crossings).
 
     def ApplyDamage(self, face: int, amount: float) -> float:
         """Absorb a hit on the face; return what reaches the hull.
@@ -2264,8 +2394,10 @@ class ShieldSubsystem(PoweredSubsystem):
         new = cur - (1.0 - b) * amt
         if new >= 0.0:
             self._current_shields[f] = new
+            native_combat.push_field(self, "_current_shields")   # in place
             return b * amt
         self._current_shields[f] = 0.0
+        native_combat.push_field(self, "_current_shields")       # in place
         return b * amt - new
 
 
@@ -2289,6 +2421,21 @@ class PowerSubsystem(ShipSubsystem):
     reservoir drains (main-only / backup-only, return amount taken, float
     0.0 falsy).  Engine has no callers — SDK scripts and tests only.
     """
+    # Mirrored for the native power piece (subsystem_step.h THE POWER
+    # PIECE), which writes them back through its C applier.
+    _available_power = NativeField(float)
+    _main_battery_power = NativeField(float)
+    _backup_battery_power = NativeField(float)
+    _main_conduit_current = NativeField(float)
+    _backup_conduit_current = NativeField(float)
+    _interval_elapsed = NativeField(float)
+    _power_dispensed = NativeField(float)
+    _power_wanted_total = NativeField(float)
+    _breach_fired = NativeField(bool)
+    # Adopted, pushing the plant's watcher state (native_combat).
+    _main_battery_watcher = native_combat.PowerWatcherField(0)
+    _backup_battery_watcher = native_combat.PowerWatcherField(1)
+
     def __init__(self, name: str = ""):
         super().__init__(name)
         self._available_power: float = 0.0
@@ -2333,6 +2480,10 @@ class PowerSubsystem(ShipSubsystem):
         prop = self.GetProperty()
         if prop is None:
             return 0.0
+        if getattr(type(prop), getter_name, None) is None:
+            fv = getattr(prop, "_field_value", None)
+            if fv is not None:
+                return float(fv(getter_name[3:]) or 0.0)
         return float(getattr(prop, getter_name)() or 0.0)
 
     def GetMainBatteryLimit(self) -> float:
@@ -2441,27 +2592,14 @@ class PowerSubsystem(ShipSubsystem):
         self._backup_battery_power -= take
         return take
 
-    # ── Per-tick flow ─────────────────────────────────────────────────────
-    # BC uses a 1-second interval tick (FUN_005636D0 / 0x892E20 constant).
-    # Elapsed game-time accumulates each call; when it crosses POWER_INTERVAL
-    # the reactor fires: generate output*elapsed into batteries (main first,
-    # spill to backup, discard), then compute conduit budgets from the new
-    # battery levels and health-scaled capacity.  Between intervals the conduit
-    # budgets are unchanged; the watcher fractions are updated every call so
-    # the FloatRangeWatcher fires promptly on StealPower drains between ticks.
+    # ── Per-tick flow (native: THE POWER PIECE, below) ───────────────────
+    # The interval the native piece reads (pushed as the POWER_INTERVAL
+    # global). Between intervals the conduit budgets are unchanged; the
+    # watcher fractions are updated every tick so the FloatRangeWatcher fires
+    # promptly on StealPower drains between ticks.
 
     POWER_INTERVAL: float = 1.0   # seconds of game time; BC constant 0x892E20
 
-    def _add_power_to_batteries(self, amount: float) -> None:
-        """Main first (capped), spill to backup (capped), discard the rest."""
-        main_cap = self.GetMainBatteryLimit()
-        backup_cap = self.GetBackupBatteryLimit()
-        room = main_cap - self._main_battery_power
-        take = min(amount, max(room, 0.0))
-        self._main_battery_power += take
-        spill = amount - take
-        room = backup_cap - self._backup_battery_power
-        self._backup_battery_power += min(spill, max(room, 0.0))
 
     def _trigger_breach(self) -> None:
         """Called once when the reactor is destroyed (Task 5 — manual p.16:
@@ -2475,17 +2613,18 @@ class PowerSubsystem(ShipSubsystem):
         re-evaluate every tick — the plant is marked "handled" even though
         no breach is emitted.
 
-        Two effects (targetable path only), matching the
-        objects.py:695-699 critical-subsystem pattern:
+        Targetable path only: the plant's crossing goes to the one death
+        path (controller ruling R9), a ZERO_CROSS checked at the tick
+        boundary (engine/appc/death_check.py). There, unless the ship is
+        invincible by then:
 
         * warp_core_breach.arm(ship) — queues the breach VFX (shockwave ring +
           hull wound records), spawned on the next warp_core_breach.advance() (driven
           by the game loop). It deals no damage; the source ship's collateral
           comes from its faithful splash (splash_damage, via ship_death.begin).
         * ship_death.begin(ship) — starts the source ship's own death sequence
-          (which also applies its splash damage), guarded on IsDying()/IsDead()
-          so a ship already dying (e.g. the hull-zero cascade already began it)
-          is untouched.
+          (which also queues its splash damage), unless the ship is already
+          dying or dead (e.g. the hull-zero cascade already began it).
 
         Raise-safe: a missing parent ship or import error must never crash
         the power tick."""
@@ -2493,179 +2632,165 @@ class PowerSubsystem(ShipSubsystem):
             from engine.appc.objects import _is_targetable
             if not _is_targetable(self):
                 return
-            from engine.appc import warp_core_breach
             ship = self.GetParentShip()
             if ship is None:
                 return
-            warp_core_breach.arm(ship)
-            # implements(), NOT hasattr(): __getattr__ answers every hasattr
-            # probe on a TGObject with a truthy _Stub, so the old guard could
-            # not tell a real IsDying() from a stub that reads as "dying".
-            if implements(ship, "IsDying") and implements(ship, "IsDead") \
-                    and not ship.IsDying() and not ship.IsDead():
-                from engine.appc import ship_death
-                ship_death.begin(ship)
+            # The one death path (R9): the plant's crossing, checked at the
+            # tick boundary like a write's (death_check.note_breach), which
+            # re-reads invincibility there (rulings M1, M5, R5). The plant
+            # stays handled (_breach_fired): making the ship vulnerable later
+            # kills nothing retroactively (R4).
+            from engine.appc import death_check
+            death_check.note_breach(ship, self)
         except Exception as _e:
             import engine.dev_mode as dev_mode
             dev_mode.log_swallowed("warp core breach trigger", _e)
 
-    def Update(self, dt: float) -> None:
-        # Task 5: on the first tick after the reactor is destroyed, arm the
-        # warp-core breach (manual p.16: "Reaching 0% causes a warp-core
-        # breach and destroys the ship").  _breach_fired is a single-fire
-        # guard so that a destroyed-but-still-ticked subsystem only arms once.
-        if self.IsDestroyed() and not self._breach_fired:
-            self._breach_fired = True
-            self._trigger_breach()
-        prop = self.GetProperty()
-        if prop is None:
-            return
-        dt = float(dt)
-        self._interval_elapsed += dt
-        if self._interval_elapsed >= self.POWER_INTERVAL:
-            elapsed = self._interval_elapsed
-            # Reset to zero (not -= POWER_INTERVAL) so every interval window
-            # accumulates the identical IEEE-754 tick sum: [0, POWER_INTERVAL).
-            # Tests mirror this exact float path via _accum_elapsed() arithmetic.
-            self._interval_elapsed = 0.0
-            self._power_dispensed = 0.0
-            if not _is_offline(self):
-                self._add_power_to_batteries(self.GetPowerOutput() * elapsed)
-            # Deliberate asymmetry: recharge is gated on reactor-offline, but
-            # conduit budgets (capacity*elapsed) are computed UNCONDITIONALLY.
-            # BC-faithful per docs/gameplay/ship-subsystems.md:122-127
-            # (ComputeAvailablePower is an unconditional sibling step; batteries
-            # still deliver through conduits even when the reactor is down).
-            # Per-interval budget = min(battery, rated*condPct*elapsed). Use the
-            # RATED (un-clamped) capacity here so the battery clamp is applied
-            # exactly once (in the min below), not double-applied via the
-            # battery-limited SDK getters. See the two-views comment above.
-            main_max = self._rated_main_conduit_capacity() * elapsed
-            backup_max = self._rated_backup_conduit_capacity() * elapsed
-            self._main_conduit_current = min(self._main_battery_power, main_max)
-            self._backup_conduit_current = min(self._backup_battery_power, backup_max)
-            self._available_power = (self._main_conduit_current
-                                     + self._backup_conduit_current)
-        self._pump_consumers(dt)     # Task 4 fills this in
-        main_cap = self.GetMainBatteryLimit()
-        backup_cap = self.GetBackupBatteryLimit()
-        # Drive the FloatRangeWatchers with each battery's FRACTION so
-        # Conditions/ConditionPowerBelow.py fires its ET_POWER_FRACTION_CHANGED
-        # crossing event (guard divide-by-zero → 0.0).
-        self._main_battery_watcher._update(
-            self._main_battery_power / main_cap if main_cap > 0.0 else 0.0
-        )
-        self._backup_battery_watcher._update(
-            self._backup_battery_power / backup_cap if backup_cap > 0.0 else 0.0
-        )
+    # ── The plant's tick is NATIVE ONLY (phase 6 Task 8) ────────────────
+    # subsystem_step.h THE POWER PIECE is the one implementation of the
+    # plant's Update and its consumer pump (the Python Update, _update_flow,
+    # _pump_consumers, _draw and each consumer's _update_power were
+    # deleted). BC's 1 s interval (FUN_005636D0 / 0x892E20): elapsed time
+    # accumulates; at POWER_INTERVAL the clock RESETS to 0, the reactor (if
+    # not offline) fills main, spills to backup, discards the rest, and the
+    # conduit budgets are recomputed UNCONDITIONALLY from the RATED
+    # capacities (docs/reference/gameplay/ship-subsystems.md:122-127). The
+    # pump runs every tick in attach order (BC draw priority); the battery
+    # watchers are fed each tick (Conditions/ConditionPowerBelow.py). A
+    # destroyed plant latches _breach_fired and runs _trigger_breach once.
 
-    def _pump_consumers(self, dt: float) -> None:
-        """Per-frame consumer draw pass.  Walks the ship's powered consumers in
-        attach order (= BC draw priority) and lets each draw its per-tick demand
-        from the conduit budget + battery via _draw.  _power_wanted_total sums
-        the demand for the WeaponsDisplay / diagnostics readout.
 
-        Called every Update (not just on the interval tick) so between-interval
-        frames still deplete the seeded conduit budget smoothly."""
-        ship = self.GetParentShip()
-        consumers = getattr(ship, "_powered_consumers", None) if ship is not None else None
-        if not consumers:
-            return
-        total = 0.0
-        for consumer in consumers:
-            consumer._update_power(dt, self)
-            # _power_wanted, not GetPowerWanted(): _update_power just wrote the
-            # attribute one line ago, and PoweredSubsystem's getter is a bare
-            # `return self._power_wanted`. At 9.4 consumers x 101 ships x 15
-            # ticks that accessor alone was ~14,000 calls per frame for no
-            # information.
-            #
-            # But "the getter is that bare return" is a property of ONE class,
-            # not of the interface: PowerSubsystem.GetPowerWanted returns
-            # _power_wanted_total, an entirely different field. It cannot reach
-            # this list today (PowerSubsystem derives from ShipSubsystem, so
-            # ShipClass.AddPoweredConsumer's isinstance(PoweredSubsystem) gate
-            # rejects it), but an unguarded inline turns any future
-            # getter-overriding consumer from a working case into a silently
-            # wrong total.
-            #
-            # Measured, not asserted (2M-iteration timeit, this interpreter):
-            # bare field 20 ns, guard + field 47 ns, method call 53 ns. So the
-            # guard is still cheaper than the call it avoids, and its 27 ns
-            # premium over the naked read is 6.7% of the 404 ns _update_power
-            # that shares the loop body -- about 26 us/frame at 9.4 consumers
-            # x 101 ships. That buys back correctness for every future
-            # consumer shape at a cost the profile cannot see.
-            if type(consumer).GetPowerWanted is _BASE_GET_POWER_WANTED:
-                total += consumer._power_wanted
-            else:
-                total += consumer.GetPowerWanted()
-        self._power_wanted_total = total
 
-    def _draw(self, amount: float, mode: int) -> float:
-        """Depletes conduit budget AND battery to satisfy up to ``amount``,
-        honouring the consumer's draw mode.  Returns the amount actually drawn.
 
-        * PSM_MAIN_FIRST — main conduit/battery first, backup for the shortfall.
-        * PSM_BACKUP_FIRST — backup first, main for the shortfall.
-        * PSM_BACKUP_ONLY — backup only, no fallback (cloak: off the main grid).
 
-        Accumulates into _power_dispensed for GetPowerDispensed()."""
-        if amount <= 0.0:
-            return 0.0
-        # Inlined _draw_main / _draw_backup. They remain as methods (public
-        # surface, and the unit tests drive them directly) but the hot path no
-        # longer pays two extra Python calls per drawing consumer -- ~6.3
-        # consumers x 101 ships x 15 ticks is ~19,000 calls a frame.
-        got = 0.0
-        # `== PSM_MAIN_FIRST`, NOT `!= the other two`. PSM_DIRECT_MAIN (3) is a
-        # fourth mode and the original chain sent it to the final else, i.e.
-        # BACKUP-ONLY. Spelling this as a negative silently re-routed it to
-        # main-first -- a behaviour change smuggled in as an optimisation.
-        if mode == PSM_MAIN_FIRST:
-            take = amount
-            if take > self._main_conduit_current:
-                take = self._main_conduit_current
-            if take > self._main_battery_power:
-                take = self._main_battery_power
-            if take > 0.0:
-                self._main_conduit_current -= take
-                self._main_battery_power -= take
-                got = take
-            rest = amount - got
-            if rest > 0.0:
-                take = rest
-                if take > self._backup_conduit_current:
-                    take = self._backup_conduit_current
-                if take > self._backup_battery_power:
-                    take = self._backup_battery_power
-                if take > 0.0:
-                    self._backup_conduit_current -= take
-                    self._backup_battery_power -= take
-                    got += take
-        elif mode == PSM_BACKUP_FIRST:
-            got += self._draw_backup(amount)
-            got += self._draw_main(amount - got)
-        else:  # PSM_BACKUP_ONLY — no fallback
-            got += self._draw_backup(amount)
-        self._power_dispensed += got
-        return got
 
-    def _draw_main(self, amount: float) -> float:
-        take = min(amount, self._main_conduit_current, self._main_battery_power)
-        if take <= 0.0:
-            return 0.0
-        self._main_conduit_current -= take
-        self._main_battery_power -= take
-        return take
 
-    def _draw_backup(self, amount: float) -> float:
-        take = min(amount, self._backup_conduit_current, self._backup_battery_power)
-        if take <= 0.0:
-            return 0.0
-        self._backup_conduit_current -= take
-        self._backup_battery_power -= take
-        return take
+
+class _RepairQueue(list):
+    """A repair bay's queue: a list that keeps each subsystem's
+    ``_in_repair_queue`` true exactly while it is a member (ruling I3), on
+    every mutation -- the bay's own (add, completion, the priority toggle)
+    and a caller's (``repair_ship_fully``'s ``clear``, a test's). A plain
+    list member that is not a subsystem is carried unmarked.
+
+    Its owning bay (``_owner``, set by RepairSubsystem) mirrors the queue's
+    order and membership (the native repair piece walks it,
+    subsystem_step.h THE REPAIR PIECE): every mutation below pushes the
+    bay's ``_queue`` again. A queue rebound with some other list is pushed
+    by the bay's descriptor, but its own in-place edits are not."""
+
+    def __init__(self, owner=None):
+        super().__init__()
+        self._owner = owner
+
+    def _pushed(self) -> None:
+        owner = self.__dict__.get("_owner")
+        if owner is not None:
+            native_combat.push_field(owner, "_queue")
+
+    def append(self, sub):
+        list.append(self, sub)
+        _mark_queued(sub, True)
+        self._pushed()
+
+    def insert(self, index, sub):
+        list.insert(self, index, sub)
+        _mark_queued(sub, True)
+        self._pushed()
+
+    def extend(self, subs):
+        subs = list(subs)
+        list.extend(self, subs)
+        for sub in subs:
+            _mark_queued(sub, True)
+        self._pushed()
+
+    def __iadd__(self, subs):
+        self.extend(subs)
+        return self
+
+    # The in-place reorderings: membership is unchanged (sort, reverse) or
+    # only repeated / emptied (*=), but the mirrored ORDER moves.
+    def sort(self, *args, **kwargs):
+        try:
+            list.sort(self, *args, **kwargs)
+        finally:
+            self._pushed()
+
+    def reverse(self):
+        list.reverse(self)
+        self._pushed()
+
+    def __imul__(self, n):
+        gone = list(self)
+        list.__imul__(self, n)
+        self._unmark(gone)
+        self._pushed()
+        return self
+
+    def clear(self):
+        gone = list(self)
+        list.clear(self)
+        self._unmark(gone)
+        self._pushed()
+
+    def pop(self, index=-1):
+        sub = list.pop(self, index)
+        self._unmark((sub,))
+        self._pushed()
+        return sub
+
+    def remove(self, sub):
+        list.remove(self, sub)
+        self._unmark((sub,))
+        self._pushed()
+
+    def __delitem__(self, index):
+        gone = self[index] if isinstance(index, slice) else (self[index],)
+        list.__delitem__(self, index)
+        self._unmark(gone)
+        self._pushed()
+
+    def __setitem__(self, index, value):
+        if isinstance(index, slice):
+            gone, value = self[index], list(value)
+            new = value
+        else:
+            gone, new = (self[index],), (value,)
+        list.__setitem__(self, index, value)
+        self._unmark(gone)
+        for sub in new:
+            _mark_queued(sub, True)
+        self._pushed()
+
+    def discard(self, sub):
+        """Remove `sub` by identity, if queued."""
+        for i, s in enumerate(self):
+            if s is sub:
+                del self[i]
+                return
+
+    def _unmark(self, gone):
+        for sub in gone:
+            if not any(s is sub for s in self):
+                _mark_queued(sub, False)
+
+
+def _mark_queued(sub, queued: bool) -> None:
+    if isinstance(sub, ShipSubsystem):
+        sub._in_repair_queue = queued
+
+
+def _notify_key(sub):
+    """A queued subsystem's key in its bay's ``_cannot_complete_notified``:
+    its mirror handle (``_nslot``), which the native repair piece keys the
+    set by too (subsystem_step.h THE REPAIR PIECE), else -- an object the
+    mirror has no row for -- its id(). A member whose row is dropped (or
+    forgotten) changes key to its id(), so it can be told
+    ET_REPAIR_CANNOT_BE_COMPLETED once more (accepted: rare, and both
+    stages do the same)."""
+    h = sub.__dict__.get("_nslot") if hasattr(sub, "__dict__") else None
+    return h if type(h) is int else id(sub)
 
 
 class RepairSubsystem(PoweredSubsystem):
@@ -2674,22 +2799,31 @@ class RepairSubsystem(PoweredSubsystem):
     SDK surface (App.py:6639-6662): AddSubsystem, AddToRepairList,
     IsBeingRepaired, plus the inherited ShipSubsystem/PoweredSubsystem
     methods. Queue semantics + tick formula are RE-verified
-    (docs/gameplay/ship-subsystems.md §Repair):
+    (docs/reference/gameplay/ship-subsystems.md §Repair):
     duplicates rejected, destroyed (condition<=0) rejected, undamaged
-    rejected; first NumRepairTeams entries are "being repaired".
+    rejected; the first NumRepairTeams entries that are not destroyed are
+    "being repaired".
     """
+
+    # Mirrored for the native repair piece (subsystem_step.h THE REPAIR
+    # PIECE): the queue's order and membership (pushed by _RepairQueue on
+    # every change) and the notified set (the native piece writes it back
+    # through its C applier).
+    _queue = native_combat.NativeRefList("Subsystem")
+    _cannot_complete_notified = native_combat.NotifiedSetField()
 
     def __init__(self, name: str = ""):
         super().__init__(name)
         # RE layout: +0x9C (isOn) inits to 1 — the bay ticks and draws
         # power without ever being switched on.
         self._is_on = True
-        # Ordered repair queue (head = active). Python list of subsystem
-        # refs; identity comparisons throughout (TGObject __eq__ is not
-        # trusted).
-        self._queue: list = []
-        # id(sub) values already notified ET_REPAIR_CANNOT_BE_COMPLETED
-        # (destroyed-while-queued fires once, not per tick).
+        # Ordered repair queue (head = active). A list of subsystem refs that
+        # keeps each member's _in_repair_queue (_RepairQueue); identity
+        # comparisons throughout (TGObject __eq__ is not trusted).
+        self._queue: list = _RepairQueue(self)
+        # _notify_key(sub) of each member already notified
+        # ET_REPAIR_CANNOT_BE_COMPLETED (destroyed-while-queued fires once,
+        # not per tick): its mirror handle.
         self._cannot_complete_notified: set = set()
         # ET_REPAIR_INCREASE_PRIORITY posted with destination=this bay
         # (EngRepairPane click) routes to the toggle via the instance-
@@ -2744,57 +2878,30 @@ class RepairSubsystem(PoweredSubsystem):
     # SDK exposes both spellings for the same insert (App.py:6660-6661).
     AddSubsystem = AddToRepairList
 
+    def _worked(self) -> list:
+        """The items holding a team: the first NumRepairTeams queued items
+        that are not destroyed. A destroyed item holds no team and does not
+        slow the others (Mark, 2026-10-23); it stays queued, skipped. The
+        repair pane draws its REPAIR list the same way."""
+        live = [s for s in self._queue if s.GetCondition() > 0.0]
+        return live[:self.GetNumRepairTeams()]
+
     def IsBeingRepaired(self, sub) -> int:
-        """True iff sub is within the first NumRepairTeams queue entries —
-        stock walks exactly that many nodes (FUN_00565890)."""
-        n = self.GetNumRepairTeams()
-        return 1 if any(s is sub for s in self._queue[:n]) else 0
+        """True iff sub holds a repair team (see _worked)."""
+        return 1 if any(s is sub for s in self._worked()) else 0
 
-    def Update(self, dt) -> None:
-        """The RE-verified repair tick (ship-subsystems.md §Repair):
+    # ── The repair tick is NATIVE ONLY (phase 6 Task 8) ─────────────────
+    # subsystem_step.h THE REPAIR PIECE is the one implementation
+    # (ship-subsystems.md §Repair; stbc-oracle bible §16, R1-R5 within 3 %):
+    #     raw     = MaxRepairPoints * bayConditionPct * dt
+    #     perItem = raw / min(liveQueueCount, NumRepairTeams)
+    #     gain_i  = perItem / target_i.RepairComplexity
+    # Destroyed entries stay queued, fire ET_REPAIR_CANNOT_BE_COMPLETED
+    # once, hold no team and are left out of the divisor; completion
+    # removes the entry and fires ET_REPAIR_COMPLETED. No power-efficiency
+    # term (Mark, 2026-10-23; a starved reactor is unmeasured, bible R6).
 
-            raw     = MaxRepairPoints * bayConditionPct * dt
-            perItem = raw / min(queueCount, NumRepairTeams)
-            gain_i  = perItem / target_i.RepairComplexity
 
-        Walks from the head assigning up to NumRepairTeams teams to
-        non-destroyed entries. Destroyed entries are skipped (stay queued,
-        per stock), fire ET_REPAIR_CANNOT_BE_COMPLETED once, and consume
-        no team. Completion removes the entry and fires
-        ET_REPAIR_COMPLETED. NO power-efficiency term — output scales
-        only by the bay's own health (spec + power spec agree)."""
-        if dt is None or dt <= 0.0 or not self._queue:
-            return
-        if self.GetCondition() <= 0.0:
-            return
-        teams = self.GetNumRepairTeams()
-        points = self.GetMaxRepairPoints()
-        if teams <= 0 or points <= 0.0:
-            return
-        raw = points * self.GetConditionPercentage() * float(dt)
-        per_item = raw / min(len(self._queue), teams)
-        assigned = 0
-        completed = []
-        for sub in list(self._queue):
-            if assigned >= teams:
-                break
-            if sub.GetCondition() <= 0.0:
-                if id(sub) not in self._cannot_complete_notified:
-                    self._cannot_complete_notified.add(id(sub))
-                    self._fire_repair_event(
-                        "ET_REPAIR_CANNOT_BE_COMPLETED", sub)
-                continue
-            self._cannot_complete_notified.discard(id(sub))
-            assigned += 1
-            complexity = sub.GetRepairComplexity()
-            if complexity <= 0.0:
-                complexity = 1.0
-            sub.Repair(per_item / complexity)
-            if sub.GetCondition() >= sub.GetMaxCondition():
-                completed.append(sub)
-        for sub in completed:
-            self._queue = [s for s in self._queue if s is not sub]
-            self._fire_repair_event("ET_REPAIR_COMPLETED", sub)
 
     # ── Event emission ──────────────────────────────────────────────────────
     def _fire_repair_event(self, event_attr: str, sub, dest=None) -> None:
@@ -2823,7 +2930,7 @@ class RepairSubsystem(PoweredSubsystem):
         idx = next((i for i, s in enumerate(self._queue) if s is sub), None)
         if idx is None:
             return
-        active = idx < self.GetNumRepairTeams()
+        active = self.IsBeingRepaired(sub)
         del self._queue[idx]
         if active:
             self._queue.append(sub)
@@ -2861,9 +2968,10 @@ class CloakingSubsystem(PoweredSubsystem):
     * ``CLOAK_CLOAKED``    — fully invisible.
     * ``CLOAK_DECLOAKING`` — fading back in; transition in progress.
 
-    The transition timer (``_transition_elapsed``) is advanced from the
-    per-tick ``Update(dt)`` (the same hook ShieldSubsystem / PowerSubsystem use,
-    walked from the game loop's subsystem update pass).  On crossing
+    The transition timer (``_transition_elapsed``) is advanced by the native
+    subsystem stage (subsystem_step.h THE CLOAK PIECE, walked from the game
+    loop's subsystem update pass, after the shield and power pieces).  On
+    crossing
     ``_transition_duration`` the machine snaps to CLOAKED / DECLOAKED and
     broadcasts the matching completion event (ET_CLOAK_COMPLETED /
     ET_DECLOAK_COMPLETED) via ``App.g_kEventManager`` — the same emission path
@@ -2880,10 +2988,18 @@ class CloakingSubsystem(PoweredSubsystem):
     CLOAK_CLOAKED    = 2
     CLOAK_DECLOAKING = 3
 
+    # Mirrored into the native combat row on every write (native_combat).
+    _cloak_state = NativeField(int)
+    # The native cloak piece's transition clock (subsystem_step.h THE CLOAK
+    # PIECE), written back through its C applier.
+    _transition_elapsed = NativeField(float)
+    _transition_duration = NativeField(float)
+
     # Cloak runs off the backup grid only — it is locked off the main conduit
     # so cloaking never starves the ship's other systems of main-battery power
-    # (docs/gameplay/ship-subsystems.md:185).
-    POWER_MODE = PSM_BACKUP_ONLY
+    # (docs/reference/gameplay/ship-subsystems.md:185).
+    POWER_MODE = native_combat.NativeClassDefault(native_combat.INDEX,
+                                                  PSM_BACKUP_ONLY)
 
     # Power starvation: the cloak runs off the BACKUP battery; when that reserve
     # is exhausted the device can no longer hold the cloak (ship-subsystems.md:
@@ -2901,7 +3017,10 @@ class CloakingSubsystem(PoweredSubsystem):
     # edit). Biased to the crossover: a healthy reactor out-refills this and
     # sustains cloak; a damaged one falls behind and the reserve empties, tripping
     # the MIN_RESERVE_TO_HOLD_CLOAK guard. Mark tunes by eye.
-    CLOAK_RESERVE_DRAIN_PER_SECOND: float = 1000.0
+    CLOAK_RESERVE_DRAIN_PER_SECOND = native_combat.NativeClassDefault(
+        float, 1000.0)
+    # The native power piece's reserve snapshot (THE POWER PIECE).
+    _backup_reserve = NativeField(float)
 
     def __init__(self, name: str = ""):
         super().__init__(name)
@@ -2910,9 +3029,10 @@ class CloakingSubsystem(PoweredSubsystem):
         # Per-instance so W5.T2 can set it from CloakStrength; defaults to the
         # module constant.
         self._transition_duration: float = CLOAK_TRANSITION_DURATION
-        # Backup-battery level snapshotted each frame in _update_power (which has
-        # the PowerSubsystem in hand). Update()'s starvation guard reads this so
-        # it keys on true reserve depletion, not per-frame conduit efficiency.
+        # Backup-battery level snapshotted each frame by the native pump (THE
+        # POWER PIECE). The native cloak piece's starvation guard reads this
+        # so it keys on true reserve depletion, not per-frame conduit
+        # efficiency.
         # inf until the first power pump, so a cold-started cloak is never
         # decloaked before its reserve has even been sampled.
         self._backup_reserve: float = float("inf")
@@ -2982,30 +3102,6 @@ class CloakingSubsystem(PoweredSubsystem):
         return 1 if self._cloak_state in (self.CLOAK_CLOAKING,
                                           self.CLOAK_CLOAKED) else 0
 
-    def _update_power(self, dt: float, power) -> None:
-        """Direct-from-reserve draw. While trying to cloak, drain
-        CLOAK_RESERVE_DRAIN_PER_SECOND straight from the backup battery
-        (StealPowerFromReserve), bypassing the conduit throttle so the reserve
-        genuinely depletes. Snapshots the post-draw reserve for the Step 0
-        starvation guard in Update() (the loop ticks power before cloak, so the
-        snapshot is fresh when Update reads it). Not trying to cloak -> no draw."""
-        dt = float(dt)
-        if dt <= 0.0:
-            return
-        if not self._wants_power():
-            self._power_wanted = 0.0
-            self._power_received = 0.0
-            self._efficiency = 0.0
-            self._power_factor = 0.0
-            self._backup_reserve = power.GetBackupBatteryPower()
-            return
-        base = self.CLOAK_RESERVE_DRAIN_PER_SECOND * dt
-        received = power.StealPowerFromReserve(base) if base > 0.0 else 0.0
-        self._power_wanted = base
-        self._power_received = received
-        self._efficiency = received / base if base > 0.0 else 1.0
-        self._power_factor = self._efficiency
-        self._backup_reserve = power.GetBackupBatteryPower()
 
     def _wants_power(self) -> bool:
         """The cloak draws power only while the ship is trying to stay hidden
@@ -3061,51 +3157,13 @@ class CloakingSubsystem(PoweredSubsystem):
 
     # ── Per-tick transition advance (game-loop subsystem update pass) ────────
 
-    def Update(self, dt: float) -> None:
-        """Advance an in-progress cloak/decloak transition.
-
-        A disabled / destroyed device cannot complete or hold a cloak: when
-        offline it is forced back toward DECLOAKED (a pending CLOAKING is
-        abandoned, a finished CLOAKED snaps off).  Power starvation (backup
-        reserve battery exhausted) also forces decloak.  Otherwise, when the
-        elapsed transition time reaches ``_transition_duration`` the machine
-        snaps to the terminal state and broadcasts its completion event.
-        """
-        offline = bool(self.IsDisabled()) or bool(self.IsDestroyed())
-        if offline:
-            # Forced decloak: a disabled cloak cannot keep the ship hidden.
-            self._force_decloak()
-            return
-
-        # Power starvation: the backup RESERVE battery is dry → the device can
-        # no longer hold the cloak.  Keyed on the reserve level (snapshotted in
-        # _update_power), NOT per-frame conduit efficiency — see
-        # MIN_RESERVE_TO_HOLD_CLOAK for why efficiency was the wrong signal.
-        # Gated on CLOAK_RESERVE_DRAIN_PER_SECOND (the ACTUAL direct-from-reserve
-        # draw amount used by _update_power), not GetNormalPowerWanted() — the
-        # latter is a legacy PoweredSubsystem field the cloak's B-path no longer
-        # reads, so a "free cloak" set via CLOAK_RESERVE_DRAIN_PER_SECOND = 0
-        # must disarm this guard regardless of _normal_power.
-        if (self.IsTryingToCloak() and self.CLOAK_RESERVE_DRAIN_PER_SECOND > 0.0
-                and self._backup_reserve <= self.MIN_RESERVE_TO_HOLD_CLOAK):
-            self._force_decloak()
-            return
-
-        if self._cloak_state not in (self.CLOAK_CLOAKING, self.CLOAK_DECLOAKING):
-            return
-
-        self._transition_elapsed += float(dt)
-        if self._transition_elapsed < self._transition_duration:
-            return
-
-        if self._cloak_state == self.CLOAK_CLOAKING:
-            self._cloak_state = self.CLOAK_CLOAKED
-            self._transition_elapsed = 0.0
-            self._fire("ET_CLOAK_COMPLETED")
-        else:  # CLOAK_DECLOAKING
-            self._cloak_state = self.CLOAK_DECLOAKED
-            self._transition_elapsed = 0.0
-            self._fire("ET_DECLOAK_COMPLETED")
+    # ── The transition tick is NATIVE ONLY (phase 6 Task 8) ─────────────
+    # subsystem_step.h THE CLOAK PIECE is the one implementation: a disabled
+    # or destroyed device (IsDisabled / IsDestroyed) cannot hold a cloak and
+    # is forced off (_force_decloak); a dry backup reserve (the pump's
+    # _backup_reserve snapshot, keyed on CLOAK_RESERVE_DRAIN_PER_SECOND > 0)
+    # forces it off too (MIN_RESERVE_TO_HOLD_CLOAK); otherwise the
+    # transition completes at _transition_duration and fires its event.
 
     # ── Weapon coupling ───────────────────────────────────────────────────────
 
@@ -3267,29 +3325,46 @@ def HandleRepairPriorityEvent(pObject, pEvent):
     pObject.CallNextHandler(pEvent)
 
 
+_SUBSYSTEM_GETTERS = (
+    "GetHull", "GetShieldSubsystem", "GetSensorSubsystem",
+    "GetImpulseEngineSubsystem", "GetWarpEngineSubsystem",
+    "GetPowerSubsystem", "GetRepairSubsystem", "GetTorpedoSystem",
+    "GetPhaserSystem", "GetPulseWeaponSystem", "GetTractorBeamSystem",
+    "GetCloakingSubsystem",
+)
+
+
+def iter_subsystems(ship):
+    """The hull, then every top-level subsystem, each followed by its
+    children, in a fixed order. Safe on None/partial ships: a getter that
+    raises is skipped (and logged)."""
+    if ship is None:
+        return
+    for name in _SUBSYSTEM_GETTERS:
+        try:
+            sub = getattr(ship, name, lambda: None)()
+            if sub is None:
+                continue
+            children = [sub.GetChildSubsystem(i)
+                        for i in range(sub.GetNumChildSubsystems())]
+        except Exception as _e:
+            dev_mode.log_swallowed("iter_subsystems", _e)
+            continue
+        yield sub
+        for child in children:
+            if child is not None:
+                yield child
+
+
 def repair_ship_fully(ship) -> None:
     """Dev/debug full repair — mirrors sdk Actions/ShipScriptActions.py
     RepairShipFully: every subsystem back to max condition. Also clears
     the repair queue (nothing left to fix). Safe on None/partial ships."""
     if ship is None:
         return
-    getters = (
-        "GetHull", "GetShieldSubsystem", "GetSensorSubsystem",
-        "GetImpulseEngineSubsystem", "GetWarpEngineSubsystem",
-        "GetPowerSubsystem", "GetRepairSubsystem", "GetTorpedoSystem",
-        "GetPhaserSystem", "GetPulseWeaponSystem", "GetTractorBeamSystem",
-        "GetCloakingSubsystem",
-    )
-    for name in getters:
+    for sub in iter_subsystems(ship):
         try:
-            sub = getattr(ship, name, lambda: None)()
-            if sub is None:
-                continue
             sub.SetCondition(sub.GetMaxCondition())
-            for i in range(sub.GetNumChildSubsystems()):
-                child = sub.GetChildSubsystem(i)
-                if child is not None:
-                    child.SetCondition(child.GetMaxCondition())
         except Exception as _e:
             dev_mode.log_swallowed("repair_ship_fully", _e)
     bay = getattr(ship, "GetRepairSubsystem", lambda: None)()

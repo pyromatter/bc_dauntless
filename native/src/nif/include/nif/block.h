@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -159,6 +160,12 @@ struct NiRawImageData {
     std::vector<std::uint8_t> pixels;   // row-major, channels-per-pixel = 3 or 4
 };
 
+/// Hard/soft edges authored in Blender (a mesh fix's BSM1 records), as vertex
+/// index pairs a < b. In-memory only: never parsed from or written to a NIF.
+struct AuthoredEdges {
+    std::vector<std::array<std::uint16_t, 2>> hard, soft;
+};
+
 /// Vertex / index / per-vertex-attribute storage for an NiTriShape.
 /// Inherits NiGeometryData → NiTriBasedGeomData → NiTriShapeData.
 /// Field layout for v3.1.
@@ -186,6 +193,8 @@ struct NiTriShapeData {
     std::uint16_t num_match_groups = 0;
     /// Each match group is a list of vertex indices that share a position.
     std::vector<std::vector<std::uint16_t>> match_groups;
+    /// Set by apply_mesh_fix only; the NIF parser and writers ignore it.
+    std::optional<AuthoredEdges> authored_edges;
 };
 
 /// Z-buffer test/write property. v3.1 has only NiObjectNET base + flags.
@@ -409,7 +418,7 @@ struct NiBinaryVoxelExtraData {
 /// voxel::from_nif_voxel_data(). raw_voxel_payload retains the full payload
 /// (fillField + planes + bytes2 + trailer) for consumers that need the
 /// unparsed sub-structures. planes and bytes2 are not sub-parsed here.
-/// See docs/engine/nif-voxel-format.md (FULLY SOLVED).
+/// See docs/reference/engine/nif-voxel-format.md (FULLY SOLVED).
 struct NiBinaryVoxelData {
     std::uint16_t dim_x = 0;               // grid resolution, X (was unknown_short1)
     std::uint16_t dim_y = 0;               // grid resolution, Y (was unknown_short2)

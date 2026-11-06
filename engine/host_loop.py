@@ -10,7 +10,7 @@ import importlib
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, NamedTuple, Optional
 
 import os as _os_mod
 
@@ -26,7 +26,9 @@ from engine.appc.ship_iter import (
 import engine.dev_keybindings as dev_keybindings
 import engine.dev_mode as dev_mode
 import engine.dev_nebula_dials as dev_nebula_dials
+from engine.core import case_paths as _case_paths
 from engine.core import frame_profiler
+from engine.core.tracked_instances import TrackedInstances
 from engine.dev_mission_picker import MissionPicker
 import engine.missions as _missions
 from engine.ui.target_reticle import build_target_reticle
@@ -92,12 +94,16 @@ from engine.appc import (
     weapon_tactical_commands,
     render_instances,
 )
+from engine.appc import effect_queue as _effect_queue
 from engine.appc import explosion_lights as _explosion_lights
+from engine.appc import native_combat as _native_combat
+from engine.appc import native_motion as _native_motion
 from engine.appc import target_menu as _target_menu_mod
 from engine.appc import viewscreen_static as _vss
 from engine.appc import bridge_set as _bridge_set
 # combat is imported as a module (not `from combat import apply_hit`) so call
 # sites read combat.apply_hit at call time — tests monkeypatch that attribute.
+from engine.core import step_memo
 from engine.appc.sensor_detection import can_detect, clear_undetectable_player_lock
 from engine import units as _units
 from engine.systems import frames as _frames
@@ -105,16 +111,15 @@ from engine.appc.math import TGPoint3, TGMatrix3
 from engine.appc.ships import ShipClass
 from engine.appc.ship_death import _out_of_action as _oa
 from engine.appc import glow_maps as _glow_maps
-from engine.appc.ship_motion import _effective_motion, _cap_keep, _asymptote_step
+from engine.appc import passive_state, passive_weapons
+from engine.appc.ship_motion import _effective_motion, _cap_keep, step_vector_velocity, law_step_vector, _no_thrust
 from engine.appc.subsystems import (
-    TorpedoTube,
-    _EnergyWeaponFireMixin,
     _emitter_in_arc,
     _is_offline,
     _resolve_bank_aim_world,
     impulse_online_fraction,
 )
-from engine.appc.weapon_subsystems import _target_undetectable, _same_set
+from engine.appc.weapon_subsystems import _same_set
 
 
 def _project_root_for_cef():
@@ -231,7 +236,21 @@ def _pump_music(dt) -> None:
         mgr.notify_track_finished()
 
 
-def tick_audio(*, camera_position, camera_forward, camera_up, dt, player) -> None:
+def _frame_clock() -> float:
+    """The wall clock run() measures each frame's length with. A function so
+    a test can drive the loop at a chosen frame rate
+    (tests/host/test_frame_rate_independence.py)."""
+    import time
+    return time.monotonic()
+
+
+def tick_audio(*, camera_position, camera_forward, camera_up, dt, player,
+               source_dt=None) -> None:
+    """`dt` is the frame's real elapsed time (0 under pause): the listener
+    rides the camera, which moves every drawn frame, and music ramps on it.
+    `source_dt` (default `dt`) is the GAME time the frame covered: attached
+    sources sit on game objects, which only move when a tick runs, so their
+    velocity is that movement over that time."""
     if _audio_mod is None:
         return
     from engine.audio import attached_sources, hum_allocator, hum_diagnostic, scene_scope
@@ -247,7 +266,7 @@ def tick_audio(*, camera_position, camera_forward, camera_up, dt, player) -> Non
     scene_scope.set_active_frame(frames.frame_of(viewed).key if viewed is not None else None)
     # Guide §9, in order: (1) attached emitters from their nodes,
     # (2) the nearest-≤4 hum allocator, (3) the listener from the active camera.
-    attached_sources.pump(dt)
+    attached_sources.pump(dt if source_dt is None else source_dt)
     hum_allocator.update(listener_pos=camera_position)
     # Dev-only diagnostic (F8-toggled, --developer only): a single boolean
     # short-circuit inside maybe_report keeps this out of the 60 Hz hot path
@@ -696,6 +715,58 @@ def _poll_raw_keyboard(host, input_map) -> None:
         suppress=(alt or ctrl or shift), raw_only=True)
 
 
+_fullscreen_chord_prev: bool = False
+
+
+def _poll_fullscreen_chord(host, panel) -> None:
+    """Alt+Enter toggles full screen — production, not a dev keybinding.
+
+    Routed through the Configuration panel's own `toggle:fullscreen` branch
+    rather than calling the renderer directly, so one code path moves all
+    three pieces of state together: the window, the row the player sees, and
+    the persisted value.  A hotkey that changed the window without the other
+    two would leave the panel claiming "Off" over a full-screen window, and
+    the next launch would disagree with the screen the player left.
+
+    NOT a BC binding and not in MODIFIER_CHORDS (which covers ALT/CTRL/Shift
+    × letters, digits and F-keys only), so Enter carries no WC_ALT_ENTER code
+    to collide with.  _poll_raw_keyboard suppresses itself while Alt is held,
+    so this press never also reaches SDK ET_KEYBOARD handlers.
+
+    Enter's code comes from engine.input_map's table, NOT from `host.keys`:
+    the native keys submodule does not export KEY_ENTER (67 names, Enter not
+    among them), so reading it from there is a guaranteed silent no-op — as
+    the first live test of this hotkey proved.  input_map already carries
+    "Enter": 257, host_io.verify_keys pins that table against the host's, and
+    _handle_controls_capture reads its codes the same way.
+
+    Own rising edge off `key_state`, deliberately not `host.key_pressed`:
+    that edge cache is only correct for a key polled every frame, and this
+    one is read only while Alt is down.  The first poll after Alt went down
+    would otherwise report an Enter pressed long before it.
+
+    Two things suppress it, both of which would be stolen keystrokes:
+    _handle_controls_capture is documented as the SOLE consumer of a press
+    while the Controls tab awaits a key, and KeyGate already makes every
+    key_state read False while a CEF text field holds the keyboard.
+
+    A suppressed frame still RECORDS the level.  Clearing it instead would
+    make a chord held across the end of a capture fire the instant capture
+    ended, so one keystroke would both bind a key and toggle the window —
+    the player released nothing, so there is no second press to honour.
+    """
+    global _fullscreen_chord_prev
+    from engine.input_map import GLFW_KEYS
+    enter = GLFW_KEYS["Enter"]
+    alt, _ctrl, _shift = _modifier_state(host)
+    down = alt and bool(host_io.key_state(enter))
+    suppressed = (panel is None
+                  or getattr(panel, "capturing_action", None) is not None)
+    if down and not _fullscreen_chord_prev and not suppressed:
+        panel.dispatch_event("toggle:fullscreen")
+    _fullscreen_chord_prev = down
+
+
 _skip_dialogue_prev: bool = False
 
 
@@ -915,31 +986,67 @@ def _advance_weapons(ships, dt: float) -> None:
     calls UpdateCharge (energy) or UpdateReload (torpedo).  AI ships are
     included — their AI scripts call StartFiring expecting charged
     emitters.
+
+    Both walks live in engine/appc/passive_weapons.py, sharing one group list
+    and one dispatch. With passive state on (the default) it walks the same
+    weapons in the same order but skips the full idle banks and loaded
+    tubes, whose update would return at its first test, until a field that
+    test reads is written. DAUNTLESS_PASSIVE_STATE=0 steps every weapon.
+
+    With native combat on, the native charging kernel K0 steps every weapon
+    from the mirror instead (native_combat.k0_weapons; the per-tick model,
+    spec 2026-11-02-native-weapon-state-design.md §4.3), Python running
+    only its records; when it cannot run at all (an audit, a nested call)
+    the Python walk below runs.
     """
+    if _native_combat.enabled() and _native_combat.k0_weapons(ships, dt):
+        return
+    if passive_state.enabled():
+        passive_weapons.advance(ships, dt)
+        return
     for ship in ships:
-        for group in (
-            ship.GetPhaserSystem(),
-            ship.GetPulseWeaponSystem(),
-            ship.GetTractorBeamSystem(),
-            ship.GetTorpedoSystem(),
-        ):
-            if group is None:
-                continue
-            for i in range(group.GetNumWeapons()):
-                emitter = group.GetWeapon(i)
-                if emitter is None:
-                    continue
-                # isinstance, NOT hasattr: TGObject.__getattr__ returns a truthy
-                # _Stub for any missing attribute, so hasattr() is vacuously True
-                # on every subsystem. The old hasattr(emitter, "UpdateCharge")
-                # guard therefore CALLED a no-op stub on every torpedo tube, every
-                # frame -- ranks 1 and 2 of docs/stub_heatmap.md, 4.5M hits.
-                # Charge is an EnergyWeapon concept (App.py:6426-6440); a
-                # TorpedoTube cannot have it.
-                if isinstance(emitter, TorpedoTube):
-                    emitter.UpdateReload(dt)
-                elif isinstance(emitter, _EnergyWeaponFireMixin):
-                    emitter.UpdateCharge(dt)
+        passive_weapons.step_every_weapon(ship, dt)
+
+
+def _combat_effect_scope():
+    """The tick's deferral scope around sim.weapons and sim.combat: with
+    native combat on, every weapon event and weapon sound they produce is
+    queued and delivered, in order, when it closes -- the tick boundary
+    (engine/appc/effect_queue.py, spec 2026-11-02-combat-fire-events §4.1).
+    Switch off it opens nothing and every producer acts at once. A caller
+    running _advance_weapons / _advance_combat by itself (a test, a tool)
+    gets no scope unless it opens this. The delivery at its close is its
+    own frame-profiler row, "sim.effects" (under "sim" in the host loop)."""
+    if _native_combat.enabled():
+        return _effect_queue.scope(profile="sim.effects")
+    return contextlib.nullcontext()
+
+
+def _combat_tick_boundary():
+    """The tick boundary, both switch states: right after the tick's
+    effect-queue scope has flushed (native combat on), every effect a
+    condition write or a hit reported since the last boundary is delivered
+    -- its events, its watcher crossings, the repair list, the death check
+    (zero crossings and deaths, unless the ship is invincible by now) and
+    the death splash (effect_queue.boundary; native damage M2, M5, R8).
+    With native combat off this is where the tick's hits are reported.
+    Writes made outside the combat step wait for a boundary: a GameLoop
+    tick's (a script) for this one, the frame's post-step pass's
+    (radiation, collisions, scenery, hull breakup) for the frame-end one.
+
+    Timed as "sim.effects" with the switch off, the row the switch-on
+    scope's exit flush uses (ruling I2): a tick's delivery reports under one
+    row in both states, so "sim.combat" compares like for like. With it on
+    this boundary is empty (the scope delivered) and is not timed again.
+
+    Then the mirror's pending frees and off-main pushes are applied
+    (native_combat.drain, both switch states; spec 2026-11-03 ruling R2)."""
+    if _native_combat.enabled():
+        _effect_queue.boundary()
+    else:
+        with frame_profiler.scope("sim.effects"):
+            _effect_queue.boundary()
+    _native_combat.drain(boundary=True)
 
 
 # Beam damage per second is MaxDamage × this, by the phaser system's power
@@ -958,7 +1065,7 @@ def _phaser_damage_for_tick(max_damage: float,
     """Phaser damage: plateau within MaxDamageDistance, then R/d decay.
 
     Verified against the real BC engine via dev-console instrumentation
-    (docs/instrumented_experiments/2026-06-29-weapon-exchange-console-probe.md,
+    (docs/reference/instrumented_experiments/2026-06-29-weapon-exchange-console-probe.md,
     probe q09). Damage is FULL while `dist <= MaxDamageDistance` (R), then
     decays inverse-linearly as `MaxDamage * (R / dist)` beyond R — so a shot
     still deals ~30% at ~2.9*R. The curve is continuous at dist=R (both
@@ -980,43 +1087,19 @@ def _phaser_damage_for_tick(max_damage: float,
 
 
 def _pump_held_weapons(ships_list, dt: float) -> None:
-    """BC WeaponSystem tick (weapon-firing-mechanics.md §3.2): one
-    update_weapons per ARMED system per frame.  Replaces the per-class
-    retry_held_fire pumps.
-
-    Stop conditions (checked per frame while the trigger stays held):
-    offline/powered-down, target undetectable (the anti-horn-loop stop —
-    a held burst at a target that cloaks must end, not restart its warm-up
-    SFX every tick), and the per-class _can_engage range gate (phaser
-    global fire range).  Systems that manage their own stop conditions
-    (TractorBeamSystem — its ENGAGE intent must survive out-of-range /
-    shields-up and re-acquire) set _pump_self_managed and get the frame
-    handed straight to their update_weapons.
+    """BC WeaponSystem tick (weapon-firing-mechanics.md §3.2): every ARMED
+    weapon system of every ship walked once per frame by the native K1
+    kernel (native_combat.k1_pump; fire control's one copy, fire control
+    native only, M3) -- the stop gates (offline/powered-down, the held
+    target dead or undetectable, the per-class range gate), then the walk.
+    Python runs only the effects the walk queued. A TractorBeamSystem's tick
+    is the kernel's too (k1_fire_control.h, THE TRACTOR WALK). Never the
+    switch: DAUNTLESS_NATIVE_COMBAT=0 still walks K1 natively (M9); only K2
+    below follows it. Whatever the mirror cannot answer does not fire that
+    tick (k1_no_fire, logged once).
     """
-    for ship in ships_list:
-        for getter in ("GetPhaserSystem", "GetPulseWeaponSystem",
-                       "GetTractorBeamSystem", "GetTorpedoSystem"):
-            sys_ = getattr(ship, getter)() if hasattr(ship, getter) else None
-            if sys_ is None or not getattr(sys_, "_fire_held", False):
-                continue
-            if getattr(sys_, "_pump_self_managed", False):
-                sys_.update_weapons(dt)
-                continue
-            if _is_offline(sys_) or not sys_.IsOn():
-                sys_.StopFiring()
-                continue
-            held = getattr(sys_, "_held_target", None)
-            if held is not None and (hasattr(held, "IsDead") and held.IsDead()):
-                sys_.StopFiring()      # target destroyed — end the burst
-                continue
-            if held is not None and _target_undetectable(sys_, held):
-                sys_.StopFiring()      # preserves the anti-horn-loop stop
-                continue
-            if held is not None and hasattr(sys_, "_can_engage") \
-                    and not sys_._can_engage(ship, held):
-                sys_.StopFiring()      # range gate (phaser global range etc.)
-                continue
-            sys_.update_weapons(dt)
+    ships = ships_list if isinstance(ships_list, list) else list(ships_list)
+    _native_combat.k1_pump(ships, dt)
 
 
 def _phaser_aim_point(ship, target):
@@ -1025,7 +1108,7 @@ def _phaser_aim_point(ship, target):
 
     Priority is BC's ShipClass target offset: Manual Aim's cursor pick
     (ship.is_using_target_offset(), target-local & unscaled -> pos +
-    R·(offset·scale), the same transform _resolve_torpedo_aim_point applies),
+    R·(offset·scale), the same transform a tube's aim applies),
     else the locked subsystem's world position, else the target's centre.
     ONE helper for both consumers -- the damage tick and the drawn beam --
     so they can never disagree about where the beam lands."""
@@ -1039,9 +1122,236 @@ def _phaser_aim_point(ship, target):
     return target.GetWorldLocation(), None
 
 
-def _advance_combat(ships, dt: float, ship_instances=None,
-                     ship_emitters=None, player=None,
-                     push_render_data: bool = True) -> None:
+# Continuous phaser damage tick (`cb.phasers`).  Each ship's PhaserSystem has
+# banks set firing by the weapon tick (cb.held_weapons); advance them here:
+# re-check arc (auto-stop drifters), compute distance falloff, and route damage
+# through apply_hit (which routes shields → subsystem → hull, calls
+# hit_feedback.dispatch, and broadcasts WeaponHitEvent).
+#
+# ONE copy of the loop body for both paths: the Python step calls
+# _phaser_step_ship for every ship; the native K2 kernel
+# (engine.appc.native_combat.k2_phasers) walks the same loop over the mirror
+# and hands back to these functions a whole ship (RUN_PYTHON) or one bank
+# (ASK bank_step), and to _phaser_level / _phaser_contact every contact's
+# effect.
+
+def _phaser_step_ship(ship, dt: float, ship_instances) -> None:
+    """The `cb.phasers` loop body for one ship."""
+    sys_ = ship.GetPhaserSystem() if hasattr(ship, "GetPhaserSystem") else None
+    if sys_ is None:
+        return
+    # Disabled-weapons gate: parent aggregates child IsDisabled. When
+    # the system flips disabled mid-tick (incoming hit during the
+    # previous frame's damage routing), stop any active banks and
+    # skip the damage loop for this ship. Spec §4.2.
+    # Power-off gate: a system turned off via the power slider (IsOn()==0)
+    # must also stop any already-firing banks immediately.  _is_offline
+    # only checks IsDisabled/IsDestroyed and does NOT cover the powered-
+    # down case, so we gate on IsOn() here as a separate check.
+    if _is_offline(sys_) or not sys_.IsOn():
+        sys_.StopFiring()
+        return
+    # GetNumWeapons is read ONCE; GetWeapon(i) re-reads the children live.
+    for i in range(sys_.GetNumWeapons()):
+        _phaser_step_bank(ship, sys_, i, dt, ship_instances)
+
+
+def _phaser_step_bank(ship, sys_, i: int, dt: float, ship_instances) -> None:
+    """The `cb.phasers` loop body for `bank = sys_.GetWeapon(i)` (each
+    `continue` of the loop is a return here)."""
+    bank = sys_.GetWeapon(i)
+    if bank is None:
+        return
+    target = bank._target
+    if not bank.IsFiring():
+        # A bank that stopped (charge out) with dwell still
+        # banked delivers it as a final partial pulse — the rows
+        # show a 7.8 after the last 66-point quantum when the
+        # Galaxy's bank ran dry (`phaser_galaxy_front_57`).
+        dwell = bank.take_dwell() if hasattr(bank, "take_dwell") else 0.0
+        if dwell <= 0.0 or target is None or (
+                hasattr(target, "IsDead") and target.IsDead()):
+            return
+        flush_dwell = dwell
+    else:
+        if target is None or (hasattr(target, "IsDead") and target.IsDead()):
+            bank.StopFiring()
+            return
+        flush_dwell = None      # decided below, once the aim is known
+    # Sensor gate (authoritative): this is the per-tick chokepoint where
+    # continuous phaser damage is actually applied. A bank can be left
+    # IsFiring by an AI that stopped updating (e.g. the firing ship's
+    # own SelectTarget cleared its target once its sensors degraded, so
+    # FireScript bailed via PS_DONE without StopFiring), so gating only
+    # FireScript.TargetVisible isn't enough — stranded banks would keep
+    # dealing damage here. A ship that can't detect its target can't
+    # keep firing at it. See engine/appc/sensor_detection.can_detect.
+    if flush_dwell is None and not can_detect(ship, target):
+        bank.StopFiring()
+        return
+    # INTERIM cross-set guard (system-frames Plan 2, Ruling 5):
+    # everything below -- _phaser_aim_point, the emitter strip, the
+    # distance falloff, the hit trace -- is a raw set-local compare,
+    # so a bank left firing at a target in ANOTHER set (or a setless
+    # one) would deal damage wherever raw numbers coincide, invisibly
+    # (the beam builder already drops cross-frame beams). No damage,
+    # no feedback; stop the bank, and drop any banked dwell. Stopgap
+    # until frame-aware weapon engagement lands (spec §6 widening
+    # list). Same-set pairs are untouched.
+    if not _same_set(ship, target):
+        if flush_dwell is None:
+            bank.StopFiring()
+        return
+    target_pos, target_sub = _phaser_aim_point(ship, target)
+    emitter_pos = bank._strip_emit_position(target_pos)
+    # Distance: emit point → target (drives damage falloff).
+    dx = target_pos.x - emitter_pos.x
+    dy = target_pos.y - emitter_pos.y
+    dz = target_pos.z - emitter_pos.z
+    dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+    aim_unit = TGPoint3(dx / dist, dy / dist, dz / dist) if dist > 1e-6 else None
+    # Arc check: aim from bank Position → target (NOT emit_pos →
+    # target). The firing cone originates at the mount, not at
+    # the emit point. Mismatch between this site and StartFiring
+    # was Bug F — a bank could pass arc at fire-time and fail
+    # on the next tick because its emit point sat past the
+    # target on the strip. See research doc § Bug F.
+    arc_aim = _resolve_bank_aim_world(bank, target_sub or target)
+    if flush_dwell is None:
+        if not _emitter_in_arc(bank, ship, arc_aim):
+            # Swept off: deliver the partial pulse, then stop.
+            flush_dwell = bank.take_dwell()
+            bank.StopFiring()
+        else:
+            flush_dwell = bank.accumulate_dwell(dt)
+    level = _phaser_level(sys_)
+    # Where the beam is touching, resolved EVERY contact frame —
+    # the per-frame impact feedback below needs it as much as the
+    # pulse does (and this is what the pre-pulse code did anyway).
+    impact_point, impact_normal = combat._resolve_hit_point(
+        ship_instances=ship_instances, ship=target,
+        ray_origin=emitter_pos,
+        ray_direction=(aim_unit if dist > 1e-6 else None),
+        max_dist=(dist * 1.5 if dist > 1e-6 else 0.0),
+        fallback_point=target_pos,
+    )
+    # Where the beam crossed the bubble — the same point
+    # _beam_endpoint stops the DRAWN beam at, so the flash lands on
+    # the beam's own tip instead of 236 NIF units behind it. None
+    # when no facing is up, which falls the flash back to the hull
+    # point inside dispatch.
+    bubble_entry = (
+        combat.shield_bubble_entry(target, emitter_pos, aim_unit,
+                                   dist * 1.5)
+        if (aim_unit is not None and combat.shields_block(target))
+        else None)
+    _phaser_contact(ship, sys_, bank, target, dist, dt, flush_dwell, level,
+                    impact_point, impact_normal, bubble_entry, ship_instances)
+
+
+def _phaser_level(sys_):
+    """The firing system's power level, which indexes
+    PHASER_INTENSITY_SCALE."""
+    return (sys_.GetPowerLevel()
+            if hasattr(sys_, "GetPowerLevel") else sys_.PP_HIGH)
+
+
+_EVALUATE = object()
+
+
+def _phaser_contact(ship, sys_, bank, target, dist: float, dt: float,
+                    flush_dwell: float, level, impact_point, impact_normal,
+                    bubble_entry, ship_instances,
+                    shields_block=_EVALUATE) -> None:
+    """One bank's effect on a contact tick: the beam's resting feedback, or
+    its damage pulse. `shields_block` is the loop's own answer when the
+    caller has one that nothing has run since (native K2); by default
+    beam_contact evaluates its own."""
+    if flush_dwell <= 0.0:
+        # Not a damage pulse: the beam is still resting on the
+        # target, so it still glows and throws sparks there. The
+        # spark threshold reads this frame's slice of the beam, so
+        # the burst behaves as it did when damage was per-tick.
+        given = {} if shields_block is _EVALUATE \
+            else {"shields_block": shields_block}
+        hit_feedback.beam_contact(
+            ship=target, source=ship,
+            point=impact_point, normal=impact_normal,
+            shield_point=bubble_entry,
+            tick_damage=_phaser_damage_for_tick(
+                max_damage=bank.GetMaxDamage(),
+                max_damage_distance=bank.GetMaxDamageDistance(),
+                dist=dist, dt=dt,
+            ) * PHASER_INTENSITY_SCALE[level],
+            ship_instances=ship_instances,
+            weapon_type="phaser",
+            radius=combat.weapon_splash_radius(bank, None),
+            **given,
+        )
+        return
+    # One pulse: MaxDamage × intensity × distance factor × dwell
+    # (clean-room 0x00572A50; measured stbc-oracle bible §2.2).
+    damage = _phaser_damage_for_tick(
+        max_damage=bank.GetMaxDamage(),
+        max_damage_distance=bank.GetMaxDamageDistance(),
+        dist=dist,
+        dt=flush_dwell,
+    ) * PHASER_INTENSITY_SCALE[level]
+    if damage > 0:
+        # LIGHT (PP_LOW) phaser power is "disable, don't destroy":
+        # damage routes to subsystems only, the hull takes no condition
+        # damage (verified by dev-console probe) and no plating wear
+        # or severance share (hit_feedback._structural_hit).
+        # `sys_` is the firing PhaserSystem; read PP_LOW off it directly.
+        damage_hull = (sys_.GetPowerLevel() != sys_.PP_LOW
+                       if hasattr(sys_, "GetPowerLevel") else True)
+        combat.apply_hit(target, damage, impact_point,
+                         source=ship,
+                         normal=impact_normal,
+                         ship_instances=ship_instances,
+                         weapon_type="phaser",
+                         hardpoint_weapon=bank,
+                         damage_hull=damage_hull,
+                         shield_point=bubble_entry)
+
+
+# K2 stands in for this loop body's helpers: snapshot them now, before any
+# test, tool or mod can replace one (native_combat.k2_snapshot_stock).
+_native_combat.k2_snapshot_stock(sys.modules[__name__])
+# ... and the functions and classes K3 (cb.projectiles) stands in for.
+_native_combat.k3_snapshot_stock()
+# ... and those the native hit and condition chain stand in for (damage).
+_native_combat.damage_snapshot_stock()
+
+
+def _advance_combat(*args, **kwargs) -> None:
+    """One combat step; see _advance_combat_step.
+
+    Runs inside an engine.core.step_memo block: a repeated question -- a
+    can_detect pair (a ship's phaser tick after its held-weapon check, every
+    torpedo it fired at that target), a mount's world position -- is answered
+    once. The answers are dropped wherever an input can change: every hit
+    (combat.apply_hit), and around deaths and subsystem damage.
+
+    The tractor force is not here: it runs in the motion stage
+    (ship_motion.tick_tractors, Mark 2026-11-04), so the beam the held-weapon
+    pump grips here first pulls in the next tick's motion stage.
+
+    The kernels read the poses the tick's motion stage published (the READ
+    WINDOW, opened by native_motion.publish); it closes when this returns,
+    so the effect delivery at the scope's exit, the boundary and everything
+    until the next publish read the live store.
+    """
+    try:
+        with step_memo.combat_step():
+            _advance_combat_step(*args, **kwargs)
+    finally:
+        _native_motion.close_published()
+
+
+def _advance_combat_step(ships, dt: float, ship_instances=None,
+                         ship_emitters=None, player=None,
+                         push_render_data: bool = True) -> None:
     """Per-frame torpedo motion + collision + damage + renderer push.
 
     `push_render_data=False` leaves the renderer push to the caller
@@ -1073,14 +1383,27 @@ def _advance_combat(ships, dt: float, ship_instances=None,
     # Refresh damage eligibility (part severance) for this tick before any
     # hits are processed: player always + capped nearest/largest ships.
     # See engine.appc.damage_eligibility.
-    with frame_profiler.scope("cb.eligibility"):
-        damage_eligibility.update(ships_list)
+    try:
+        with frame_profiler.scope("cb.eligibility"):
+            # The step scan K4 (here) and K3 (cb.projectiles) share: once a
+            # step.
+            if _native_combat._switch:
+                _native_combat.step_scan(ships_list)
+            damage_eligibility.update(ships_list)
 
-    with frame_profiler.scope("cb.projectiles"):
-        hits = projectiles.update_all(
-            dt, ships_list,
-            ship_instances=ship_instances,
-        )
+        with frame_profiler.scope("cb.projectiles"):
+            hits = projectiles.update_all(
+                dt, ships_list,
+                ship_instances=ship_instances,
+            )
+    finally:
+        # K3 was the scan's last reader: it must not outlive the step (it
+        # holds ships_list), and no later update_all may read it as current.
+        if _native_combat._step is not None:
+            _native_combat.clear_step()
+    # Only the hits a Python update_all step returns: the native K3 step
+    # applies its own after its expiries (native damage Task 4;
+    # native_combat._k3_apply_hits) and returns none.
     for torpedo, ship, hit_point, hit_normal in hits:
         combat.apply_hit(ship, torpedo._damage, hit_point,
                   source=torpedo._source_ship,
@@ -1097,6 +1420,10 @@ def _advance_combat(ships, dt: float, ship_instances=None,
         from engine.appc import shockwaves
         shockwaves.advance(dt)
         particles.advance(dt)
+    # Deaths and subsystem damage change what sensors see and
+    # where mounts are; every hit forgets on its own (combat.apply_hit).
+    # See _advance_combat.
+    step_memo.forget()
     with frame_profiler.scope("cb.death"):
         with frame_profiler.scope("death.ship"):
             ship_death.advance(dt)
@@ -1107,6 +1434,7 @@ def _advance_combat(ships, dt: float, ship_instances=None,
         from engine.appc import object_lifetime
         with frame_profiler.scope("death.lifetime"):
             object_lifetime.advance(dt)
+    step_memo.forget()
     with frame_profiler.scope("cb.damage_sys"):
         from engine.appc import subsystem_cascade, warp_core_breach
         with frame_profiler.scope("dmg.cascade"):
@@ -1121,7 +1449,9 @@ def _advance_combat(ships, dt: float, ship_instances=None,
             internal_blast.advance(dt, ship_instances=ship_instances)
         camera_shake.update(dt)
 
-    # BC WeaponSystem tick: one update_weapons per armed system per frame.
+    # BC WeaponSystem tick: native fire control's walk of every armed
+    # system, once per tick (native_combat.k1_pump).
+    step_memo.forget()
     with frame_profiler.scope("cb.held_weapons"):
         _pump_held_weapons(ships_list, dt)
 
@@ -1131,161 +1461,10 @@ def _advance_combat(ships, dt: float, ship_instances=None,
     # apply_hit (which routes shields → subsystem → hull, calls
     # hit_feedback.dispatch, and broadcasts WeaponHitEvent).
     with frame_profiler.scope("cb.phasers"):
-        for ship in ships_list:
-            sys_ = ship.GetPhaserSystem() if hasattr(ship, "GetPhaserSystem") else None
-            if sys_ is None:
-                continue
-            # Disabled-weapons gate: parent aggregates child IsDisabled. When
-            # the system flips disabled mid-tick (incoming hit during the
-            # previous frame's damage routing), stop any active banks and
-            # skip the damage loop for this ship. Spec §4.2.
-            # Power-off gate: a system turned off via the power slider (IsOn()==0)
-            # must also stop any already-firing banks immediately.  _is_offline
-            # only checks IsDisabled/IsDestroyed and does NOT cover the powered-
-            # down case, so we gate on IsOn() here as a separate check.
-            if _is_offline(sys_) or not sys_.IsOn():
-                sys_.StopFiring()
-                continue
-            for i in range(sys_.GetNumWeapons()):
-                bank = sys_.GetWeapon(i)
-                if bank is None:
-                    continue
-                target = bank._target
-                if not bank.IsFiring():
-                    # A bank that stopped (charge out) with dwell still
-                    # banked delivers it as a final partial pulse — the rows
-                    # show a 7.8 after the last 66-point quantum when the
-                    # Galaxy's bank ran dry (`phaser_galaxy_front_57`).
-                    dwell = bank.take_dwell() if hasattr(bank, "take_dwell") else 0.0
-                    if dwell <= 0.0 or target is None or (
-                            hasattr(target, "IsDead") and target.IsDead()):
-                        continue
-                    flush_dwell = dwell
-                else:
-                    if target is None or (hasattr(target, "IsDead") and target.IsDead()):
-                        bank.StopFiring()
-                        continue
-                    flush_dwell = None      # decided below, once the aim is known
-                # Sensor gate (authoritative): this is the per-tick chokepoint where
-                # continuous phaser damage is actually applied. A bank can be left
-                # IsFiring by an AI that stopped updating (e.g. the firing ship's
-                # own SelectTarget cleared its target once its sensors degraded, so
-                # FireScript bailed via PS_DONE without StopFiring), so gating only
-                # FireScript.TargetVisible isn't enough — stranded banks would keep
-                # dealing damage here. A ship that can't detect its target can't
-                # keep firing at it. See engine/appc/sensor_detection.can_detect.
-                if flush_dwell is None and not can_detect(ship, target):
-                    bank.StopFiring()
-                    continue
-                # INTERIM cross-set guard (system-frames Plan 2, Ruling 5):
-                # everything below -- _phaser_aim_point, the emitter strip, the
-                # distance falloff, the hit trace -- is a raw set-local compare,
-                # so a bank left firing at a target in ANOTHER set (or a setless
-                # one) would deal damage wherever raw numbers coincide, invisibly
-                # (the beam builder already drops cross-frame beams). No damage,
-                # no feedback; stop the bank, and drop any banked dwell. Stopgap
-                # until frame-aware weapon engagement lands (spec §6 widening
-                # list). Same-set pairs are untouched.
-                if not _same_set(ship, target):
-                    if flush_dwell is None:
-                        bank.StopFiring()
-                    continue
-                target_pos, target_sub = _phaser_aim_point(ship, target)
-                emitter_pos = bank._strip_emit_position(target_pos)
-                # Distance: emit point → target (drives damage falloff).
-                dx = target_pos.x - emitter_pos.x
-                dy = target_pos.y - emitter_pos.y
-                dz = target_pos.z - emitter_pos.z
-                dist = (dx * dx + dy * dy + dz * dz) ** 0.5
-                aim_unit = TGPoint3(dx / dist, dy / dist, dz / dist) if dist > 1e-6 else None
-                # Arc check: aim from bank Position → target (NOT emit_pos →
-                # target). The firing cone originates at the mount, not at
-                # the emit point. Mismatch between this site and StartFiring
-                # was Bug F — a bank could pass arc at fire-time and fail
-                # on the next tick because its emit point sat past the
-                # target on the strip. See research doc § Bug F.
-                arc_aim = _resolve_bank_aim_world(bank, target_sub or target)
-                if flush_dwell is None:
-                    if not _emitter_in_arc(bank, ship, arc_aim):
-                        # Swept off: deliver the partial pulse, then stop.
-                        flush_dwell = bank.take_dwell()
-                        bank.StopFiring()
-                    else:
-                        flush_dwell = bank.accumulate_dwell(dt)
-                level = (sys_.GetPowerLevel()
-                         if hasattr(sys_, "GetPowerLevel") else sys_.PP_HIGH)
-                # Where the beam is touching, resolved EVERY contact frame —
-                # the per-frame impact feedback below needs it as much as the
-                # pulse does (and this is what the pre-pulse code did anyway).
-                impact_point, impact_normal = combat._resolve_hit_point(
-                    ship_instances=ship_instances, ship=target,
-                    ray_origin=emitter_pos,
-                    ray_direction=(aim_unit if dist > 1e-6 else None),
-                    max_dist=(dist * 1.5 if dist > 1e-6 else 0.0),
-                    fallback_point=target_pos,
-                )
-                # Where the beam crossed the bubble — the same point
-                # _beam_endpoint stops the DRAWN beam at, so the flash lands on
-                # the beam's own tip instead of 236 NIF units behind it. None
-                # when no facing is up, which falls the flash back to the hull
-                # point inside dispatch.
-                bubble_entry = (
-                    combat.shield_bubble_entry(target, emitter_pos, aim_unit,
-                                               dist * 1.5)
-                    if (aim_unit is not None and combat.shields_block(target))
-                    else None)
-                if flush_dwell <= 0.0:
-                    # Not a damage pulse: the beam is still resting on the
-                    # target, so it still glows and throws sparks there. The
-                    # spark threshold reads this frame's slice of the beam, so
-                    # the burst behaves as it did when damage was per-tick.
-                    hit_feedback.beam_contact(
-                        ship=target, source=ship,
-                        point=impact_point, normal=impact_normal,
-                        shield_point=bubble_entry,
-                        tick_damage=_phaser_damage_for_tick(
-                            max_damage=bank.GetMaxDamage(),
-                            max_damage_distance=bank.GetMaxDamageDistance(),
-                            dist=dist, dt=dt,
-                        ) * PHASER_INTENSITY_SCALE[level],
-                        ship_instances=ship_instances,
-                        weapon_type="phaser",
-                        radius=combat.weapon_splash_radius(bank, None),
-                    )
-                    continue
-                # One pulse: MaxDamage × intensity × distance factor × dwell
-                # (clean-room 0x00572A50; measured stbc-oracle bible §2.2).
-                damage = _phaser_damage_for_tick(
-                    max_damage=bank.GetMaxDamage(),
-                    max_damage_distance=bank.GetMaxDamageDistance(),
-                    dist=dist,
-                    dt=flush_dwell,
-                ) * PHASER_INTENSITY_SCALE[level]
-                if damage > 0:
-                    # LIGHT (PP_LOW) phaser power is "disable, don't destroy":
-                    # damage routes to subsystems only, the hull takes no condition
-                    # damage (verified by dev-console probe) and no plating wear
-                    # or severance share (hit_feedback._structural_hit).
-                    # `sys_` is the firing PhaserSystem; read PP_LOW off it directly.
-                    damage_hull = (sys_.GetPowerLevel() != sys_.PP_LOW
-                                   if hasattr(sys_, "GetPowerLevel") else True)
-                    combat.apply_hit(target, damage, impact_point,
-                              source=ship,
-                              normal=impact_normal,
-                              ship_instances=ship_instances,
-                              weapon_type="phaser",
-                              hardpoint_weapon=bank,
-                              damage_hull=damage_hull,
-                              shield_point=bubble_entry)
-
-    # Tractor beams (hold/tow/pull/push/dock): the weapon tick above sustains
-    # the held grab beam (TractorBeamSystem.update_weapons re-acquires while
-    # engaged); advance_tractors applies the mode's physics — it moves the
-    # target (and reciprocally the source) via direct position displacement.
-    # No-op for ships without a firing tractor (production stays identical).
-    with frame_profiler.scope("cb.tractors"):
-        from engine.appc import tractor as _tractor
-        _tractor.advance_tractors(ships_list, dt)
+        if not (_native_combat.enabled()
+                and _native_combat.k2_phasers(ships_list, dt, ship_instances)):
+            for ship in ships_list:
+                _phaser_step_ship(ship, dt, ship_instances)
 
     if push_render_data:
         _push_combat_render_data(ships_list, ship_instances=ship_instances,
@@ -1315,10 +1494,11 @@ def _push_combat_render_data(ships_list, *, ship_instances=None,
         host_io.set_warp_in_flash_params(_warp_in_flash_params())
         host_io.set_hit_vfx(_build_hit_vfx_render_data())
         host_io.set_particle_emitters(_build_particle_render_data(ship_instances))
+        memo = _ViewMemo()      # one in-view sweep for both beam feeds
         host_io.set_phaser_beams(_build_phaser_beam_render_data(
-            ships_list, ship_instances=ship_instances))
+            ships_list, ship_instances=ship_instances, memo=memo))
         host_io.set_tractor_beams(_build_tractor_beam_render_data(
-            ships_list, ship_instances=ship_instances))
+            ships_list, ship_instances=ship_instances, memo=memo))
 
 
 def _color_tuple(color):
@@ -1366,6 +1546,31 @@ def _torpedo_forward(t) -> tuple:
     return (v.x / mag, v.y / mag, v.z / mag)
 
 
+def _torpedo_colors(t):
+    """(brightness, core, glow, flares) dimmed by TORPEDO_BRIGHTNESS, the bolt
+    shell and core colours, and the glow RGB for the torpedo's light -- built
+    ONCE per model (CreateTorpedoModel / CreateDisruptorModel drop
+    `_vis_colors`), not per frame: the five _color_tuple reads were 224k calls
+    per 400 frames. Nothing else changes a torpedo's colours after creation
+    (SDK projectile scripts build their TGColorA locals, pass them in once and
+    never touch them again). The brightness knob is part of the entry, so a
+    changed TORPEDO_BRIGHTNESS rebuilds it."""
+    d = t.__dict__
+    c = d.get("_vis_colors")
+    if c is not None and c[0] == TORPEDO_BRIGHTNESS:
+        return c
+    glow = _color_tuple(t._glow_color)
+    c = d["_vis_colors"] = (
+        TORPEDO_BRIGHTNESS,
+        _dim_color(_color_tuple(t._core_color), TORPEDO_BRIGHTNESS),
+        _dim_color(glow, TORPEDO_BRIGHTNESS),
+        _dim_color(_color_tuple(t._flares_color), TORPEDO_BRIGHTNESS),
+        _color_tuple(t._shell_color),
+        _color_tuple(t._bolt_core_color),
+        glow[:3])
+    return c
+
+
 def _build_torpedo_render_data():
     """Convert projectiles._active into the dict shape set_torpedoes expects.
 
@@ -1380,32 +1585,43 @@ def _build_torpedo_render_data():
     Only torpedoes in the viewed frame are sent, in RENDER space
     (frames.to_render: the viewed set's coordinates minus the render origin)
     -- a left-behind set's torpedoes stay out of the scene you are in. No
-    viewed set: no scene, nothing sent."""
+    viewed set: no scene, nothing sent.
+
+    Textures are resolved once per distinct path per CALL: every torpedo of a
+    kind shares three paths, and resolving them per torpedo (mods overlay +
+    case-insensitive stat) was 60% of this feed at 1,440 torpedoes. The cache
+    dies with the call, so a new game root or mod set is seen next frame."""
     out = []
     view = _frames.viewing_set()
     if view is None:
         return out
+    textures = {}
+
+    def texture(path):
+        r = textures.get(path)
+        if r is None:
+            r = textures[path] = _resolve_game_texture(path)
+        return r
+
     for t in projectiles._active:
         p = t.GetTranslate()
         pos = _frames.to_render(view, _frames.containing_set(t), p.x, p.y, p.z)
         if pos is None:
             continue
+        _b, core_c, glow_c, flares_c, shell_c, bolt_c, _g = _torpedo_colors(t)
         out.append({
             "position":      pos,
-            "core_texture":  _resolve_game_texture(t._core_texture),
-            "core_color":    _dim_color(_color_tuple(t._core_color),
-                                        TORPEDO_BRIGHTNESS),
+            "core_texture":  texture(t._core_texture),
+            "core_color":    core_c,
             "core_size_a":   t._core_size_a,
             "core_size_b":   t._core_size_b,
-            "glow_texture":  _resolve_game_texture(t._glow_texture),
-            "glow_color":    _dim_color(_color_tuple(t._glow_color),
-                                        TORPEDO_BRIGHTNESS),
+            "glow_texture":  texture(t._glow_texture),
+            "glow_color":    glow_c,
             "glow_size_a":   t._glow_size_a,
             "glow_size_b":   t._glow_size_b,
             "glow_size_c":   t._glow_size_c,
-            "flares_texture": _resolve_game_texture(t._flares_texture),
-            "flares_color":  _dim_color(_color_tuple(t._flares_color),
-                                        TORPEDO_BRIGHTNESS),
+            "flares_texture": texture(t._flares_texture),
+            "flares_color":  flares_c,
             "num_flares":    t._num_flares,
             "flares_size_a": t._flares_size_a,
             "flares_size_b": t._flares_size_b,
@@ -1415,8 +1631,8 @@ def _build_torpedo_render_data():
             "forward":         _torpedo_forward(t),
             # Disruptor bolt colors are audit-authentic already — no
             # TORPEDO_BRIGHTNESS dimming (that knob is for the quad layers).
-            "shell_color":     _color_tuple(t._shell_color),
-            "bolt_core_color": _color_tuple(t._bolt_core_color),
+            "shell_color":     shell_c,
+            "bolt_core_color": bolt_c,
             "bolt_length":     float(t._bolt_length),
             "bolt_width":      float(t._bolt_width),
         })
@@ -1461,7 +1677,7 @@ def _build_dynamic_light_render_data():
             # The fade judged the VIEW position (the eye is in view
             # coordinates); the renderer takes it in render space.
             "position":  _frames.view_to_render(pos),
-            "color":     _color_tuple(t._glow_color)[:3],
+            "color":     _torpedo_colors(t)[6],
             "radius":    radius,
             "intensity": _TORPEDO_LIGHT_INTENSITY * fade,
         })
@@ -1735,7 +1951,7 @@ def _part_pose_at(ship, iid, position, prop=None, severed_mask=None):
     at its identity pose), or `_PART_SEVERED` when its part has been shot
     off. Shared by every per-frame attached effect -- the subsystem emitter
     lights and the running lights -- so they follow exactly the pose
-    `_sync_ship_articulation` pushes to the renderer this frame.
+    `_sync_ship_articulation` has pushed to the renderer.
 
     A STRUCTURE part (unrigged hulls, `hull_breakup`) that has broken off
     also answers `_PART_SEVERED`: the point's `structure_part_at` label has
@@ -1781,7 +1997,7 @@ def _articulate_emitter_light(ship, iid, spec, d, severed_mask=None):
 
     Still body frame out: the renderer places it through the hull's matrix
     as before. The pose is the same `_articulation_poses` value
-    `_sync_ship_articulation` pushes to the renderer this frame, so the light
+    `_sync_ship_articulation` has pushed to the renderer, so the light
     and the drawn part cannot disagree. Decided per frame rather than cached
     at spawn: the boxes derive from `model_nodes(iid)`, which a spawn-time
     tag could run before, silently tagging every light None forever.
@@ -2326,17 +2542,63 @@ def _beam_descriptor_pair(ship, bank, ship_instances):
     ]
 
 
-def _ships_in_view(ships):
-    """(ship, its set, view) for each ship in the viewed frame -- the beam
-    builders' scope. A left-behind set's ships keep firing off-screen; their
-    beams stay out of the scene you are in. Nothing viewed: nothing yields."""
-    view = _frames.viewing_set()
-    if view is None:
-        return
-    for ship in ships:
-        pSet = _frames.containing_set(ship)
-        if _frames.offset_between(view, pSet) is not None:
-            yield ship, pSet, view
+class _ViewMemo:
+    """Which ships are in the viewed frame, answered once per ship per frame
+    and shared by the phaser and tractor builders (the old `_ships_in_view` ran its
+    containing_set + offset_between sweep over every ship twice a frame).
+    `view` is None when nothing is viewed; then no ship is in view."""
+
+    __slots__ = ("view", "_sets")
+
+    def __init__(self):
+        self.view = _frames.viewing_set()
+        self._sets = {}
+
+    def set_of(self, ship):
+        """The ship's set when it is in the viewed frame, else None."""
+        sets = self._sets
+        try:
+            return sets[ship]
+        except KeyError:
+            pass
+        r = None
+        if self.view is not None:
+            pSet = _frames.containing_set(ship)
+            if _frames.offset_between(self.view, pSet) is not None:
+                r = pSet
+        sets[ship] = r
+        return r
+
+
+def _firing_banks(sys_):
+    """The banks of `sys_` that are firing, in bank order -- what
+    `GetWeapon(i)` + `IsFiring()` over every bank yielded, read off the
+    authoritative `_firing` in the bank's own dict (where the native applier
+    and every Python writer put it) instead of two calls per bank. A bank
+    class or system that overrides those accessors takes the original calls."""
+    from engine.appc.weapon_subsystems import (
+        WeaponSystem, _EnergyWeaponFireMixin)
+    children = sys_.__dict__.get("_children")
+    if (type(children) is not list
+            or type(sys_).GetWeapon is not WeaponSystem.GetWeapon
+            or type(sys_).GetNumWeapons is not WeaponSystem.GetNumWeapons
+            or "GetWeapon" in sys_.__dict__
+            or "GetNumWeapons" in sys_.__dict__):
+        out = []
+        for i in range(sys_.GetNumWeapons()):
+            bank = sys_.GetWeapon(i)
+            if bank is not None and bank.IsFiring():
+                out.append(bank)
+        return out
+    stock = _EnergyWeaponFireMixin.IsFiring
+    out = []
+    for bank in children:
+        if type(bank).IsFiring is stock and "IsFiring" not in bank.__dict__:
+            if bank.__dict__.get("_firing"):
+                out.append(bank)
+        elif bank.IsFiring():
+            out.append(bank)
+    return out
 
 
 def _beam_pair_in_view(pair, view, ship_set, target):
@@ -2355,22 +2617,31 @@ def _beam_pair_in_view(pair, view, ship_set, target):
     return pair
 
 
-def _build_phaser_beam_render_data(ships, ship_instances=None):
+def _build_phaser_beam_render_data(ships, ship_instances=None, memo=None):
     """Snapshot active phaser beams for the renderer.
 
     Walks the PhaserSystem of every ship in the viewed frame; for each bank
     IsFiring()=1, yields the outer-shell + inner-core descriptor pair via
     _beam_descriptor_pair, endpoints in the viewed set's coordinates.
+    `memo` is the frame's shared _ViewMemo (made here when not given).
     """
     out = []
-    for ship, pSet, view in _ships_in_view(ships):
+    if memo is None:
+        memo = _ViewMemo()
+    if memo.view is None:
+        return out
+    view = memo.view
+    for ship in ships:
         sys_ = ship.GetPhaserSystem() if hasattr(ship, "GetPhaserSystem") else None
         if sys_ is None:
             continue
-        for i in range(sys_.GetNumWeapons()):
-            bank = sys_.GetWeapon(i)
-            if bank is None or not bank.IsFiring():
-                continue
+        banks = _firing_banks(sys_)
+        if not banks:
+            continue
+        pSet = memo.set_of(ship)
+        if pSet is None:
+            continue
+        for bank in banks:
             for d in _beam_pair_in_view(
                     _beam_descriptor_pair(ship, bank, ship_instances),
                     view, pSet, bank._target):
@@ -2393,7 +2664,7 @@ TRACTOR_BEAM_END_WIDTH_SCALE = 1.25
 TRACTOR_BEAM_BRIGHTNESS = 0.5
 
 
-def _build_tractor_beam_render_data(ships, ship_instances=None):
+def _build_tractor_beam_render_data(ships, ship_instances=None, memo=None):
     """Snapshot active tractor beams for the renderer.
 
     Mirrors _build_phaser_beam_render_data but walks each ship's
@@ -2407,18 +2678,26 @@ def _build_tractor_beam_render_data(ships, ship_instances=None):
     Tractor beams keep the emitter taper-in and normal body width, but flare the
     TARGET end out to TRACTOR_BEAM_END_WIDTH_SCALE × the body radius (the shader
     reads end_width_scale to make the target-end taper widen instead of pinch).
-    Frame-scoped exactly like the phaser builder (_ships_in_view).
+    Frame-scoped exactly like the phaser builder (_ViewMemo).
     """
     out = []
-    for ship, pSet, view in _ships_in_view(ships):
+    if memo is None:
+        memo = _ViewMemo()
+    if memo.view is None:
+        return out
+    view = memo.view
+    for ship in ships:
         sys_ = (ship.GetTractorBeamSystem()
                 if hasattr(ship, "GetTractorBeamSystem") else None)
         if sys_ is None:
             continue
-        for i in range(sys_.GetNumWeapons()):
-            bank = sys_.GetWeapon(i)
-            if bank is None or not bank.IsFiring():
-                continue
+        banks = _firing_banks(sys_)
+        if not banks:
+            continue
+        pSet = memo.set_of(ship)
+        if pSet is None:
+            continue
+        for bank in banks:
             for d in _beam_pair_in_view(
                     _beam_descriptor_pair(ship, bank, ship_instances),
                     view, pSet, bank._target):
@@ -2619,12 +2898,16 @@ def _resolve_asset_path(rel_path, root):
     cached = _ASSET_PATH_CACHE.get(key)
     if cached is not None:
         return cached
-    candidate = Path(root) / rel_path
+    base = Path(root)
+    candidate = _case_paths.resolve(base, str(rel_path)) or base / rel_path
     resolved = str(candidate)
     if not candidate.suffix and not candidate.exists():
         want = candidate.name.lower()
+        # The directory may be spelled in a different case too.
+        parent = (_case_paths.resolve(base, str(Path(rel_path).parent))
+                  or candidate.parent)
         try:
-            entries = list(candidate.parent.iterdir())
+            entries = list(parent.iterdir())
         except OSError:
             entries = []                      # no such directory: degrade, never raise
         for entry in entries:
@@ -2866,6 +3149,16 @@ from engine.cameras.dof import FocusSolver as _DofFocusSolver
 _focus_solver = _DofFocusSolver()
 
 
+def _drop_motion_vel(ship) -> None:
+    """Drop the motion law's velocity vector (``_motion_vel``) of a ship
+    something other than the law is moving, so the law re-seeds it along the
+    nose when it next flies the ship. Through the descriptor, so kernel M's
+    mirror drops it too; written only when one stands, so a long warp burst
+    or dash pushes once."""
+    if ship.__dict__.get("_motion_vel") is not None:
+        ship._motion_vel = None
+
+
 class _PlayerControl:
     """Keyboard-driven ship-transform integrator.
 
@@ -2888,8 +3181,10 @@ class _PlayerControl:
     FALLBACK_MAX_ACCEL  = 1.0e9  # effectively instant — preserves legacy semantics
     REVERSE_LEVEL       = -2
 
-    # Reverse magnitude as a fraction of MaxSpeed (BC convention: ¼ impulse).
-    REVERSE_FRACTION = 0.25
+    # Reverse magnitude as a fraction of MaxSpeed: 2/9 -- the reverse key is
+    # impulse level 2 of 9 backwards (measured on stbc.exe, stbc-oracle
+    # mechanics reference, Movement / Throttle).
+    REVERSE_FRACTION = 2.0 / 9.0
 
     def __init__(self, input_map=None):
         # Single source of truth for action → physical key.  Defaults to a
@@ -3025,6 +3320,8 @@ class _PlayerControl:
             cav.x = pitch_rate
             cav.z = -yaw_rate
             cav.y = -roll_rate
+            # In place: re-push the native combat mirror's copy.
+            _native_combat.push_field(player, "_current_angular_velocity")
         if not (pitch_rate or yaw_rate or roll_rate):
             return
         R = player.GetWorldRotation()
@@ -3092,6 +3389,8 @@ class _PlayerControl:
             cav.x = self._current_pitch_rate
             cav.z = -self._current_yaw_rate
             cav.y = -self._current_roll_rate
+            # In place: re-push the native combat mirror's copy.
+            _native_combat.push_field(player, "_current_angular_velocity")
 
     def _sync_control_from_ship(self, player) -> None:
         """AI → manual handoff: resume player control from the ship's actual
@@ -3099,10 +3398,21 @@ class _PlayerControl:
         velocity projected onto ship-forward (manual flight is always along
         facing); angular rates map through the yaw/roll negation (see the
         section comment above). The AI's setpoints are cleared so
-        _step_ship_motion disengages and stops double-driving the ship."""
-        fwd = player.GetWorldRotation().GetCol(1)
-        v = player.GetVelocity()
-        self._current_speed = v.x * fwd.x + v.y * fwd.y + v.z * fwd.z
+        _step_ship_motion disengages and stops double-driving the ship.
+
+        While the motion law's vector (``_motion_vel``) stands, the speed is
+        ITS speed, ``[3]``, so the helm's next step_vector_velocity trusts
+        the vector (the re-seed contract): a ship taken over mid-turn keeps
+        its course lag instead of snapping onto the nose at |v| cos(lag).
+        With no vector (never stepped, or dropped by a warp or a dash) it is
+        the published velocity on the nose, as before the motion law."""
+        mv = player.__dict__.get("_motion_vel")
+        if type(mv) is tuple and len(mv) == 4:
+            self._current_speed = mv[3]
+        else:
+            fwd = player.GetWorldRotation().GetCol(1)
+            v = player.GetVelocity()
+            self._current_speed = v.x * fwd.x + v.y * fwd.y + v.z * fwd.z
         cav = getattr(player, "_current_angular_velocity", None)
         if cav is not None:
             self._current_pitch_rate = cav.x
@@ -3145,7 +3455,20 @@ class _PlayerControl:
         # speed (or hold at 0 during align) along the current warp-aligned
         # heading, ignoring throttle/input so the ship can't be steered mid-warp
         # and there's a single motion path (no double-translate).
+        #
+        # Every exit below that moves (or leaves) the player without the
+        # motion law (step_vector_velocity) records no thrust
+        # (ship_motion._no_thrust): the motion stage writes nothing for the
+        # setpoint-less player, so the helm's last law step would otherwise
+        # stand in GetAccelerationTG (FireScript's 0.5*a*t^2 lead).
+        #
+        # The same exits drop the law's velocity vector (_drop_motion_vel):
+        # the warp burst and a dash move the ship on their own, so the vector
+        # would still hold the course flown before them, at a speed nothing
+        # rewrote (the re-seed contract, ship_motion.step_vector_velocity).
         if self._warp_speed_override is not None:
+            _no_thrust(player)
+            _drop_motion_vel(player)
             s = float(self._warp_speed_override)
             self._current_speed = s
             if s != 0.0:
@@ -3161,6 +3484,8 @@ class _PlayerControl:
         # nothing -- except full stop, which drops out at rest.
         from engine.appc import dash
         if dash.is_dashing(player):
+            _no_thrust(player)
+            _drop_motion_vel(player)
             self._dash_owned = True
             self._manual_throttle_nudge = False
             if h.key_pressed(self._input_map.code("full_stop")):
@@ -3273,6 +3598,7 @@ class _PlayerControl:
             p = player.GetTranslate()
             player.SetTranslateXYZ(p.x + d.x * dt, p.y + d.y * dt, p.z + d.z * dt)
             player.SetVelocity(TGPoint3(d.x, d.y, d.z))
+            _no_thrust(player)
             return
 
         # ── Powered flight: clear drift, re-seed speed ──────────────────
@@ -3282,28 +3608,23 @@ class _PlayerControl:
 
         em = _effective_motion(player)
 
-        # Linear ramp toward (capped) target.
+        # Linear target (capped); integrated below on the velocity vector.
         commanded = self.GetTargetSpeed(player)
         if em.has_linear:
             target_speed = _cap_keep(commanded, self._current_speed, em.max_speed)
             accel = em.max_accel if em.max_accel > 0.0 else self.FALLBACK_MAX_ACCEL
-            linear_step = _asymptote_step(accel, target_speed - self._current_speed, dt)
         else:
             target_speed = commanded
-            linear_step = self.FALLBACK_MAX_ACCEL * dt
-        self._current_speed = self._ramp_toward(
-            self._current_speed, target_speed, linear_step,
-        )
+            accel = self.FALLBACK_MAX_ACCEL
 
         # Angular: held keys → per-axis target rate, capped + ramped.
         # W=nose DOWN S=nose UP A=yaw LEFT D=yaw RIGHT Q=roll LEFT E=roll RIGHT
         if em.has_angular:
             ang_rate = em.max_ang_vel
             aa = em.max_ang_accel if em.max_ang_accel > 0.0 else self.FALLBACK_MAX_ACCEL
-            ang_step = aa * dt
         else:
             ang_rate = self.TURN_RATE_RAD_PER_S
-            ang_step = self.FALLBACK_MAX_ACCEL * dt
+            aa = self.FALLBACK_MAX_ACCEL
         pitch_target = 0.0; yaw_target = 0.0; roll_target = 0.0
         im = self._input_map
         if h.key_state(im.code("pitch_down")): pitch_target -= ang_rate
@@ -3312,28 +3633,46 @@ class _PlayerControl:
         if h.key_state(im.code("yaw_right")):  yaw_target   += ang_rate
         if h.key_state(im.code("roll_left")):  roll_target  += ang_rate
         if h.key_state(im.code("roll_right")): roll_target  -= ang_rate
+        # BC's TurnShip (TacticalInterfaceHandlers) unitizes the sum of the
+        # held keys' axes before SetTargetAngularVelocityFraction: two keys at
+        # once (a diagonal) turn at 1/sqrt(2) of the rate on each axis, three
+        # at 1/sqrt(3) -- the turn's total rate is the ship's max either way.
+        _mag = _math.sqrt(pitch_target * pitch_target + yaw_target * yaw_target
+                         + roll_target * roll_target)
+        if _mag > ang_rate > 0.0:
+            _k = ang_rate / _mag
+            pitch_target *= _k; yaw_target *= _k; roll_target *= _k
         if em.has_angular:
             pitch_target = _cap_keep(pitch_target, self._current_pitch_rate, em.max_ang_vel)
             yaw_target   = _cap_keep(yaw_target,   self._current_yaw_rate,   em.max_ang_vel)
             roll_target  = _cap_keep(roll_target,  self._current_roll_rate,  em.max_ang_vel)
-        self._current_pitch_rate = self._ramp_toward(self._current_pitch_rate, pitch_target, ang_step)
-        self._current_yaw_rate   = self._ramp_toward(self._current_yaw_rate,   yaw_target,   ang_step)
-        self._current_roll_rate  = self._ramp_toward(self._current_roll_rate,  roll_target,  ang_step)
+        # BC eases into and out of turns with the impulse law (capped at
+        # MaxAngularAccel, then tau = 1 s) -- ship_motion's angular ramp. A
+        # ship with no authored limits keeps the legacy instant response.
+        # The law acts on the rate VECTOR: a diagonal's total rate eases in
+        # like a single axis (measured, motion3).
+        (self._current_pitch_rate, self._current_yaw_rate,
+         self._current_roll_rate) = law_step_vector(
+            (self._current_pitch_rate, self._current_yaw_rate, self._current_roll_rate),
+            (pitch_target, yaw_target, roll_target),
+            aa if em.has_angular else self.FALLBACK_MAX_ACCEL, dt)
         # Rotation integration (R · D body-frame delta; see CLAUDE.md).
         self._apply_body_rotation(
             player, self._current_pitch_rate, self._current_yaw_rate,
             self._current_roll_rate, dt,
         )
 
-        # Position integration (powered: velocity follows facing).
-        # Publish world velocity unconditionally so GetVelocity() is
-        # authoritative for the collision system (zero when stationary).
+        # Position integration: BC's impulse law on the velocity VECTOR
+        # (ship_motion.step_vector_velocity), so the course lags the nose in
+        # a turn and the speed bleeds, as measured. Publish world velocity
+        # unconditionally so GetVelocity() is authoritative for the
+        # collision system (zero when stationary).
         forward = player.GetWorldRotation().GetCol(1)
-        vx = forward.x * self._current_speed
-        vy = forward.y * self._current_speed
-        vz = forward.z * self._current_speed
+        vx, vy, vz, self._current_speed = step_vector_velocity(
+            player, forward, self._current_speed, target_speed, accel, dt,
+            snap=not em.has_linear)
         player.SetVelocity(TGPoint3(vx, vy, vz))
-        if self._current_speed != 0.0:
+        if vx or vy or vz:
             p = player.GetTranslate()
             player.SetTranslateXYZ(p.x + vx * dt, p.y + vy * dt, p.z + vz * dt)
 
@@ -3845,6 +4184,19 @@ def _bridge_clock_dt(editor, player_dt, frame_dt):
     it is open, else the paused-aware player dt."""
     fn = getattr(editor, "preview_dt", None)
     return player_dt if fn is None else fn(player_dt, frame_dt)
+
+
+def _bridge_texture_time(offset, game_time, editor, bridge_dt):
+    """The clock bridge textures play on (flipbooks and Lottie panels): game
+    time, plus every preview-clock step taken while the Bridge Editor was
+    open. The editor freezes the sim, so game time alone would stop every
+    panel the moment it opens; its preview clock (0 when paused) keeps them
+    playing. `offset` is a one-element box that only grows, so closing the
+    editor never steps the clock back. Never opened: exactly game time."""
+    fn = getattr(editor, "preview_alert", None)
+    if fn is not None and fn() is not None:
+        offset[0] += bridge_dt
+    return game_time + offset[0]
 
 
 def _bridge_camera_pose(editor, bridge_camera, shake):
@@ -4776,7 +5128,8 @@ def _reset_action_registry(keep=None) -> None:
 
 
 def _reset_session_scratch() -> None:
-    """The crew-speech channel, live ObjectGroups and the tooltip throttle."""
+    """The crew-speech channel, live ObjectGroups, the tooltip and hit-sound
+    throttles and the presentation generator."""
     # Clear the global crew-speech channel so a line still "live" at swap
     # time can't suppress the next mission's first SpeakLine. The subtitle
     # crew slot itself is cleared transitively by reset_for_tests (it
@@ -4806,6 +5159,15 @@ def _reset_session_scratch() -> None:
     _tooltip_dispatch_state["last"] = -1e9
     from engine.appc.characters import CharacterClass_SetCurrentToolTipOwner
     CharacterClass_SetCurrentToolTipOwner(None)
+    # The hit-sound edge stamps: the same game-time hazard (they compare the
+    # new clock against the old mission's stamps) and the recycled-id() one
+    # (a new ship at a dead one's address inherits its stamp): either would
+    # silence a new ship's first hits.
+    hit_feedback.reset_audio_throttle()
+    # The presentation generator starts every mission alike (ruling R3), so
+    # a capture of a mission looks the same whatever ran before it.
+    from engine.appc import presentation_rng
+    presentation_rng.reset()
 
 
 def _reset_missionlib_state() -> None:
@@ -4842,6 +5204,23 @@ def _reset_system_loader_state() -> None:
         system_loader.reset()
     except Exception as _e:
         dev_mode.log_swallowed("system_loader.reset on swap", _e)
+    # A home station destroyed in the old mission stands again in the new one.
+    try:
+        from engine.systems import home_stations
+        home_stations.reset()
+    except Exception as _e:
+        dev_mode.log_swallowed("home_stations.reset on swap", _e)
+    try:
+        from engine.systems import shuttle_service
+        shuttle_service.reset()
+    except Exception as _e:
+        dev_mode.log_swallowed("shuttle_service.reset on swap", _e)
+    # Hostility (and the hit counts behind it) belongs to the old mission.
+    try:
+        from engine.systems import station_hostility
+        station_hostility.reset()
+    except Exception as _e:
+        dev_mode.log_swallowed("station_hostility.reset on swap", _e)
     _mapped_body_warned.clear()
 
 
@@ -4961,8 +5340,9 @@ def _init_episode_context(episode, mission_module_name: str) -> None:
     the episode DB is never set and goals fall back to raw string ids
     (``E1DestroyDebrisGoal`` instead of ``Clear Debris``). We restore just the DB
     by deriving its path (see _episode_tgl_path) and loading it — no episode
-    Initialize, so none of its side effects (music, sound, event-handler,
-    real-bridge-module imports) leak into the process. Best-effort: a missing or
+    Initialize, so none of its side effects (sound, event-handler,
+    real-bridge-module imports) leak into the process; its music alone is
+    set up, by _init_campaign_music. Best-effort: a missing or
     unreadable TGL leaves goals labelled by raw id and never blocks the load."""
     path = _episode_tgl_path(mission_module_name)
     if path is None:
@@ -4974,6 +5354,33 @@ def _init_episode_context(episode, mission_module_name: str) -> None:
             episode.SetDatabase(db)
     except Exception as e:
         dev_mode.log_swallowed("episode DB init", e)
+
+
+def _init_campaign_music(game, mission_module_name: str) -> None:
+    """Start the campaign's music for a mission loaded directly.
+
+    BC's Game.LoadEpisode runs the campaign module's Initialize, whose
+    SetupMusic(pGame) is DynamicMusic.Initialize (the track list, the music
+    state machine and its game event hooks), then the episode's Initialize,
+    whose SetupMusic() swaps in that episode's tracks. Both run before the
+    mission's Initialize, which may already steer the music. The dev loader
+    skips that cascade (see _init_episode_context), which left every mission
+    started from the picker or DAUNTLESS_MISSION silent. Only the two
+    SetupMusic calls run here, not either Initialize: the campaign's through
+    mission_change._ensure_campaign_music (a no-op once DynamicMusic is
+    initialized), then the episode's. Best-effort."""
+    from engine.core import mission_change
+    episode_name = mission_change.episode_module_for(mission_module_name)
+    if episode_name is None:
+        return
+    import importlib
+    try:
+        mission_change._ensure_campaign_music(game, episode_name)
+        episode = importlib.import_module(episode_name)
+        if hasattr(episode, "SetupMusic"):
+            episode.SetupMusic()
+    except Exception as e:
+        dev_mode.log_swallowed("campaign music init", e)
 
 
 def _init_mission(mission_module_name: str):
@@ -5006,6 +5413,7 @@ def _init_mission(mission_module_name: str):
     # the episode cascade that BC's Game.LoadEpisode would run.
     _init_campaign_context(game, mission_module_name)
     _init_episode_context(episode, mission_module_name)
+    _init_campaign_music(game, mission_module_name)
 
     # Import through sensor_mission_guards.install_after_import, not a raw
     # importlib.import_module: reset_sdk_globals's call (above, via
@@ -6308,11 +6716,12 @@ def _model_sphere_radius_from_aabb(center: tuple, half_extents: tuple) -> float:
     radius (and the NIF's authored bound_radius).
 
     This is the correct divisor for planet/moon render scaling: BC computes
-    render_scale = GetRadius() / NIF_bound_radius, so the model draws at
-    exactly GetRadius() game units. `_model_extent_from_aabb` returns the AABB
+    render_scale = base radius / NIF_bound_radius, so the model draws at
+    exactly the base radius in game units (GetBaseRadius(); GetRadius() is
+    that times GetScale(), 1 for a planet). `_model_extent_from_aabb` returns the AABB
     *corner* distance instead (|half| = R·√3 for a sphere), which is ~1.73×
-    too large and shrinks the planet to GetRadius()/√3. See
-    docs/instrumented_experiments/2026-07-07-planet-render-scale.md.
+    too large and shrinks the planet to its base radius/√3. See
+    docs/reference/instrumented_experiments/2026-07-07-planet-render-scale.md.
 
     All stock planet/moon NIFs are origin-centred spheres, so max-half-extent
     is exact here; it is not a general model radius."""
@@ -6330,9 +6739,10 @@ def _seed_ship_radius(ship, extent: float, sphere_radius: float) -> None:
     gets its bounding-sphere radius (`sphere_radius`, the planets' divisor,
     _model_sphere_radius_from_aabb): its sphere IS its surface, collisions
     apply no shrink to it, and the corner distance is ~1.7x too big for a
-    roughly spherical mesh. Both are unscaled: the collision and hit code
-    multiply by GetScale() (collisions.world_radius)."""
-    if ship.GetRadius() > 0.0:
+    roughly spherical mesh. Both are written as the BASE radius (SetRadius /
+    GetBaseRadius()), at GetScale() == 1; GetRadius() is that times the live
+    scale (collisions.world_radius)."""
+    if ship.GetBaseRadius() > 0.0:
         return
     from engine.rocks.rock import is_rock
     r = sphere_radius if is_rock(ship) else extent
@@ -6391,8 +6801,8 @@ def _ship_world_matrix(ship, natural_scale: float) -> list:
     """Row-major TRS mat4 for a ship.
 
     Two-layer scaling:
-      natural_scale  — load-time GetRadius() / NIF_extent, makes the rendered
-                       outer radius match BC's GetRadius() reading by default.
+      natural_scale  — load-time base radius / NIF_extent, makes the rendered
+                       outer radius match the base radius by default.
       ship.GetScale()— per-frame multiplier applied by SDK scripts
                        (DockWithStarbase, asteroid systems, etc.).
 
@@ -6447,19 +6857,6 @@ def _bind_store_transform(session, obj, iid, scale: float) -> bool:
     return True
 
 
-def _unbind_store_transform(session, obj, iid) -> None:
-    """Restore the explicit-matrix path for `iid`. No-op when unbound.
-
-    Needed whenever an object's rendered pose stops being its live store pose
-    — the player handing the helm to an AI (rendered interpolated), for
-    instance. Leaving it bound would let the per-frame store sweep overwrite
-    the pushed matrix.
-    """
-    if session.slot_bindings.pop(obj, None) is None:
-        return
-    host_io.set_instance_transform_slot(iid, -1, 0, 1.0)
-
-
 def _apply_live_world_transform(renderer_, session, obj, iid,
                                 natural_scale: float) -> None:
     """Point `iid` at `obj`'s LIVE world transform (no render interpolation).
@@ -6490,7 +6887,7 @@ class MissionSession:
     manager (which is itself about to be cleared).
     """
     mission_name: str
-    ship_instances:   dict[Any, int] = field(default_factory=dict)
+    ship_instances:   dict[Any, int] = field(default_factory=TrackedInstances)
     # Subsystem glow-dimming controllers, keyed by render instance id.
     # Best-effort VFX; ships without the relevant subsystems get fewer regions.
     ship_glow_controllers: dict[int, Any] = field(default_factory=dict)
@@ -6508,7 +6905,8 @@ class MissionSession:
     ship_running_light_specs: dict[object, tuple] = field(default_factory=dict)
     ship_emitters: dict[object, list] = field(default_factory=dict)  # keyed by the renderer InstanceId (not int): the value is passed straight through as each light's instance_id
     planet_instances: dict[Any, int] = field(default_factory=dict)
-    # Per-planet natural_scale = GetRadius() / NIF_extent, cached at load.
+    # Per-planet natural_scale = base radius (GetBaseRadius()) / NIF_extent,
+    # cached at load.
     # Ships share a single flat NIF→world scale (BC_MODEL_SCALE) so they
     # need no per-object cache; planets vary in size class and still use
     # the GetRadius-derived per-object scale.
@@ -6518,6 +6916,16 @@ class MissionSession:
     # re-bind guard — the binding itself lives on the native instance — so the
     # per-frame path can skip the boundary crossing when nothing changed.
     slot_bindings: dict[Any, tuple] = field(default_factory=dict)
+    # Last self-illumination scale sent per ship instance id -- a re-push
+    # guard like slot_bindings, so a steady hull costs no boundary crossing.
+    emissive_scales: dict[Any, float] = field(default_factory=dict)
+    # Last SIM source sent per ship instance id -- (index, generation, scale,
+    # view_offset) -- a re-push guard like slot_bindings (_push_sim_source).
+    sim_sources: dict[Any, tuple] = field(default_factory=dict)
+    # Ship instance ids tracked + composed by the native interpolation buffer
+    # -> whether each is drawn live (the manually flown player) -- a guard
+    # like sim_sources (_set_interp_mode).
+    interp_modes: dict[Any, bool] = field(default_factory=dict)
     # Last articulation pose PUSHED per render instance id -- a tuple of
     # per-part pose 6-tuples, one per rigged part -- a re-push guard only,
     # exactly like slot_bindings. The authoritative pose lives on the ship
@@ -6574,6 +6982,9 @@ class MissionSession:
         # The bindings themselves died with the instances above; drop the
         # re-bind guard so a recycled object cannot look already-bound.
         self.slot_bindings.clear()
+        self.emissive_scales.clear()
+        self.sim_sources.clear()
+        self.interp_modes.clear()
         self.player = None
 
 
@@ -6670,6 +7081,42 @@ def _mark_rigged(r_, iid, ship) -> None:
             r_.set_instance_rigged(iid, True)
     except Exception as _e:
         dev_mode.log_swallowed("flag rigged instance", _e)
+
+
+def _push_sim_source(session, ship, iid, scale: float, view_offset) -> None:
+    """Give `iid` its SIM source (phase 3a): `ship`'s transform-store slot,
+    uniform `scale` (model scale x GetScale()) and VIEW offset (None = the
+    viewed set). Gameplay point queries then read the simulation pose, not
+    the drawn one. Sent only when the value changes; a ship with no store
+    slot, or no native instance (headless, a plain-int iid), sends nothing."""
+    handle = getattr(ship, "_xform", None)
+    if handle is None:
+        return
+    off = (0.0, 0.0, 0.0) if view_offset is None else tuple(view_offset)
+    want = (handle[0], handle[1], scale, off)
+    last = session.sim_sources.get(iid)
+    if last == want:
+        return
+    if host_io.set_instance_sim_source(iid, handle[0], handle[1], scale, off):
+        session.sim_sources[iid] = want
+        # Snapshots are keyed by iid: a new slot under a tracked iid must not
+        # blend across the two objects' poses.
+        if (last is not None and last[:2] != want[:2]
+                and iid in session.interp_modes):
+            host_io.interp_snap(iid)
+
+
+def _mark_sim_source(session, ship, iid, model_scale: float) -> None:
+    """Realize-time sim source for a new ship instance, so its first hit test
+    already reads the sim pose. ONE helper for BOTH realize sites, right
+    after _mark_rigged. Always pushes: a recycled iid must not look sourced."""
+    session.sim_sources.pop(iid, None)
+    try:
+        _ps = float(ship.GetScale())
+    except Exception:
+        _ps = 1.0
+    _push_sim_source(session, ship, iid, model_scale * _ps,
+                     _frames.view_offset(_frames.containing_set(ship)))
 
 
 def _runtime_ship_model_source(ship, *, verbose: bool = False):
@@ -6874,6 +7321,8 @@ def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
         _prefetch_hull_damage_state(r_, handle)
         _prewarm_trace_accel(r_, handle)
         _mark_rigged(r_, iid, ship)
+        _mark_sim_source(session, ship, iid, BC_MODEL_SCALE)
+        _sync_ship_articulation(session, ship, iid)
         render_instances.register(ship, iid)
         # Fresnel rim applies to ship hulls only — planets share the opaque
         # shader and must stay rim-free (default ineligible).
@@ -6934,14 +7383,14 @@ def realize_set_objects(session, pSet, renderer, *, verbose: bool = False,
         if loaded is None:
             continue
         handle, extent, sphere_radius = loaded
-        if planet.GetRadius() <= 0.0:
+        if planet.GetBaseRadius() <= 0.0:
             try:
                 planet.SetRadius(extent * BC_MODEL_SCALE)
             except Exception as _e:
                 dev_mode.log_swallowed("realize planet.SetRadius fallback", _e)
-        radius = planet.GetRadius()
+        radius = planet.GetBaseRadius()
         # Divide by the bound-sphere radius (BC's render_scale divisor), not the
-        # AABB corner, so the planet draws at exactly GetRadius() game units.
+        # AABB corner, so the planet draws at exactly its radius in game units.
         natural_scale = (radius / sphere_radius) if sphere_radius > 0.0 else 1.0
         iid = r_.create_instance(handle)
         _apply_planet_atmosphere(r_, iid, pSet.GetName(), planet.GetName(),
@@ -7229,10 +7678,17 @@ def _sync_player_identity(session, on_player_change=None) -> None:
     player yet.
 
     The scene reconcile's player tail, split out because the reconcile runs
-    AFTER the sim: the host loop also calls this ahead of the sim, so on a
-    RecreatePlayer tick input, weapons, combat and the warp FSM drive the new
-    ship rather than the destroyed one (system-frames Plan 3, Ruling 11;
-    order guarded by tests/host/test_scene_reconcile_ordering.py)."""
+    AFTER the sim. The host loop also calls it twice before that, in
+    _run_frame_sim (system-frames Plan 3, Ruling 11; native motion phase 4,
+    ruling 2): at frame start, so a frame-start RecreatePlayer (QuickBattle's
+    preload-done spawn) has input, the fire keys and the frame's whole ticks
+    drive the new ship rather than the destroyed one; and after the ticks,
+    so a RecreatePlayer inside a tick (an SDK timer) reaches the post-tick
+    pass (sensor contacts, crew prompts, dash, hand-off) that same frame.
+    Inside the ticks combat keeps the frame-start player, which it uses only
+    for the render push (the host passes push_render_data=False). Order
+    guarded by tests/host/test_scene_reconcile_ordering.py and
+    tests/integration/test_whole_ticks.py."""
     game = Game_GetCurrentGame()
     new_player = game.GetPlayer() if game is not None else None
     if new_player is not None and new_player is not session.player:
@@ -7570,6 +8026,108 @@ def _sync_quick_battle_panel(controller) -> None:
         panel.close()
 
 
+def reset_mission_state(renderer=None) -> None:
+    """Forget the outgoing mission's module-level state: ships, effects,
+    damage records, rocks, Quick Battle bookkeeping, camera-derived state.
+
+    ONE list, shared by the mission swap (HostController._drain_pending_swap,
+    with the live renderer) and the per-test reset in tests/conftest.py
+    (renderer None: nothing is drawn, so only the registries are emptied).
+    Before 2026-11-06 the test reset hand-mirrored this list and had
+    drifted 15 entries behind it; ship_lifecycle._live and
+    registry_texture._pending among them kept every ship any test built
+    alive to the end of the run (the full suite peaked at 4.3 GB; see
+    docs/reference/architecture/test-suite-memory.md). Add a new
+    mission-scoped registry HERE, never in only one of the two callers.
+    """
+    from engine.appc import ship_lifecycle
+    ship_lifecycle.reset()
+    # Effects held for the tick boundary name the old mission's ships.
+    _effect_queue.reset()
+    from engine.appc import ship_death
+    ship_death.reset()
+    from engine.rocks import death as _rock_death
+    _rock_death.reset()
+    from engine.appc import debris_chunk as _debris_chunk
+    _debris_chunk.clear(renderer)
+    from engine.rocks import minors as _minors
+    _minors.reset(renderer)
+    from engine.rocks import promotion as _promotion
+    _promotion.reset(renderer)
+    _far_tier.reset(renderer)
+    from engine.rocks import minor_contact as _minor_contact
+    _minor_contact.reset()
+    from engine.rocks import scenery_contact as _scenery_contact
+    _scenery_contact.reset()
+    from engine.appc import hull_breakup as _hull_breakup
+    _hull_breakup.reset()
+    _explosion_lights.reset()
+    from engine.appc import object_lifetime
+    object_lifetime.reset()
+    from engine.appc import subsystem_cascade
+    subsystem_cascade.reset()
+    from engine.appc import warp_core_breach
+    warp_core_breach.reset()
+    from engine.appc import visible_damage
+    visible_damage.reset()
+    from engine.appc import internal_blast            # SPIKE (damage redesign)
+    internal_blast.reset()
+    from engine.appc import registry_texture
+    registry_texture.reset()
+    from engine.appc import shockwaves
+    shockwaves.reset()
+    from engine.appc import warp_in_flash as _warp_in_flash
+    _warp_in_flash.reset()
+    # Quick Battle late arrivals: pending orders and the cached event
+    # type (the event-type counter restarts at 1200 on a swap).
+    from engine.quickbattle import late_arrivals as _qb_late
+    _qb_late.reset()
+    # The Objectives buttons' click event type, cached for the same reason.
+    from engine.appc import mission_goals as _mission_goals
+    _mission_goals.reset()
+    # Blind-warp parked marks (engine/appc/warp.py): the swap deletes the
+    # warp set with every other set.
+    from engine.appc import warp as _warp_parked
+    _warp_parked.forget_parked_blind()
+    # The running battle's real-object snapshot: the swap deletes every
+    # region set, so a later EndSimulation must not rebuild them.
+    from engine.quickbattle import sim_restore as _qb_sim_restore
+    _qb_sim_restore.reset()
+    from engine.quickbattle import battle_end as _qb_end
+    _qb_end.reset()
+    from engine.ui import target_markers as _target_markers
+    _target_markers.clear()
+    from engine.appc import particles
+    particles.reset()
+    damage_eligibility.reset()
+    # The decal emission throttle is keyed by id(ship), and id() is a
+    # RECYCLED address: a dead ship's entry is inherited by whatever lands
+    # at that address next, which silently suppresses the new ship's
+    # first decal.
+    hit_feedback._last_decal_emit.clear()
+    from engine.appc import hull_wear
+    hull_wear.reset()
+    from engine.appc import hull_hit_smoke
+    hull_hit_smoke.reset()
+    from engine.appc import damage_geometry
+    damage_geometry.reset()
+    # The dynamic-light distance gate's camera eye belongs to the mission
+    # that solved it. The next mission's ships spawn wherever its sets put
+    # them, so a carried-over eye can cull their lights on the first frame,
+    # before the new camera solves. None reads as "no camera known" — the
+    # gate stays inert until the render path writes a real one.
+    _note_camera_eye(None)
+    # Same hazard, the other camera-derived state: the depth-of-field lens
+    # belongs to the mission that racked it. Swap with a target held and
+    # blend == 1.0, and if the new mission selects a target on load --
+    # common in episode openers -- _inv_focus is still > 0, so the solver
+    # eases rather than snaps: the opening frames render at full blend
+    # focused at the PREVIOUS mission's distance. reset_focus() drops the
+    # rack and the engagement but KEEPS the nudged lens strengths, which
+    # are per-session dev tuning rather than mission state.
+    _focus_solver.reset_focus()
+
+
 class HostController:
     """Per-process state for the running renderer + a single mission.
 
@@ -7656,75 +8214,12 @@ class HostController:
                       f"{type(e).__name__}: {e}", flush=True)
         if self.session is not None:
             self.session.teardown(self.renderer)
-        from engine.appc import ship_lifecycle
-        ship_lifecycle.reset()
-        from engine.appc import ship_death
-        ship_death.reset()
-        from engine.rocks import death as _rock_death
-        _rock_death.reset()
-        from engine.appc import debris_chunk as _debris_chunk
-        _debris_chunk.clear(self.renderer)
-        from engine.rocks import minors as _minors
-        _minors.reset(self.renderer)
-        from engine.rocks import promotion as _promotion
-        _promotion.reset(self.renderer)
-        _far_tier.reset(self.renderer)
-        from engine.rocks import minor_contact as _minor_contact
-        _minor_contact.reset()
-        from engine.rocks import scenery_contact as _scenery_contact
-        _scenery_contact.reset()
-        from engine.appc import hull_breakup as _hull_breakup
-        _hull_breakup.reset()
-        _explosion_lights.reset()
-        from engine.appc import object_lifetime
-        object_lifetime.reset()
-        from engine.appc import subsystem_cascade
-        subsystem_cascade.reset()
-        from engine.appc import warp_core_breach
-        warp_core_breach.reset()
-        from engine.appc import visible_damage
-        visible_damage.reset()
-        from engine.appc import internal_blast            # SPIKE (damage redesign)
-        internal_blast.reset()
-        from engine.appc import registry_texture
-        registry_texture.reset()
-        from engine.appc import shockwaves
-        shockwaves.reset()
-        from engine.appc import warp_in_flash as _warp_in_flash
-        _warp_in_flash.reset()
-        # Quick Battle late arrivals: pending orders and the cached event
-        # type (the event-type counter restarts at 1200 on a swap).
-        from engine.quickbattle import late_arrivals as _qb_late
-        _qb_late.reset()
-        from engine.appc import particles
-        particles.reset()
-        damage_eligibility.reset()
-        # The decal emission throttle is keyed by id(ship), and id() is a
-        # RECYCLED address: a dead ship's entry is inherited by whatever lands
-        # at that address next, which silently suppresses the new ship's
-        # first decal.
-        hit_feedback._last_decal_emit.clear()
-        from engine.appc import hull_wear
-        hull_wear.reset()
-        from engine.appc import hull_hit_smoke
-        hull_hit_smoke.reset()
-        from engine.appc import damage_geometry
-        damage_geometry.reset()
-        # The dynamic-light distance gate's camera eye belongs to the mission
-        # that solved it. The next mission's ships spawn wherever its sets put
-        # them, so a carried-over eye can cull their lights on the first frame,
-        # before the new camera solves. None reads as "no camera known" — the
-        # gate stays inert until the render path writes a real one.
-        _note_camera_eye(None)
-        # Same hazard, the other camera-derived state: the depth-of-field lens
-        # belongs to the mission that racked it. Swap with a target held and
-        # blend == 1.0, and if the new mission selects a target on load --
-        # common in episode openers -- _inv_focus is still > 0, so the solver
-        # eases rather than snaps: the opening frames render at full blend
-        # focused at the PREVIOUS mission's distance. reset_focus() drops the
-        # rack and the engagement but KEEPS the nudged lens strengths, which
-        # are per-session dev tuning rather than mission state.
-        _focus_solver.reset_focus()
+        # The native combat step scan holds the old mission's ships_list.
+        _native_combat.clear_step()
+        # Frees and off-main pushes still pending land now, before the next
+        # mission builds a row (spec 2026-11-03 ruling R2).
+        _native_combat.drain()
+        reset_mission_state(self.renderer)
         reset_sdk_globals()
         # A mission swap mid-warp would otherwise leak the WarpVFX manager
         # (reset_sdk_globals zeroes the timer manager, cancelling the pending
@@ -7895,6 +8390,28 @@ class _MissionLoader:
         from engine.quickbattle import spawn as _qb_spawn
         _bs.set_player_type_resolver(_qb_spawn.player_type_for_recreate)
         _bs.install_quickbattle_hook(_QB, self._c.bridge_pins)
+        # Owned objects (home stations) stay in their own set when BC's
+        # ChangeRegion moves the player's ships. Installed BEFORE spawn's
+        # hooks so spawn's idempotency marker stays on the outermost wrapper.
+        from engine.quickbattle import sim_restore as _qb_sim_restore
+        _qb_sim_restore.install(_QB)
+        # Stations the player turned hostile go home when a battle starts or
+        # ends. Also after sim_restore and before spawn's hooks, so spawn's
+        # idempotency marker stays on the outermost wrapper.
+        from engine.systems import station_hostility as _station_hostility
+        _station_hostility.install(_QB)
+        # A player's death in free roam is final: no RecreatePlayer. Before
+        # spawn's hooks too.
+        from engine.quickbattle import free_roam_death as _free_roam_death
+        _free_roam_death.install(_QB)
+        # A battle is a simulation for the Tau Ceti shuttles too: what it
+        # damaged or destroyed comes back docked. Before spawn's hooks.
+        from engine.systems import shuttle_service as _shuttle_service
+        _shuttle_service.install(_QB)
+        # Free roam docks at Starbase 12 with BC's defaults (repairs on), not
+        # whatever the last campaign mission left in the cached Starbase12_S.
+        from engine.systems import home_stations as _home_stations
+        _home_stations.free_roam_docking_defaults()
         # Our GenerateShips (the setup screen's BattlePlan), plus the radius
         # seeder it runs before placement: nothing is realised at
         # GenerateShips time, so every ship would otherwise report radius 0.
@@ -7902,6 +8419,10 @@ class _MissionLoader:
         # Late groups (warp-in delay): EndSimulation cancels their pending
         # arrivals -- End Combat, Restart and the end-of-battle timer alike.
         _qb_spawn.install_end_simulation_hook(_QB)
+        # Battle end (victory spec §4.1): ShipDestroyed and the win/lose
+        # sequences, so the Victory and Defeat condition stacks can end the battle.
+        from engine.quickbattle import battle_end as _qb_end
+        _qb_end.install(_QB)
         _qb_spawn.set_radius_fn(self._seed_quickbattle_ship_radius)
 
         import QuickBattle.QuickBattleGame as _QBGame
@@ -8041,7 +8562,7 @@ class _MissionLoader:
             the next ship of the class.
 
         Rocks take the sphere radius, via _seed_ship_radius's own rule."""
-        if ship is None or ship.GetRadius() > 0.0:
+        if ship is None or ship.GetBaseRadius() > 0.0:
             return
         src = _runtime_ship_model_source(ship, verbose=self._verbose)
         if src is None:
@@ -8138,6 +8659,8 @@ class _MissionLoader:
             _prefetch_hull_damage_state(r_, handle)
             _prewarm_trace_accel(r_, handle)
             _mark_rigged(r_, iid, ship)
+            _mark_sim_source(sess, ship, iid, BC_MODEL_SCALE)
+            _sync_ship_articulation(sess, ship, iid)
             render_instances.register(ship, iid)
             # Fresnel rim applies to ship hulls only — planets share the
             # opaque shader and must stay rim-free (default ineligible).
@@ -8209,14 +8732,14 @@ class _MissionLoader:
             if loaded is None:
                 continue
             handle, extent, sphere_radius = loaded
-            if planet.GetRadius() <= 0.0:
+            if planet.GetBaseRadius() <= 0.0:
                 try:
                     planet.SetRadius(extent * BC_MODEL_SCALE)
                 except Exception as _e:
                     dev_mode.log_swallowed("planet.SetRadius fallback", _e)
-            radius = planet.GetRadius()
+            radius = planet.GetBaseRadius()
             # Divide by the bound-sphere radius (BC's render_scale divisor), not
-            # the AABB corner, so the planet draws at exactly GetRadius() GU.
+            # the AABB corner, so the planet draws at exactly its base radius in GU.
             natural_scale = (radius / sphere_radius) if sphere_radius > 0.0 else 1.0
             iid = r_.create_instance(handle)
             _apply_planet_atmosphere(r_, iid, planet.GetContainingSetName(),
@@ -8378,7 +8901,8 @@ def _player_forward_speed_gups(player, rot) -> float:
 # Lengths in game units.
 VS_NEAR: float = SCENE_NEAR_GU
 VS_FAR: float = SCENE_FAR_GU
-# Viewscreen RTT shape; keep in step with kViewscreenRttW/H in host_bindings.cc.
+# Viewscreen RTT shape: always 16:9 (renderer/viewscreen_rtt_size.h
+# width_for_height); only its size follows the screen footprint.
 VS_ASPECT: float = 640.0 / 360.0
 
 from engine.cameras import zoom_fit as _zoom_fit  # noqa: E402
@@ -9542,9 +10066,12 @@ def _pump_contacts(menu, player) -> tuple:
     Spec: docs/superpowers/specs/2026-08-16-contact-index-and-perception-design.md
     """
     from engine.appc.perception import perceived_by
-    contacts = perceived_by(player)
-    menu.set_contacts(contacts)
-    menu.ResetAffiliationColors()
+    with frame_profiler.scope("contacts.perceive"):
+        contacts = perceived_by(player)
+    with frame_profiler.scope("contacts.push"):
+        menu.set_contacts(contacts)
+    with frame_profiler.scope("contacts.colors"):
+        menu.ResetAffiliationColors()
     return contacts
 
 
@@ -9598,15 +10125,19 @@ def resolve_officer_menu_layout() -> None:
         )
 
 
-def _drive_handover_smoother(smoother, prev_interp, cur_interp,
+def _drive_handover_smoother(player_iid, prev_interp, cur_interp,
                              prev_drawn) -> None:
     """Open a smoothing window when the player's render pipeline flips.
 
     The player is drawn live while manually flown and interpolated while an AI
     or script drives it, and those two pipelines sit a tick apart (see
-    engine/core/handover_smoother). Crossing between them without easing jumps
-    the drawn pose by that offset. `prev_drawn` is the pose that was actually
-    on screen last frame — the thing the new window must continue from.
+    engine/core/handover_smoother, the Python twin of the native blend).
+    Crossing between them without easing jumps the drawn pose by that offset.
+    The native window starts from the pose the compose last drew for the
+    player (`interp_handover_begin`), which is what was on screen last frame.
+    `prev_drawn` is that frame's drawn pose, or None when there is none to
+    continue from (the first frame, a mission swap, a hand-off into another
+    set's coordinates).
 
     A no-op on the first frame (`prev_interp is None`), when nothing flipped,
     or when there is no previous drawn pose to blend out of.
@@ -9615,7 +10146,7 @@ def _drive_handover_smoother(smoother, prev_interp, cur_interp,
         return
     if bool(cur_interp) == bool(prev_interp):
         return
-    smoother.begin(prev_drawn[0], prev_drawn[1])
+    host_io.interp_handover_begin(player_iid)
 
 
 def _player_render_interpolated(player, *, sim_frozen,
@@ -9660,47 +10191,49 @@ def _rebase_view(r, director, offset) -> None:
         dev_mode.log_swallowed("reset_render_origin on a view rebase", _e)
 
 
-def _rebase_player_render(xform_buf, smoother, player_iid, player) -> None:
+def _rebase_player_render(xform_buf, player_iid) -> None:
     """The player changed region set (a dash hand-off): its set-local
-    coordinates jumped by the anchor difference. Re-seed its interpolation
-    slot at the new pose and drop any handover window, so no frame blends a
-    set-A pose with a set-B one."""
-    smoother.cancel()
-    if player_iid is not None and player is not None:
-        xform_buf.snap(player_iid, player.GetWorldLocation(),
-                       player.GetWorldRotation())
+    coordinates jumped by the anchor difference. Re-seed its native
+    interpolation slot at the live pose and drop any handover window, so no
+    frame blends a set-A pose with a set-B one."""
+    host_io.interp_handover_cancel()
+    if player_iid is not None:
+        xform_buf.snap(player_iid)
 
 
-def _make_render_pose_provider(session, xform_buf, interp_alpha, *,
-                               interpolate_player, player_iid,
-                               smoother=None):
-    """Build `pose_of(obj) -> (loc, rot)` returning the render-interpolated
-    pose for a ship so the camera and the renderer anchor on identical poses
-    (smooth-motion fix).
+def _make_render_pose_provider(session, xform_buf, interp_alpha):
+    """Build `pose_of(obj) -> (loc, rot)` returning a ship's DRAWN pose so the
+    camera and the renderer anchor on identical poses (smooth-motion fix).
 
-    Non-player ships integrate on the fixed 60 Hz sim tick, so they are always
-    interpolated. The player renders LIVE while manually flown (it is
-    integrated per render frame in `_PlayerControl`, already smooth), so
-    `interpolate_player` is False then and `pose_of(player)` returns its live
-    pose. When a helm-AI / waypoint order drives the player it moves on the
-    60 Hz tick like any AI ship, so `interpolate_player` is True and the player
-    is interpolated too. Any object not in the buffer falls back to live."""
+    Every tracked ship, the player included, reads the native buffer's
+    `sample`: the same pose `interp_compose` draws for it (the lerp for a ship
+    on the 60 Hz tick, the live store pose for the manually flown player, then
+    the player's handover blend). Any object the buffer does not track, or one
+    with nothing to draw, falls back to its live pose."""
     def pose_of(obj):
         iid = session.ship_instances.get(obj)
-        is_player = iid is not None and iid == player_iid
-        sampled = None
-        if iid is not None and (interpolate_player or not is_player):
-            sampled = xform_buf.sample(iid, interp_alpha)
+        sampled = (xform_buf.sample(iid, interp_alpha)
+                   if iid is not None and xform_buf.has(iid) else None)
         if sampled is None:
             sampled = (obj.GetWorldLocation(), obj.GetWorldRotation())
-        # Handover easing is player-only, and applied HERE so the camera and
-        # the renderer -- which both read pose_of -- cannot disagree about
-        # where the ship is. Inactive smoother (or none) returns `sampled`
-        # untouched, so the ordinary path is unchanged.
-        if is_player and smoother is not None and smoother.active:
-            return smoother.blend(sampled[0], sampled[1])
         return sampled
     return pose_of
+
+
+def _set_interp_mode(session, xform_buf, iid, live: bool) -> None:
+    """Track `iid` in the native buffer, composed (once), and draw it live
+    (from its store pose: the manually flown player) or interpolated. Both
+    are guarded in `session.interp_modes` (iid -> live), so a steady ship
+    costs one dict lookup."""
+    mode = session.interp_modes.get(iid)
+    if mode is None:
+        xform_buf.track(iid, compose=True)
+    if mode is None and not live:
+        session.interp_modes[iid] = False   # the native default
+        return
+    if mode != live:
+        host_io.interp_set_live(iid, live)
+        session.interp_modes[iid] = live
 
 
 def _sync_ship_articulation(session, ship, iid) -> None:
@@ -9708,14 +10241,19 @@ def _sync_ship_articulation(session, ship, iid) -> None:
 
     READ-ONLY on game state: each part's pose is advanced on the sim tick by
     engine.appc.articulation.tick_ship and read back here via
-    `articulation.pose_for_part`. Nothing here mutates the ship — a
-    game-state mutation in the render path is exactly the class of bug that
-    gave the player's phasers a half-second of aiming at a destroyed subsystem.
+    `articulation.pose_for_part`. Called when the pose CHANGES (phase 3a):
+    articulation notifies `pose_sink`, whose live sink is
+    `_push_articulation`, plus once at realize and by the SPV sweep -- never
+    per frame from `_sync_instance_transforms`, so the node overrides the
+    mesh trace reads are the sim pose, not a frame behind it. Nothing here
+    mutates the ship — a game-state mutation in the render path is exactly
+    the class of bug that gave the player's phasers a half-second of aiming
+    at a destroyed subsystem.
 
     Guarded on CHANGE: the pose (a TUPLE of (name, 6-tuple), one per posable
     part) is re-pushed only when it actually moved, so a settled ship (which
     is nearly all of them, nearly always) costs one dict lookup and a tuple
-    compare rather than a boundary crossing per node per frame.
+    compare rather than a boundary crossing per node.
 
     Posable = the rig's parts plus any part the Ship Property Viewer has
     posed by NAME (`articulation.posed_part_names`) -- a part authored fresh
@@ -9770,13 +10308,22 @@ def _sync_ship_articulation(session, ship, iid) -> None:
     session.ship_articulation[iid] = pose
 
 
+def _push_articulation(session, ship) -> None:
+    """The live `pose_sink`: push `ship`'s part poses to its render instance
+    when articulation reports a change. A ship with no session or no
+    instance (not realized yet) is skipped; realize pushes its pose then."""
+    iid = session.ship_instances.get(ship) if session is not None else None
+    if iid is not None:
+        _sync_ship_articulation(session, ship, iid)
+
+
 def _sync_spv_articulation(session, spv_panel) -> None:
     """Push the Ship Property Viewer's FORCED articulation pose, every frame
     the viewer is open -- INCLUDING the frozen ones, which is all of them.
 
     This exists as its own sweep, called from `run()` OUTSIDE
-    `if not pause.sim_frozen:`, because the ordinary articulation push rides
-    inside `_sync_instance_transforms`, which that guard skips. Opening the
+    `if not pause.sim_frozen:`. The ordinary articulation push follows the
+    sim tick (`pose_sink`), which a frozen sim never runs. Opening the
     SPV opens the pause menu, which sets `sim_frozen` -- so the one state in
     which the forced pose matters was exactly the state in which it never
     ran. The hologram kept drawing whatever pose was last pushed before the
@@ -9818,34 +10365,24 @@ def _emissive_scale_for(ship, is_player: bool, hd_boost: float) -> float:
 
 def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
                               game_time, model_scale, player_control=None,
-                              player_interp_pose=None,
                               player_is_interpolated=None) -> None:
-    """Push ship + planet world transforms to the renderer for one frame.
+    """Draw ship + planet world transforms for one frame.
 
-    Player ship: rendered at its LIVE pose (it is integrated per render frame
-    on wall-clock dt in _PlayerControl, so it is already smooth in world
-    space), which means its instance is BOUND to its transform-store slot and
-    nothing is pushed — the renderer composes the matrix in C++ each frame.
-    UNLESS a helm-AI / waypoint order drives it, in which case it moves on the
-    60 Hz tick and `player_interp_pose` carries its render-interpolated
-    (loc, rot); the instance is then unbound and that pose is pushed (and its
-    iid kept in the buffer across frames), which makes it smooth on
-    high-refresh displays. Kept in lock-step with the camera, which anchors on
-    the same interpolated pose.
+    Ships (phase 3c): no matrix is built or pushed here. Every ship's render
+    instance, the player included, is tracked by the NATIVE interpolation
+    buffer (`xform_buf`, engine.core.native_transform_buffer) and drawn by ONE
+    `host_io.interp_compose(interp_alpha)` after the ship loop, from the
+    frame-end capture of the live store (run() captured it before the
+    camera): lerp(prev, cur, interp_alpha) x its sim scale + its view offset.
+    The player is drawn LIVE (its store pose) while manually flown
+    (`player_is_interpolated` False or None: `_PlayerControl` integrates it
+    per render frame, already smooth) and interpolated while a helm-AI,
+    waypoint order, cutscene or dash moves it on the tick; the native handover
+    blend eases the flip, and the camera samples that same drawn pose
+    (`_make_render_pose_provider`), so the two cannot disagree. The ship
+    objects keep live transforms, so physics/AI/combat are unaffected.
 
-    Non-player ships: integrated on the fixed 60 Hz tick, so they are
-    rendered at lerp(prev, cur, interp_alpha) to hide the discrete
-    steps. xform_buf.roll() ran earlier this frame (only when a tick
-    fired); here we capture the new current state and push the
-    interpolated pose. This only affects what is sent to the renderer —
-    the ship objects keep live transforms, so physics/AI/combat (which
-    ran earlier this frame) are unaffected. They therefore CANNOT be bound to
-    the transform store: the store holds one (live) pose, and binding them
-    would render the un-interpolated pose and put the judder back. Moving that
-    two-snapshot buffer native is the follow-up that would let them bind too.
-
-    Planets: rendered at their live pose, so they are bound like the
-    manually-flown player.
+    Planets: rendered at their live pose, so they are bound to the store.
 
     Also ages each ship's glow controller on `game_time` (the same game
     clock the decal system ages on, engine.appc.damage_decals), drops
@@ -9857,18 +10394,15 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
     View coordinates (system-frames Plan 3 Task 3): ships of every set in the
     viewed frame are realized, so a ship's pushed position is its set-local
     position plus offset_between(view, its set) -- zero in the viewed set, so
-    those numbers are untouched. The player is store-bound only when its set
-    IS the viewed set; in a sibling region (a cutscene rendered at Ona2 while
-    the player is in Ona1) the store's set-local pose would be in the wrong
-    coordinates, so it is pushed like any other ship, with its offset. An
-    object with no offset (no view, no set, another frame) is drawn exactly
-    as before.
+    those numbers are untouched. Every ship, the player included, is drawn
+    by the native compose (interp_compose) from its sim source, which
+    carries that offset, so a player in a sibling region (a cutscene
+    rendered at Ona2 while the player is in Ona1) is drawn in the viewed
+    coordinates too.
 
-    Articulation is pushed here at the ship's LIVE pose only. The Ship
-    Property Viewer's FORCED pose is NOT applied from here: this whole
-    function sits under `run()`'s `if not pause.sim_frozen:`, and the SPV
-    freezes the sim, so it would never run on a frame the SPV cares about.
-    `_sync_spv_articulation` is the sweep for that, called unguarded.
+    Articulation is NOT pushed here (phase 3a): the node overrides follow
+    the sim pose per change, through `pose_sink` -> `_push_articulation`.
+    `_sync_spv_articulation` is the SPV's unguarded per-frame sweep.
     """
     # player is always set when a session exists, so _player_iid is a
     # real iid (never None) at runtime.
@@ -9919,7 +10453,6 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
     # volumes and cast light spool up and burst together.
     _player_warp_glow = _warp_glow_envelope(player)
     for ship, iid in session.ship_instances.items():
-        _sync_ship_articulation(session, ship, iid)
         _wg = session.ship_glow_controllers.get(iid)
         if _wg is not None:
             _wg.update(game_time,
@@ -9927,79 +10460,52 @@ def _sync_instance_transforms(r, session, player, xform_buf, interp_alpha,
                        _player_warp_glow if ship is player else None)
         # Destroyed (dying/dead) ships lose self-illumination —
         # a dark hulk in space. Hull stays lit by external light.
-        r.set_emissive_scale(iid, _emissive_scale_for(ship, ship is player, _hd_boost))
+        _es = _emissive_scale_for(ship, ship is player, _hd_boost)
+        if session.emissive_scales.get(iid) != _es:
+            r.set_emissive_scale(iid, _es)
+            session.emissive_scales[iid] = _es
         _off = _view_offset(ship)
-        if iid == _player_iid and _off is None:
-            if player_interp_pose is not None:
-                # The player is ALWAYS drawn from the pose the camera resolved
-                # (`pose_of`), so the two cannot disagree — that shared pose is
-                # what carries the handover easing. It may be the live pose,
-                # the 60 Hz interpolation, or a blend of the two mid-handover.
-                _iloc, _irot = player_interp_pose
-                try:
-                    _ps = float(ship.GetScale())
-                except Exception:
-                    _ps = 1.0
-                # A pushed matrix, not the live store pose, so this instance
-                # must be unbound — otherwise frame()'s store sweep overwrites
-                # what is pushed here and the smoothing is lost. (set_world_
-                # transform also unbinds; this keeps session.slot_bindings in
-                # step with it.)
-                _unbind_store_transform(session, ship, iid)
-                r.set_world_transform(
-                    iid, _world_matrix_from(_iloc, _irot, model_scale * _ps))
-                # Keep the iid in the buffer ONLY while genuinely interpolated,
-                # so prune drops it during manual flight. Retaining it would
-                # leave `prev` stale (set_current runs only when interpolated),
-                # and the next handover would smear from that stale pose
-                # instead of seeding prev=cur.
-                _is_interp = (player_is_interpolated
-                              if player_is_interpolated is not None
-                              else True)
-                if _is_interp:
-                    _live_ship_iids.append(iid)
-            else:
-                # Player under manual control integrates per RENDER frame, so
-                # its live store pose is already the pose to draw: bind the
-                # instance and let the renderer compose the matrix in C++.
-                _apply_live_world_transform(r, session, ship, iid, model_scale)
-            continue
+        # NOTE: scale is read live, not interpolated — the buffer only
+        # stores loc+rot. Fine for steady scale; a mid-animation GetScale()
+        # change applies the current scale to the blended pose
+        # (imperceptible).
+        try:
+            _ps = float(ship.GetScale())
+        except Exception:
+            _ps = 1.0
+        # Every ship, the player included: gameplay point queries read this
+        # sim pose whatever is drawn (phase 3a), and the native compose draws
+        # from it (phase 3c).
+        _push_sim_source(session, ship, iid, model_scale * _ps, _off)
+        _set_interp_mode(session, xform_buf, iid,
+                         iid == _player_iid and not player_is_interpolated)
         _live_ship_iids.append(iid)
-        # A ship that was the player (bound) and is no longer one renders
-        # interpolated from here on; drop any binding before pushing below.
-        if session.slot_bindings:
-            _unbind_store_transform(session, ship, iid)
+        if iid == _player_iid and _off is None:
+            continue
         if _warp_apply_vis:
             r.set_visible(iid, not _warp_hide
                           and iid not in session.scope_hidden)
             if _warp_hide:
                 _warp_hid_iids.add(iid)
-        # NOTE: scale is read live, not interpolated — the
-        # buffer only stores loc+rot. Fine for steady scale;
-        # a mid-animation GetScale() change applies the
-        # current scale to the blended pose (imperceptible).
-        try:
-            _ps = float(ship.GetScale())
-        except Exception:
-            _ps = 1.0
-        xform_buf.set_current(
-            iid, ship.GetWorldLocation(), ship.GetWorldRotation())
-        _sampled = xform_buf.sample(iid, interp_alpha)
-        _iloc, _irot = _sampled
-        if _off is not None:
-            _iloc = _frames.shifted(_iloc, _off)
-        r.set_world_transform(
-            iid, _world_matrix_from(_iloc, _irot, model_scale * _ps))
+    # One native call draws every tracked ship (contradiction 10: here, not
+    # inside frame(), so every reader before frame() sees this frame's pose).
+    host_io.interp_compose(interp_alpha)
     xform_buf.prune(_live_ship_iids)
     session.warp_hidden_iids = _warp_hid_iids
-    # Drop controllers for instances no longer present. The
-    # player iid is excluded from _live_ship_iids (handled by
-    # the continue above), so key the keep-set on the full
-    # live ship_instances values, not _live_ship_iids.
+    # Drop controllers for instances no longer present.
     _wg_live_iids = set(session.ship_instances.values())
     for _dead in list(session.ship_glow_controllers.keys()):
         if _dead not in _wg_live_iids:
             del session.ship_glow_controllers[_dead]
+    for _dead in list(session.emissive_scales.keys()):
+        if _dead not in _wg_live_iids:
+            del session.emissive_scales[_dead]
+    for _dead in list(session.sim_sources.keys()):
+        if _dead not in _wg_live_iids:
+            del session.sim_sources[_dead]
+    for _dead in list(session.interp_modes.keys()):
+        if _dead not in _wg_live_iids:
+            del session.interp_modes[_dead]
     for planet, iid in session.planet_instances.items():
         ns = session.planet_natural_scale.get(planet, 1.0)
         # Planets render at their live pose (no interpolation), so the store
@@ -10242,7 +10748,8 @@ def _run_preboot_panel(panel, view_w=1280, view_h=720):
             # here means there is no window -- however unlikely -- where a
             # reload could call back into a panel whose screen has ended.
             _set_load_end(lambda: None)
-        if _h is not None:
+        # None = the panel stays up past this loop (a held boot notice).
+        if _h is not None and panel.teardown_script is not None:
             try:
                 _h.cef_execute_javascript(panel.teardown_script)
             except Exception as _e:
@@ -10286,6 +10793,82 @@ def _run_first_run_screen(resolution, resolver=None, view_w=1280, view_h=720):
     panel = FirstRunPanel(resolution, resolver=resolver)
     _run_preboot_panel(panel, view_w, view_h)
     return panel.resolution
+
+
+def _boot_notice_wanted(environ, max_ticks, cef_ready, modules=None) -> bool:
+    """Whether run() shows the boot notice splash.
+
+    Every interactive launch, the first included. Never headless
+    (OPEN_STBC_HOST_HEADLESS), never for a caller bounding the run with
+    max_ticks (tests, harnesses), never under pytest, and never without a
+    live CEF page to draw it into -- that loop could only ever time out.
+    --smoke-check returns before run() is reached.
+    """
+    if modules is None:
+        modules = sys.modules
+    if not cef_ready:
+        return False
+    if environ.get("OPEN_STBC_HOST_HEADLESS"):
+        return False
+    if max_ticks is not None:
+        return False
+    return "pytest" not in modules
+
+
+def _begin_boot_notice(view_w=1280, view_h=720, clock=None):
+    """Fade Activision's required notice in (engine/ui/boot_notice_panel.py)
+    and hand back with it held at full opacity, so boot can load the game
+    behind it. Returns the held panel for _finish_boot_notice, or None when
+    there is nothing to finish: the page never acknowledged it (logged), or
+    the window closed.
+
+    Between the two calls nothing pumps the window: it keeps presenting the
+    last frame, which is the finished fade-in. The loop itself is
+    `_run_preboot_panel`.
+    """
+    import time as _time
+    from engine.ui.boot_notice_panel import ACK_TIMEOUT_S, BootNoticePanel
+
+    panel = BootNoticePanel(
+        clock=clock if clock is not None else _time.monotonic, hold=True)
+    _run_preboot_panel(panel, view_w, view_h)
+    outcome = panel.outcome
+    if outcome == "unshown":
+        print("[boot-notice] the page never showed the notice within "
+              "%.0f s -- booting without it" % ACK_TIMEOUT_S, file=sys.stderr)
+    return panel if outcome == "holding" else None
+
+
+def _set_boot_audio_muted(muted: bool) -> None:
+    """Silence every sound category while the game loads behind the boot
+    notice. The SDK starts sounds during the load (LoadBridge.py:213 plays
+    AmbBridge) and the screen is showing the logo meanwhile. The backend
+    re-applies a category gain to sounds already playing, so a loop started
+    under the mute is heard at its own gain once unmuted. Restores 1.0: no
+    volume setting drives these gains (test_nothing_else_owns_the_category_gains).
+    Music only plays from the game loop, so it needs nothing here."""
+    if _audio_mod is None:
+        return
+    gain = 0.0 if muted else 1.0
+    for category in ("SFX", "Voice", "Interface"):
+        try:
+            _audio_mod.set_category_gain(category, gain)
+        except Exception as _e:
+            dev_mode.log_swallowed("boot notice audio mute", _e)
+
+
+def _finish_boot_notice(panel, view_w=1280, view_h=720):
+    """The load behind the notice is done: play the rest of the 2 s hold (if
+    the load was shorter) and the fade-out. Returns the panel's outcome:
+    "shown", or None if the window closed.
+
+    Must run BEFORE run() registers its own CEF event and load-end handlers:
+    `_run_preboot_panel` installs its own and leaves a no-op load-end
+    handler behind.
+    """
+    panel.release()
+    _run_preboot_panel(panel, view_w, view_h)
+    return panel.outcome
 
 
 def _resolve_paths_or_report(view_w=1280, view_h=720, *, cef_ready=True):
@@ -10376,7 +10959,7 @@ def _initial_window_size(environ) -> tuple:
     """Starting window size: DAUNTLESS_WINDOW_SIZE=WxH, else 1280x720.
 
     A perf baseline must be taken at a known size -- GPU cost scales with the
-    pixels drawn (docs/engine/perf-register.md, M-4). A bad value falls back
+    pixels drawn (docs/reference/engine/perf-register.md, M-4). A bad value falls back
     to the default rather than stopping the game.
     """
     raw = str(environ.get("DAUNTLESS_WINDOW_SIZE", "")).strip().lower()
@@ -10384,6 +10967,882 @@ def _initial_window_size(environ) -> tuple:
     if sep and w.isdigit() and h.isdigit() and int(w) > 0 and int(h) > 0:
         return int(w), int(h)
     return 1280, 720
+
+
+@dataclass
+class FrameSimContext:
+    """What the frame's sim section (_run_frame_sim) reads from run().
+
+    The fixed fields are run()'s, built once before the frame loop. The
+    carried fields are the section's state across frames: read at entry and
+    written back at exit."""
+    h: Any
+    controller: Any
+    director: Any
+    view_mode: Any
+    player_control: Any
+    pause: Any
+    input_map: Any
+    xform_buf: Any
+    tick_gameloop: Callable[[], None]
+    snap_scene: Callable[[], None]
+    close_star_map: Callable[[], None]
+    consume_scroll: Optional[Callable[[], float]]
+    cef_send_wheel: Optional[Callable[..., Any]]
+    crew_menu_panel: Any
+    perf_monitor_panel: Any
+    # Carried only so Alt+Enter can dispatch the Configuration panel's own
+    # toggle:fullscreen branch -- see _poll_fullscreen_chord.
+    configuration_panel: Any
+    collisions: Any
+    verbose: bool
+    tick_dt: float
+    max_frame_dt: float
+    cutscene: Any
+    bridge_camera: Any
+    char_anim: Any
+    walk_ctrl: Any
+    watch_ctrl: Any
+    idle_gestures: Any
+    node_anim: Any
+    lip_runtime: Any
+    letterbox_anim: Any
+    # Carried across frames.
+    accumulator: float
+    previous_real_time: float
+    bridge_left_pick_active: bool = False
+    z_held_prev: bool = False
+    v_held_prev: bool = False
+    prev_interp_player: Any = None
+    prev_player_set: tuple = (None, None)
+    prev_view_set: Any = None
+    prev_drawn_player_pose: Any = None
+    # The last running frame's player interpolation flag (the motion
+    # trace's; None until a running frame sets it).
+    interp_player: Any = None
+
+
+class FrameSimResult(NamedTuple):
+    """The section's locals run() reads after it (_run_frame_sim)."""
+    now: Any
+    wall_dt: Any
+    frame_dt: Any
+    player_dt: Any
+    frame_game_dt: Any
+    interp_alpha: Any
+    sim_ticks: Any
+    ships_this_tick: Any
+    pose_of: Any
+    player_interp_pose: Any
+    session: Any
+    player: Any
+
+
+def _run_frame_sim(ctx: FrameSimContext, *, mx: float, my: float,
+                   cursor_in_panel: bool) -> FrameSimResult:
+    """One frame's sim: the fixed-timestep accumulator; at frame start the
+    swap drain, the session sync, the keys and input; then each tick whole
+    (GameLoop tick, weapons, combat, the tick boundary: native motion phase
+    4, ruling 2); a second player-identity sync; the post-step pass and the
+    scene reconcile. `ctx` carries the state across frames; the result is
+    what run()'s render section reads."""
+    import App
+    from engine.core.timestep import step_accumulator
+    from engine.core.transform_buffer import advance_ticks
+    _h = ctx.h
+    controller = ctx.controller
+    director = ctx.director
+    view_mode = ctx.view_mode
+    player_control = ctx.player_control
+    pause = ctx.pause
+    input_map = ctx.input_map
+    _xform_buf = ctx.xform_buf
+    _tick_gameloop = ctx.tick_gameloop
+    _snap_scene = ctx.snap_scene
+    _close_star_map = ctx.close_star_map
+    _consume_scroll = ctx.consume_scroll
+    _cef_send_wheel = ctx.cef_send_wheel
+    crew_menu_panel = ctx.crew_menu_panel
+    perf_monitor_panel = ctx.perf_monitor_panel
+    collisions = ctx.collisions
+    verbose = ctx.verbose
+    TICK_DT = ctx.tick_dt
+    MAX_FRAME_DT = ctx.max_frame_dt
+    cutscene = ctx.cutscene
+    bridge_camera = ctx.bridge_camera
+    char_anim = ctx.char_anim
+    walk_ctrl = ctx.walk_ctrl
+    watch_ctrl = ctx.watch_ctrl
+    idle_gestures = ctx.idle_gestures
+    node_anim = ctx.node_anim
+    lip_runtime = ctx.lip_runtime
+    _letterbox_anim = ctx.letterbox_anim
+    _accumulator = ctx.accumulator
+    _previous_real_time = ctx.previous_real_time
+    _bridge_left_pick_active = ctx.bridge_left_pick_active
+    z_held_prev = ctx.z_held_prev
+    v_held_prev = ctx.v_held_prev
+    _prev_interp_player = ctx.prev_interp_player
+    _prev_player_set = ctx.prev_player_set
+    _prev_view_set = ctx.prev_view_set
+    _prev_drawn_player_pose = ctx.prev_drawn_player_pose
+    _interp_player = ctx.interp_player
+    _mx, _my, _cursor_in_panel = mx, my, cursor_in_panel
+
+    # --- frame sim: begin ---
+    frame_profiler.mark("sim")
+    # --- Sim advance: fixed-timestep accumulator ---
+    # frame_dt is the real wall-clock since the previous frame.
+    # While frozen we force it to 0 so the accumulator cannot
+    # grow and there is no catch-up burst on resume. The cap
+    # bounds the inner while-loop after a stalled render frame.
+    # Frozen = pause menu OR the DevTools window (which stops the
+    # world so the overlay under inspection holds still).
+    pause.set_external_freeze(_devtools_frozen(_h))
+    _now = _frame_clock()
+    # The raw wall delta, kept apart from _frame_dt (which the freeze
+    # zeroes): the Bridge Editor's preview clock runs while the
+    # (hidden) pause menu freezes the sim (spec 2026-10-08-bridge-emitters §12.2).
+    _wall_dt = _now - _previous_real_time
+    _frame_dt = _wall_dt
+    _previous_real_time = _now
+    if perf_monitor_panel is not None:
+        perf_monitor_panel.tick(_wall_dt)
+    if pause.sim_frozen:
+        _frame_dt = 0.0
+        # No tick runs, so no tick boundary drains: the mirror's
+        # pending frees and off-main pushes are applied here (no
+        # kernel session is open between frames).
+        _native_combat.drain()
+    _accumulator, _sim_ticks_this_frame = step_accumulator(
+        _accumulator, _frame_dt, TICK_DT, MAX_FRAME_DT
+    )
+    frame_profiler.note_sim_ticks(_sim_ticks_this_frame)
+    # Per-render-frame delta for the player input integrator.
+    # _apply_input runs once per render frame, so its dt must
+    # be the wall-clock delta since the last frame — not the
+    # fixed sim TICK_DT. Otherwise at 120 Hz monitor refresh
+    # the player ship rotates / accelerates 2× too fast (BC
+    # Galaxy 360° yaw collapses from 24 s to 12 s). Clamp
+    # matches step_accumulator's spiral-of-death cap so a
+    # stalled frame doesn't teleport the player.
+    _player_dt = 0.0 if pause.sim_frozen else min(max(_frame_dt, 0.0), MAX_FRAME_DT)
+    # The GAME time this frame covers: the GameLoop ticks it runs.
+    # Everything below that steps game state does so once per tick
+    # (inside _whole_tick, or `for _ in range(_sim_ticks_this_frame)`)
+    # or by this -- never by one TICK_DT per frame, which ran combat at
+    # a third of its speed in a 3-tick frame and double speed at 120
+    # fps (tests/host/test_frame_rate_independence.py).
+    _frame_game_dt = _sim_ticks_this_frame * TICK_DT
+    _interp_alpha = _accumulator / TICK_DT  # in [0, 1) after step_accumulator
+
+    # Only snap the camera when a sim tick actually fired —
+    # no tick means no state change to follow.
+    if _sim_ticks_this_frame > 0:
+        had_pending_swap = controller.pending_swap is not None
+        # Clear any stale cutscene from the OUTGOING mission BEFORE the
+        # drain — the drain runs the incoming mission's Initialize()/
+        # Briefing(), which queues that mission's own camera/door
+        # requests. Resetting after the drain would wipe the freshly
+        # queued walk-on (the camera then never moves).
+        if had_pending_swap:
+            cutscene.reset()
+            bridge_camera.reset_cutscene_pose()
+            char_anim.reset()
+            walk_ctrl.reset()
+            watch_ctrl.reset()
+            idle_gestures.reset()
+            node_anim.reset(renderer=r)
+            lip_runtime.clear()
+            _letterbox_anim.reset()
+            _close_star_map()
+        controller._drain_pending_swap()
+        if had_pending_swap:
+            _snap_scene()
+            # Same discontinuity: never blend the player in from a
+            # pose that belonged to the previous scene.
+            host_io.interp_handover_cancel()
+            _prev_interp_player = None
+            _prev_drawn_player_pose = None
+            # Nor re-base across a swap: the old sets are gone.
+            _prev_player_set = (None, None)
+            _prev_view_set = None
+    else:
+        had_pending_swap = False
+
+    session = controller.session
+    with frame_profiler.scope("sim.session_sync"):
+        # Fire QuickBattle's stored preload-done event (if pending) BEFORE
+        # reconciliation. Its handler (StartSimulation2) spawns the player
+        # ship; firing first means the reconciliation pass below realizes
+        # that ship in the same tick. Fire-once and fully guarded — a no-op
+        # for missions that never set a preload-done event.
+        _fire_pending_preload_done()
+        # Remove SetDeleteMe(1)-flagged objects from their set (QuickBattle
+        # "End Combat" clears the battle this way); the reconciliation below
+        # then tears down their render instances.
+        _process_object_deletions()
+        # Mirror the SDK config-dialog flag onto the Quick Battle Setup
+        # panel: opens it when the player clicks the XO menu's config
+        # button, closes it on Close/Start. Boot leaves it closed.
+        _sync_quick_battle_panel(controller)
+    # The camera follows session.player; _sync_player_identity (just
+    # below, again after the ticks, and in the scene reconcile after
+    # the sim) calls this when the player's identity changed
+    # (RecreatePlayer's destroy+recreate). Snap so the new player
+    # doesn't lerp from the destroyed ship's pose, and re-seed the
+    # director's ship-radius distances.
+    def _on_player_change(new_player, _d=director, _xb=_xform_buf):
+        _r = new_player.GetRadius()
+        _d.chase.set_ship_radius(_r)
+        _d.tracking.set_ship_radius(_r)
+        _d.snap()
+        _xb.reset_all()
+    # Sync the player BEFORE the sim reads it: the preload-done event
+    # above may have just run RecreatePlayer, and the scene reconcile
+    # that would otherwise catch it runs after the sim (Ruling 11).
+    if session is not None:
+        _sync_player_identity(session, _on_player_change)
+    player = session.player if session is not None else None
+    if had_pending_swap and player is not None:
+        _r = player.GetRadius()
+        director.chase.set_ship_radius(_r)
+        director.tracking.set_ship_radius(_r)
+
+    # Render-pose interpolation (smooth motion on high-refresh displays).
+    # Populated below when the sim is live; left None while paused, in
+    # which case the camera reads live poses and every hull keeps the
+    # matrix the last compose drew. See _make_render_pose_provider /
+    # _sync_instance_transforms.
+    _pose_of = None
+    _player_interp_pose = None
+
+    # Mouse-wheel routing (runs every frame, paused or not). Scroll
+    # delta is consumed once per tick — the single consumer of the
+    # accumulator. Over a CEF surface (a pause/config modal is open,
+    # or the cursor is over a HUD panel) → scroll that panel; over
+    # open space in exterior view → step the ship throttle. Replaces
+    # the old camera scroll-zoom. Old bindings without the accumulator
+    # return 0.0 via the fallback.
+    with frame_profiler.scope("sim.keys"):
+        scroll_y = _consume_scroll() if _consume_scroll is not None else 0.0
+        _route_scroll_wheel(
+            scroll_y,
+            route_to_panel=(pause.is_open or _cursor_in_panel),
+            mx=_mx, my=_my,
+            send_wheel=_cef_send_wheel,
+            player_control=player_control,
+            can_throttle=(player is not None and view_mode.is_exterior),
+        )
+
+        # Alt+Enter: full screen. Outside the `not pause.is_open` block
+        # below on purpose -- the pause menu is exactly where a player who
+        # just discovered the setting will try the shortcut, and the window
+        # is a host concern, not a simulation one.
+        _poll_fullscreen_chord(_h, ctx.configuration_panel)
+
+        if not pause.is_open:
+            # Dev-mode keybindings (no-op when --developer is not set).
+            # register_for_frame re-binds handlers that close over the
+            # current player/session each tick; dispatch_dev_key reads
+            # _h.key_pressed for every registered key and fires matching
+            # handlers. Skipped silently when dev_mode.is_enabled() is False.
+            if _h is not None and dev_mode.is_enabled():
+                dev_keybindings.register_for_frame(_h, session, player)
+                for key, _desc in dev_mode.keybinding_descriptions():
+                    if host_io.key_pressed(key):
+                        dev_mode.dispatch_dev_key(key)
+
+            # F12: toggle CEF DevTools for the UI overlay.
+            if _h is not None and host_io.key_pressed(_h.keys.KEY_F12):
+                _h.cef_toggle_devtools()
+
+            # Cmd+R / Ctrl+R: hot-reload the CEF overlay's HTML.
+            # Reload only when Cmd (macOS) or Ctrl (Linux/Windows) is held;
+            # bare R is reverse-thrust and must not be intercepted.
+            if _h is not None and host_io.key_pressed(_h.keys.KEY_R):
+                _cmd_held = host_io.key_state(_h.keys.KEY_LEFT_SUPER) if hasattr(_h.keys, "KEY_LEFT_SUPER") else False
+                _ctrl_held = host_io.key_state(_h.keys.KEY_LEFT_CONTROL) if hasattr(_h.keys, "KEY_LEFT_CONTROL") else False
+                if _cmd_held or _ctrl_held:
+                    _h.cef_reload()
+
+    # This frame's ships: each whole tick rebuilds it (_whole_tick), a
+    # running frame with no tick builds it once after the ticks; None
+    # on a frozen frame (the render section keys the combat feed push
+    # off it).
+    _ships_this_tick = None
+    # The input below is SIMULATION — ship/camera input, firing — so it
+    # gates on sim_frozen, not on the menu, as the post-tick pass does.
+    # The DevTools keys above deliberately sit in the is_open block
+    # instead: DevTools freezes the sim, so gating F12 on sim_frozen
+    # would make it impossible to press F12 a second time to close
+    # DevTools again.
+    if not pause.sim_frozen:
+        # Apply keyboard input to the player ship's transform and to the
+        # orbit camera (see _apply_input below).
+
+        with frame_profiler.scope("sim.input"):
+            if player is not None and _h is not None:
+                # Alert keys (Shift+1/2/3) run before the throttle handler;
+                # _PlayerControl.apply checks _shift_held() to skip digit
+                # throttling on the same press.
+                _apply_alert_keys(_h, player)
+                # C-key: toggle Chase ↔ Tracking (only enters Tracking if
+                # the player has a valid target). key_pressed fires once per
+                # key-down event (not while held). Gate on exterior view so
+                # the mode cannot flip silently while the bridge is active.
+                if view_mode.is_exterior and host_io.key_pressed(input_map.code("camera_cycle")):
+                    director.toggle_mode(player=player)
+                # Z-key: ZoomTarget framing while held. Held-state (not
+                # press-edge) so the camera enters/exits as the key state
+                # changes. The `not director.tracking.zoom_target_active`
+                # retry guard lets a Z-held-during-target-acquisition
+                # succeed on whichever frame the target appears.
+                z_held_now = view_mode.is_exterior and host_io.key_state(input_map.code("camera_zoom_target"))
+                if z_held_now and not director.tracking.zoom_target_active:
+                    director.start_zoom_target(player=player)
+                elif z_held_prev and not z_held_now:
+                    director.end_zoom_target()
+                z_held_prev = z_held_now
+                # =/- sticky zoom: press-edge (OS auto-repeat for hold).
+                if view_mode.is_exterior and host_io.key_pressed(input_map.code("camera_zoom_in")):
+                    director.zoom_in()
+                if view_mode.is_exterior and host_io.key_pressed(input_map.code("camera_zoom_out")):
+                    director.zoom_out()
+                # V-key: Reverse Chase while held. Same hold-state
+                # edge detection as Z, with a retry guard so a
+                # V-held-during-mode-transition succeeds on the
+                # next eligible frame.
+                v_held_now = view_mode.is_exterior and host_io.key_state(input_map.code("camera_reverse_chase"))
+                if v_held_now and not director.chase.reverse_active:
+                    director.start_reverse()
+                elif v_held_prev and not v_held_now:
+                    director.end_reverse()
+                v_held_prev = v_held_now
+                # Shift+mouse: orbit yaw/pitch additive on top of
+                # arrow keys. Drain the mouse delta unconditionally
+                # in exterior view so non-Shift mouse motion doesn't
+                # accumulate and snap the camera on the next Shift
+                # press.
+                mouse_dx_exterior, mouse_dy_exterior = 0.0, 0.0
+                if view_mode.is_exterior:
+                    mouse_dx_exterior, mouse_dy_exterior = host_io.consume_mouse_delta()
+                shift_held = view_mode.is_exterior and (
+                    host_io.key_state(_h.keys.KEY_LEFT_SHIFT) or
+                    host_io.key_state(_h.keys.KEY_RIGHT_SHIFT)
+                )
+                if shift_held and director.mode is CameraMode.CHASE:
+                    director.chase.apply_mouse_delta(
+                        mouse_dx_exterior, mouse_dy_exterior)
+                # dt = _player_dt (wall-clock frame delta), not TICK_DT —
+                # see comment at the accumulator step. _apply_input fires
+                # once per render frame, so its dt is the wall delta.
+                _apply_input(view_mode, player_control, director,
+                             player=player, dt=_player_dt, h=_h)
+
+            # Bridge crew-menu click. On the bridge the cursor is locked for
+            # mouse-look, so the player AIMS by looking: the reticle is
+            # screen centre.
+            #   - No menu open: centre an officer and left-click → open that
+            #     officer's crew menu (else the click falls through to
+            #     _poll_mouse_buttons and fires phasers).
+            #   - Menu open: the cursor is freed for the CEF menu; a click on
+            #     the menu itself is consumed earlier by the CEF panel
+            #     forwarding, so any left press we still see here is OFF the
+            #     menu → close it.
+            # mouse_button_pressed consumes the edge, so we only call it once
+            # we've decided to intercept — leaving genuine empty-space clicks
+            # to fire phasers.
+            if view_mode.is_bridge and _h is not None:
+                _bridge_left_pick_active = bridge_officer_picking.handle_click(
+                    _h, r, bridge_camera, crew_menu_panel,
+                    _bridge_left_pick_active)
+
+            # Forward mouse button edges into the input manager (fire
+            # events route via g_kKeyboardBinding → TCW handlers).
+            _poll_mouse_buttons(_h)
+            _poll_function_keys(_h, input_map)
+            _poll_fire_keys(_h, input_map)
+            _poll_modifier_chords(_h)
+            # General key stream → BC's raw ET_KEYBOARD window event.
+            # Runs AFTER the three tables above so their _fn_key_prev
+            # entries are already written for this frame (it skips the
+            # keys they own, but the ordering keeps that invariant
+            # obvious).
+            _poll_raw_keyboard(_h, input_map)
+            _poll_skip_dialogue(_h, input_map)
+
+            # Manual Aim (H): re-pick the cursor's hull point on the
+            # player's target, or revert to the subsystem lock. Sim side
+            # on purpose -- it mutates the player's target offset, which
+            # the weapon ticks and the phaser ticks in _advance_combat
+            # (each whole tick below) all read this same frame. At frame
+            # start it picks against last frame's target pose with last
+            # frame's camera, which agree.
+            manual_aim.update(
+                player=player,
+                tcw=TacticalControlWindow.GetInstance(),
+                ship_instances=(session.ship_instances if session is not None else None),
+                is_exterior=view_mode.is_exterior,
+            )
+
+    # --- Each tick runs whole (native motion phase 4, ruling 2) ---
+    # Everything above ran at FRAME START, before tick 0: the swap
+    # drain, the session sync (preload-done spawn, deletions, player
+    # identity), the keys and the input stages (the manual player's
+    # integrator, fire keys, mouse, chords, Manual Aim). So this
+    # frame's first AI tick sees this frame's manual pose and firing
+    # state, and a press reaches the frame's first combat tick.
+    #
+    # One whole tick: GameLoop tick i (timers, the TimeSliceProcess
+    # scheduler, the AI tree-walk, collision avoidance, motion and the
+    # per-ship shield/power/cloak/repair updates), then weapons and
+    # combat tick i on the ships alive after it, then the combat tick
+    # boundary (the tick's held effects, GameLoop's included:
+    # owns_boundary=False). Combat tick i reads motion tick i's poses,
+    # and AI tick i+1 sees combat tick i's hits. Torpedo flight, phaser
+    # dwell, weapon charge and every effect clock step by TICK_DT, once
+    # per GAME TICK, never once per frame (see _frame_game_dt).
+    def _whole_tick():
+        nonlocal _ships_this_tick
+        _tick_gameloop()
+        # The tick may have killed or spawned a ship: the list is
+        # materialized once per tick, after its GameLoop tick, and both
+        # consumers below share it.
+        with frame_profiler.scope("sim.ship_list"):
+            _ships_this_tick = list(_all_ships_for_tick())
+        # Weapon events and sounds both produce are delivered
+        # when this closes (native combat on; _combat_effect_scope).
+        with _combat_effect_scope():
+            with frame_profiler.scope("sim.weapons"):
+                _advance_weapons(_ships_this_tick, TICK_DT)
+            with frame_profiler.scope("sim.combat"):
+                _advance_combat(
+                    _ships_this_tick, TICK_DT,
+                    ship_instances=(session.ship_instances if session is not None else None),
+                    ship_emitters=(session.ship_emitters if session is not None else None),
+                    player=player,
+                    # Pushed after the camera, once the render origin is
+                    # set (_push_combat_render_data below).
+                    push_render_data=False,
+                )
+        _combat_tick_boundary()
+
+    # advance_ticks rolls the interpolation buffer and, on a frame
+    # that runs 2+ ticks, re-seats its prev just before the last one
+    # (after whole tick n-1's boundary), so the drawn pose always
+    # blends across exactly one tick. The tick count was decided at
+    # the frame top: a frame frozen mid-frame (a dev key in sim.keys)
+    # still runs its whole ticks.
+    advance_ticks(_xform_buf, _sim_ticks_this_frame, _whole_tick)
+    # The warp tunnel's destination preload: at most one model load
+    # per frame, so no tunnel frame pays for the whole destination.
+    with frame_profiler.scope("warp.preload"):
+        _step_warp_preload()
+
+    # A tick may have changed the game's player (an SDK timer's
+    # RecreatePlayer): sync again, so the post-tick pass below
+    # (sensor contacts, crew prompts, dash, hand-off) drives the new
+    # ship this frame, as the old post-tick session sync did.
+    if session is not None:
+        _sync_player_identity(session, _on_player_change)
+    player = session.player if session is not None else None
+
+    if not pause.sim_frozen:
+        # A frame that ran no tick still builds the list once, for the
+        # render section's combat feed.
+        if _ships_this_tick is None:
+            with frame_profiler.scope("sim.ship_list"):
+                _ships_this_tick = list(_all_ships_for_tick())
+
+        # Player-only contact manager: bands, proximity events and the
+        # identification dwell (engine/appc/sensor_contacts.py). Sim-gated
+        # by the enclosing `not pause.sim_frozen`; it runs its own 1 s
+        # sweep cadence internally.
+        if player is not None:
+            import App  # deferred: matches host-loop convention
+            from engine.appc import sensor_contacts
+            sensor_contacts.tick(player, App.g_kUtopiaModule.GetGameTime())
+
+        # Crew "raise shields" prompts in asteroids / radiation
+        # (engine/appc/crew_hazard_prompts.py). Sim-gated like the
+        # contact manager above; polls at 1 Hz on game time.
+        if player is not None:
+            global _crew_hazard_prompts
+            if _crew_hazard_prompts is None:
+                from engine.appc.crew_hazard_prompts import CrewHazardPrompts
+                _crew_hazard_prompts = CrewHazardPrompts()
+            _crew_hazard_prompts.update(
+                player, App.g_kUtopiaModule.GetGameTime())
+
+        # Nebula membership → enter/exit events, environmental
+        # damage, sensor scaling. Sim dt (TICK_DT), once per game tick
+        # like combat above; gated by the enclosing
+        # `not pause.sim_frozen` (no effects while frozen); no-op for
+        # sets without a nebula.
+        _neb_set = _resolve_active_set(player)
+        if _neb_set is not None:
+            global _nebula_tracker
+            if _nebula_tracker is None:
+                from engine.appc.nebula_runtime import NebulaTracker
+                _nebula_tracker = NebulaTracker()
+            import App  # deferred: matches host-loop convention
+
+            # Radial-profile radiation (engine/appc/radiation.py):
+            # drain + outages via 16 Hz ET_ENVIRONMENT_DAMAGE. Ships
+            # inside an armed local nebula ride the tracker's events.
+            global _radiation_driver
+            if _radiation_driver is None:
+                from engine.appc.radiation import RadiationDriver
+                from engine.systems import profile as _profile
+                _radiation_driver = RadiationDriver(_profile.sample_for_object)
+                _nebula_tracker.env_listeners.append(
+                    _radiation_driver.on_local_event)
+            for _tick_i in range(_sim_ticks_this_frame):
+                _nebula_tracker.update(
+                    _neb_set,
+                    _neb_set.GetClassObjectList(App.CT_SHIP),
+                    TICK_DT,
+                )
+                _radiation_driver.update(
+                    _neb_set.GetClassObjectList(App.CT_SHIP), TICK_DT,
+                    shared=_nebula_tracker.ships_in_armed_nebula())
+
+            # Shared nebula-state locals used by ALL nebula drivers
+            # (thunder, hull-discharge, wake).  Computed once here so
+            # each per-toggle block can read them without duplication.
+            player_id = id(player) if player is not None else None
+            in_neb = player_id is not None and any(
+                player_id in ships
+                for ships in _nebula_tracker._inside.values()
+            )
+            _gt = App.g_kUtopiaModule.GetGameTime()
+
+            # The radial profile at the player: hull sparks follow its
+            # radiation, the impulse wake its gas (engine/systems/profile_fx).
+            from engine.systems import profile as _profile
+            from engine.systems import profile_fx as _profile_fx
+            from engine.appc import warp_state as _warp_state
+            _prof_sample = (_profile.sample_for_object(player)
+                            if player is not None else _profile.CLEAR)
+            _warping = (player is not None
+                        and _warp_state.is_ship_warping(player))
+
+            # Nebula lightning: tick the thunder driver while the player
+            # is in a clump or the profile's thick cloud
+            # (profile_fx.lightning_active).  Visual/audio only; gated
+            # by the toggle.
+            # Lazy construct (mirrors _nebula_tracker).
+            global _nebula_thunder
+            if r.nebula_lightning_enabled():
+                if _nebula_thunder is None:
+                    from engine.appc.nebula_thunder import NebulaThunderDriver
+                    _nebula_thunder = NebulaThunderDriver()
+                fwd = player.GetWorldForwardTG() if player is not None else None
+                fwd_t = (fwd.x, fwd.y, fwd.z) if fwd is not None else (0.0, 1.0, 0.0)
+                _nebula_thunder.update(
+                    _profile_fx.lightning_active(
+                        in_neb, _prof_sample, _warping),
+                    _frame_game_dt, _gt, fwd_t)
+                for name in _nebula_thunder.pop_due_audio(_gt):
+                    try:
+                        from engine.audio.tg_sound import TGSoundManager
+                        TGSoundManager.instance().PlaySound(name)
+                    except Exception:
+                        pass
+                # Hull electrical discharges: crackle on the hull while
+                # in a nebula, rate ∝ the nebula's damage.  Gated by
+                # the Nebula Lightning toggle (shared with the flashes).
+                # Lazy construct mirrors _nebula_thunder above.
+                global _hull_discharge
+                if _hull_discharge is None:
+                    from engine.appc.hull_discharge import HullDischargeDriver
+                    _hull_discharge = HullDischargeDriver()
+                clump_rate = 0.0
+                hull_pts = []
+                if in_neb and player is not None:
+                    pset = player.GetContainingSet()
+                    if pset is not None:
+                        for obj in pset.GetClassObjectList(App.CT_NEBULA):
+                            neb = App.MetaNebula_Cast(obj)
+                            if neb is not None and neb.IsObjectInNebula(player):
+                                clump_rate = neb.GetDamage()[0]
+                                break
+                sparking, dmg_rate = _profile_fx.discharge_inputs(
+                    in_neb, clump_rate, _prof_sample, _warping)
+                if sparking and player is not None:
+                    pset = player.GetContainingSet()
+                    # Anchor sparks across the WHOLE hull (saucer rim,
+                    # nacelles, pylons) via the model's surface-point
+                    # sample, not just the central subsystem mounts.
+                    _piid = (session.ship_instances.get(player)
+                             if session is not None else None)
+                    # VIEW coordinates, both sources: the discharge
+                    # feed is pushed through frames.view_to_render.
+                    if _piid is not None:
+                        # Drawn pose: sparks are VFX on the hull
+                        # the player sees.
+                        hull_pts = r.instance_surface_points(
+                            _piid, drawn=True)
+                    if not hull_pts:
+                        # Fallback: subsystem mounts (central, but better
+                        # than nothing) when no surface sample is available.
+                        from engine.appc.subsystems import subsystem_world_position
+                        _hview = _frames.viewing_set()
+                        for sub in player.GetSubsystems():
+                            wp = subsystem_world_position(sub, player)
+                            _hp = _frames.in_view(_hview, pset,
+                                                  wp.x, wp.y, wp.z)
+                            hull_pts.append(_hp if _hp is not None
+                                            else (wp.x, wp.y, wp.z))
+                _hull_discharge.update(sparking, dmg_rate, _frame_game_dt, hull_pts, _gt)
+
+            # Nebula ship wake: record the player's path while in a nebula.
+            # Gated by Volumetric Nebulae ONLY (spec §7: "no cloud → no
+            # wake"), independent of the Nebula Lightning toggle.
+            global _nebula_wake
+            if r.volumetric_nebulae_enabled():
+                if _nebula_wake is None:
+                    from engine.appc.nebula_wake import NebulaWakeTracker
+                    _nebula_wake = NebulaWakeTracker()
+                _emitters = []
+                _waking = _profile_fx.wake_active(in_neb, _prof_sample, _warping)
+                if _waking and player is not None:
+                    from engine.appc.subsystems import active_impulse_emitters
+                    _emitters = active_impulse_emitters(player)
+                _nebula_wake.update(_waking, _emitters, _gt)
+
+        # Collision detection + response (ships/asteroids/moons/
+        # planets). Runs once per render frame after motion + player
+        # input, so every body's post-thrust position is current.
+        # Reuses combat.apply_hit for impact damage; injects a
+        # mass-weighted impulse into each body's decaying
+        # _collision_velocity overlay. Spec
+        # docs/superpowers/specs/2026-06-11-collision-response-design.md.
+        # dt = _player_dt (clamped wall-clock frame delta), matching
+        # the player integrator — the collision-velocity overlay is
+        # real-time motion, so it advances/decays on real elapsed time,
+        # not the fixed sim TICK_DT.
+        # BC's warp FSM (dewarp transitions + warp-in slides) advances
+        # on game time inside GameLoop.tick (warp_state.tick_warp_states),
+        # which runs above, before collisions: a ship in warp is
+        # non-collidable (collisions._collisions_enabled), so a dewarp
+        # that completes this frame is collidable THIS frame, not next.
+        # sync_flythrough is the leak guard — once the warp animator is
+        # inactive the flythrough ship cannot still read as warping,
+        # however the sequence ended.
+        from engine.appc import warp_state as _warp_state
+        from engine import warp_vfx as _wv_state
+        _warp_state.sync_flythrough(_wv_state.get().is_active())
+
+        with frame_profiler.scope("sim.debris_chunks"):
+            from engine.appc import debris_chunk as _debris_chunk
+            with frame_profiler.scope("dc.tick"):
+                _debris_chunk.tick(_player_dt, r)
+            from engine.appc import hull_breakup as _hull_breakup
+            with frame_profiler.scope("dc.breakup_drain"):
+                _hull_breakup.drain()
+            from engine.appc import hull_wear as _hull_wear
+            with frame_profiler.scope("dc.wear_drain"):
+                _hull_wear.drain()
+
+        with frame_profiler.scope("sim.collisions"):
+            collisions.tick_collisions(
+                _player_dt,
+                ship_instances=(session.ship_instances if session is not None else None),
+            )
+
+        # Rock breakup, render side (rock-class spec §2): the death
+        # burst (crack flash, dust, light) engine.rocks.death queued
+        # -- this frame's collision kills included. Breakup debris is
+        # a free minor cloud (engine.rocks.minors), not bodies here.
+        with frame_profiler.scope("sim.rock_breakup"):
+            from engine.rocks import vfx as rock_vfx
+            rock_vfx.pump()
+            _pump_minor_contact(player, session=session)
+            _pump_scenery_contact(player, session=session)
+
+        with frame_profiler.scope("sim.rock_promotion"):
+            _pump_rock_promotion(player, session=session)
+
+        # The frame-end boundary (native damage, ruling R8): what the
+        # post-step pass above reported -- radiation, hull breakup,
+        # collisions, scenery contact, rock promotion's restores --
+        # is delivered now, its deaths included, not a frame later.
+        with frame_profiler.scope("sim.effects_frame"):
+            _effect_queue.boundary()
+
+        # The player's dash (engine/appc/dash.py): its align, its
+        # engage, and the drop-out of a flight that ended this frame
+        # -- before the hand-off tick, so a drop-out's own hand-off
+        # lands first.
+        with frame_profiler.scope("sim.travel"):
+            if player is not None:
+                from engine.appc import dash
+                dash.tick(player, _player_dt)
+
+            # The impulse region hand-off (in-system-warp spec section 3,
+            # rule H): the player crosses into another region's sphere
+            # under its own power. Runs after collisions (this frame's
+            # last mover of the player) and before the scene reconcile,
+            # which reads the player's containing set to decide what the
+            # render scope shows this frame. A no-op while the player is
+            # dashing (handoff._is_dashing) -- Task 4's drop-out calls
+            # handoff.hand_off directly once the flight ends.
+            if player is not None:
+                from engine.systems import handoff
+                handoff.tick(player)
+
+        # The scene reconcile (_reconcile_scene): load the player's
+        # system, realize / tear down / cull / hide ships for the
+        # render scope, and diff the viewed frame's map bodies. It
+        # reads frames.viewing_set(), so it runs HERE -- after every
+        # part of the frame's sim that can change the view (the timers
+        # in loop.tick, input and clicks that engage a warp, combat,
+        # the warp FSM, collisions) and immediately before
+        # _sync_instance_transforms, the camera and
+        # _apply_render_origin, which read the same view. Before the
+        # sim, a frame that changed the view drew map bodies in the
+        # OLD view's coordinates. INVARIANT: it is the FIRST visibility
+        # writer of the frame -- warp hide (in _sync_instance_
+        # transforms), SPV, bridge player and cloak all run after it
+        # and AND their conditions with scope_hidden, and the scope
+        # only writes on a change. Order guarded by
+        # tests/host/test_scene_reconcile_ordering.py.
+        with frame_profiler.scope("sim.reconcile"):
+            _reconcile_scene(
+                session, controller.renderer, nif_cache=controller,
+                on_player_change=_on_player_change, verbose=verbose)
+            # It may have retargeted session.player (RecreatePlayer).
+            player = session.player if session is not None else None
+            # The reconcile above may have just realized a player ship
+            # RecreatePlayer created with an unknown (0) radius -- catch
+            # up the cameras now that GetRadius() is real.
+            _reconcile_camera_radius(director, player)
+
+        # Sync transforms for known instances: every ship is drawn
+        # through the native interpolation buffer (phase 3c). The
+        # player is drawn live while manually flown (integrated per
+        # render frame in _PlayerControl, already smooth) and
+        # interpolated otherwise; every other ship is integrated on
+        # the 60 Hz tick and drawn at lerp(prev, cur, _interp_alpha).
+        # advance_ticks rolled the buffer above; the frame-end
+        # capture below records the new current state. This only
+        # affects what is drawn — the ship objects keep live
+        # transforms, so physics/AI/combat are unaffected.
+        with frame_profiler.scope("sim.render_xforms"):
+            if session is not None:
+                # Render-pose provider: the camera (below) and the
+                # renderer must anchor on IDENTICAL per-ship poses: both
+                # read the native drawn pose (interp_sample /
+                # interp_compose).
+                _player_iid_i = (session.ship_instances.get(player)
+                                 if player is not None else None)
+                # Interpolate the player render when it is NOT being flown
+                # per render frame by _PlayerControl: a helm-AI / waypoint
+                # order (GetAI) OR an active in-space cutscene (the player
+                # is scripted, never manually flown then, and a cutscene
+                # camera is commonly locked onto it — so its 60 Hz-stepped
+                # motion must be interpolated or the whole shot judders).
+                # An in-system dash too: its flight steps the ship on the
+                # tick (_player_render_interpolated).
+                _interp_player = _player_render_interpolated(
+                    player, sim_frozen=pause.sim_frozen,
+                    cutscene_active=_active_cutscene_camera() is not None)
+                if _player_iid_i is not None:
+                    _set_interp_mode(session, _xform_buf,
+                                     _player_iid_i, not _interp_player)
+                # The frame-end publish: every tracked ship's current
+                # snapshot from the live store, after every per-frame
+                # pose writer and before the camera samples it.
+                _xform_buf.capture()
+                # A hand-off (the same player, another region set): the
+                # slot and any handover window hold the old set's
+                # coordinates -- re-seed / drop them, and never open a
+                # window from last frame's (old-set) drawn pose.
+                _pset = (player.GetContainingSet()
+                         if player is not None else None)
+                if (player is not None
+                        and _prev_player_set[0] is player
+                        and _prev_player_set[1] is not None
+                        and _pset is not _prev_player_set[1]):
+                    _rebase_player_render(_xform_buf, _player_iid_i)
+                    _prev_drawn_player_pose = None
+                _prev_player_set = (player, _pset)
+                # The viewed set changed within the frame (a hand-off):
+                # re-base the cameras and drop the dust history before
+                # the camera is solved below.
+                _view_now = _frames.viewing_set()
+                _view_off = _view_rebase_offset(_prev_view_set, _view_now)
+                if _view_off is not None:
+                    _rebase_view(r, director, _view_off)
+                _prev_view_set = _view_now
+                # Handover easing: the pipeline the player is drawn from
+                # flips between live (manual) and interpolated (AI /
+                # scripted), and those sit a tick apart. The window is
+                # advanced ONCE a frame, here, ahead of both the
+                # camera's sample and the sync's compose, so the two
+                # see one elapsed time; a flip then opens a window
+                # from the pose the compose drew last frame.
+                host_io.interp_handover_advance(_player_dt)
+                _drive_handover_smoother(
+                    _player_iid_i, _prev_interp_player, _interp_player,
+                    _prev_drawn_player_pose)
+                _pose_of = _make_render_pose_provider(
+                    session, _xform_buf, _interp_alpha)
+                # The camera's player pose (the same native drawn pose
+                # the compose uses); kept as "a drawn pose exists" for
+                # the next frame's handover begin, and for telemetry.
+                _player_interp_pose = (
+                    _pose_of(player) if player is not None else None)
+                _prev_interp_player = _interp_player
+                _prev_drawn_player_pose = _player_interp_pose
+                # Same game clock the decal system ages on
+                # (engine.appc.damage_decals). Read once per frame.
+                _sync_instance_transforms(
+                    r, session, player, _xform_buf, _interp_alpha,
+                    App.g_kUtopiaModule.GetGameTime(), BC_MODEL_SCALE,
+                    player_control=player_control,
+                    player_is_interpolated=_interp_player)
+    else:
+        # Frozen frame (pause, DevTools): no sim ran, so nothing
+        # changed the view; reconcile as every frame always has, still
+        # ahead of the SPV / bridge-player / cloak visibility writers.
+        with frame_profiler.scope("sim.reconcile"):
+            _reconcile_scene(
+                session, controller.renderer, nif_cache=controller,
+                on_player_change=_on_player_change, verbose=verbose)
+            player = session.player if session is not None else None
+            # Same catch-up as the live branch above -- a frozen frame
+            # (e.g. the pause menu opened the same tick RecreatePlayer
+            # ran) must not leave the cameras on an unknown radius.
+            _reconcile_camera_radius(director, player)
+    # --- frame sim: end ---
+
+    ctx.accumulator = _accumulator
+    ctx.previous_real_time = _previous_real_time
+    ctx.bridge_left_pick_active = _bridge_left_pick_active
+    ctx.z_held_prev = z_held_prev
+    ctx.v_held_prev = v_held_prev
+    ctx.prev_interp_player = _prev_interp_player
+    ctx.prev_player_set = _prev_player_set
+    ctx.prev_view_set = _prev_view_set
+    ctx.prev_drawn_player_pose = _prev_drawn_player_pose
+    ctx.interp_player = _interp_player
+    return FrameSimResult(
+        now=_now,
+        wall_dt=_wall_dt,
+        frame_dt=_frame_dt,
+        player_dt=_player_dt,
+        frame_game_dt=_frame_game_dt,
+        interp_alpha=_interp_alpha,
+        sim_ticks=_sim_ticks_this_frame,
+        ships_this_tick=_ships_this_tick,
+        pose_of=_pose_of,
+        player_interp_pose=_player_interp_pose,
+        session=session,
+        player=player,
+    )
 
 
 def run(mission_name: Optional[str] = None,
@@ -10586,6 +12045,24 @@ def run(mission_name: Optional[str] = None,
             r.shutdown()
             return 0
 
+    # Activision's required notice (SDK licence, "New Game Materials"):
+    # after the first-run and Mods screens, so it shows on every launch. It
+    # fades in here and HOLDS while the SDK and the mission load behind it;
+    # _finish_boot_notice fades it out just before run() takes over the CEF
+    # handlers, so the bridge follows the fade-out instead of a black hang.
+    # _notice_ended_at times the gap from its fade-out to the first game
+    # frame (logged once, below r.frame()).
+    _boot_notice = None
+    _notice_ended_at = None
+    if _boot_notice_wanted(_os.environ, max_ticks, _cef_ready):
+        _boot_notice = _begin_boot_notice(_CEF_VIEW_W, _CEF_VIEW_H)
+        if r.should_close():
+            r.cef_shutdown()
+            r.shutdown()
+            return 0
+        if _boot_notice is not None:
+            _set_boot_audio_muted(True)
+
     _prewarm_sdk_modules()
 
     import App
@@ -10609,6 +12086,11 @@ def run(mission_name: Optional[str] = None,
         # teardown beside spawn.set_radius_fn(None).
         from engine.appc import warp_state as _warp_state
         _warp_state.set_radius_seeder(controller.loader._seed_quickbattle_ship_radius)
+        # Articulated part poses reach the render instance (and the mesh
+        # trace) when they change on the sim side, not per frame (phase 3a).
+        # Reads the session at call time, so a mission swap needs no reset.
+        from engine.appc import pose_sink as _pose_sink
+        _pose_sink.set(lambda ship: _push_articulation(controller.session, ship))
 
         # Warp spine render hooks (Stage 1 hard cut): the warp sequence loads
         # the destination set then calls realize; on arrival it tears down the
@@ -10853,6 +12335,10 @@ def run(mission_name: Optional[str] = None,
             controller.session = controller.loader.load_quickbattle()
         else:
             controller.session = controller.loader.load(mission_name)
+        # The far tier's catalogue push (every near rock's LOD models) is a
+        # once-per-session cost the first frame used to pay: do it now, while
+        # the boot notice covers the load.
+        _far_tier.prewarm(r)
         # The SDK's CreateAndPopulateBridgeSet plays AmbBridge at load
         # (LoadBridge.py:213); silence it now since the initial view is space.
         # bridge_ambient remains the sole authority on when the hum plays.
@@ -10963,6 +12449,7 @@ def run(mission_name: Optional[str] = None,
         controller.bridge_runtime = BridgeRuntime(
             eye=lambda: _BRIDGE_CAMERA_EYE, alert=_bridge_runtime_alert_level)
         _bridge_probe_alert_last = [None]   # mutable box: last frame's level
+        _bridge_texture_offset = [0.0]      # editor preview time (_bridge_texture_time)
 
         _after_mission_loaded()
         try:
@@ -11008,6 +12495,9 @@ def run(mission_name: Optional[str] = None,
                 _warp_in_dials.register()
                 from engine.appc import plating_dials as _plating_dials
                 _plating_dials.register()
+                from engine import bridge_ao_dials as _bridge_ao_dials
+                _bridge_ao_dials.register(
+                    lambda d: r.set_bridge_ao_tuning(**d))
                 from engine.planets import atmosphere_dials as _atmo_dials
                 _atmo_dials.set_target_fn(
                     lambda: _nearest_live_planet(controller.session)
@@ -11155,6 +12645,7 @@ def run(mission_name: Optional[str] = None,
             on_reset=lambda section: _settings.reset_and_apply_section(
                 _store, _settings_ctx, section),
             set_dust=r.set_dust_enabled,
+            set_fullscreen=r.set_fullscreen,
             set_hdr=r.set_hdr_enabled,
             set_rim=r.set_rim_enabled,
             # Routed through the settings row, not straight at the renderer:
@@ -11407,41 +12898,30 @@ def run(mission_name: Optional[str] = None,
         TICK_DT = 1.0 / 60.0
         MAX_FRAME_DT = 0.25  # Fiedler spiral-of-death cap
 
-        loop = GameLoop()
+        # The host's tick boundary is the per-tick combat flush below
+        # (_combat_tick_boundary), not the end of the GameLoop tick.
+        loop = GameLoop(owns_boundary=False)
         ticks = 0
         init_audio()
         _bootstrap_firing_pipeline()
 
         # Fixed-timestep accumulator state — sim runs at TICK_DT (60 Hz)
         # regardless of render refresh rate. See engine/core/timestep.py.
-        import time
-        from engine.core.timestep import step_accumulator
-        _previous_real_time = time.monotonic()
+        _previous_real_time = _frame_clock()
         _accumulator = 0.0
         # True while a bridge-officer left-click is held (press was intercepted
         # for the crew menu); used to swallow the matching release edge so it
         # never leaks to phaser fire. See the officer-pick block below.
         _bridge_left_pick_active = False
-        from engine.core.transform_buffer import TransformBuffer, advance_ticks
-        from engine.core.handover_smoother import HandoverSmoother
-        _xform_buf = TransformBuffer()
+        from engine.core.native_transform_buffer import NativeTransformBuffer
+        # Render interpolation is native (phase 3c): snapshots, the compose
+        # and the player's helm-handover blend (engine/core/handover_smoother
+        # is its Python twin) all live behind host_io's interp_* bindings.
+        _xform_buf = NativeTransformBuffer()
 
         def _tick_gameloop():
             with frame_profiler.scope("sim.gameloop"):
                 loop.tick()
-
-        def _interp_live_poses():
-            """Live poses of every realised ship the buffer may track, for
-            advance_ticks' pre-last-tick re-seat (multi-tick frames only)."""
-            _s = controller.session
-            if _s is None:
-                return ()
-            return [(iid, obj.GetWorldLocation(), obj.GetWorldRotation())
-                    for obj, iid in list(_s.ship_instances.items())
-                    if _xform_buf.has(iid)]
-        # Eases the player's drawn pose across a helm handover; see
-        # engine/core/handover_smoother. Inert except during a handover window.
-        _handover = HandoverSmoother()
         _prev_interp_player = None      # None until the first frame completes
         # (player, its containing set) last running frame: a hand-off is the
         # same player in another set (_rebase_player_render).
@@ -11510,7 +12990,7 @@ def run(mission_name: Optional[str] = None,
         # GPU timing is opt-in (DAUNTLESS_PROFILE_GPU=1). Its timer queries
         # make the CPU wait for the GPU, adding about the GPU frame time, so
         # by default every capture below is CPU-only and its frame time real
-        # (docs/engine/perf-register.md, M-6).
+        # (docs/reference/engine/perf-register.md, M-6).
         host_io.profiler_set_gpu_enabled(
             frame_profiler.gpu_timing_requested_from_env())
         # DAUNTLESS_PROFILE_GPU_FOCUS=a,b: GPU-time these nested scopes too
@@ -11528,6 +13008,11 @@ def run(mission_name: Optional[str] = None,
         # DAUNTLESS_PROFILE_SPIKES=<path>: write every frame over the
         # threshold (DAUNTLESS_PROFILE_SPIKE_MS, default 100) to a file, raw.
         # Works without --developer; vsync is left as it is.
+        # DAUNTLESS_PROFILE_PY=<path>: a cProfile window over whole frames
+        # (engine/core/py_profile.py) for splitting AI / subsystems / combat
+        # by class. Read relative splits only: cProfile inflates the frame.
+        from engine.core import py_profile as _py_profile_mod
+        _py_profile = _py_profile_mod.Window.from_env()
         if frame_profiler.configure_spike_log_from_env():
             print("[host_loop] spike capture -> %s (>= %.0f ms)"
                   % (frame_profiler.spike_log_path(),
@@ -11538,7 +13023,7 @@ def run(mission_name: Optional[str] = None,
         motion_trace.configure_from_env()
         # Record what was captured: the drawn size drives GPU cost, and two
         # captures at different sizes are not comparable
-        # (docs/engine/perf-register.md, M-4).
+        # (docs/reference/engine/perf-register.md, M-4).
         if frame_profiler.is_enabled():
             try:
                 _fbw0, _fbh0 = host_io.framebuffer_size()
@@ -11583,10 +13068,70 @@ def run(mission_name: Optional[str] = None,
                 from engine.appc.top_window import TopWindow_GetTopWindow
                 TopWindow_GetTopWindow().ForceTacticalVisible()
 
+        # Everything up to here loaded behind the boot notice: fade it out.
+        # Its pump loop installs CEF handlers of its own (see
+        # _finish_boot_notice), so run()'s are put back after it, and the
+        # frame clock restarts so the fade is not replayed as sim time.
+        if _boot_notice is not None:
+            _finish_boot_notice(_boot_notice, _CEF_VIEW_W, _CEF_VIEW_H)
+            _set_boot_audio_muted(False)
+            if _cef_set_event_handler is not None:
+                _cef_set_event_handler(registry.dispatch)
+            if _cef_set_load_end is not None:
+                _cef_set_load_end(_on_cef_load_end)
+            _previous_real_time = _frame_clock()
+            _notice_ended_at = _previous_real_time
+
+        # The frame sim section's inputs, and the state it carries across
+        # frames (_run_frame_sim). Built once, after the boot notice's
+        # clock restart.
+        _frame_ctx = FrameSimContext(
+            h=_h,
+            controller=controller,
+            director=director,
+            view_mode=view_mode,
+            player_control=player_control,
+            pause=pause,
+            input_map=input_map,
+            xform_buf=_xform_buf,
+            tick_gameloop=_tick_gameloop,
+            snap_scene=_snap_scene,
+            close_star_map=_close_star_map,
+            consume_scroll=_consume_scroll,
+            cef_send_wheel=_cef_send_wheel,
+            crew_menu_panel=crew_menu_panel,
+            perf_monitor_panel=perf_monitor_panel,
+            configuration_panel=configuration_panel,
+            collisions=collisions,
+            verbose=verbose,
+            tick_dt=TICK_DT,
+            max_frame_dt=MAX_FRAME_DT,
+            cutscene=cutscene,
+            bridge_camera=bridge_camera,
+            char_anim=char_anim,
+            walk_ctrl=walk_ctrl,
+            watch_ctrl=watch_ctrl,
+            idle_gestures=idle_gestures,
+            node_anim=node_anim,
+            lip_runtime=lip_runtime,
+            letterbox_anim=_letterbox_anim,
+            accumulator=_accumulator,
+            previous_real_time=_previous_real_time,
+            bridge_left_pick_active=_bridge_left_pick_active,
+            z_held_prev=z_held_prev,
+            v_held_prev=v_held_prev,
+            prev_interp_player=_prev_interp_player,
+            prev_player_set=_prev_player_set,
+            prev_view_set=_prev_view_set,
+            prev_drawn_player_pose=_prev_drawn_player_pose,
+        )
+
         while not r.should_close():
             # Frame profiler: phase timeline for the Python half of the frame.
             # No-op (one global read + branch) unless a developer enabled it
             # with the ` key. See engine/core/frame_profiler.py.
+            if _py_profile is not None:
+                _py_profile.frame_tick()
             frame_profiler.begin_frame()
             frame_profiler.mark("cef_resize")
             # --- Track window resizes: re-lay-out the CEF overlay at the new
@@ -11781,8 +13326,9 @@ def run(mission_name: Optional[str] = None,
                         # was our own earlier guess and would restore and
                         # clear at the wrong moments.
                         try:
-                            _target_menu_mod.remember_player_target(_player)
-                            _target_menu_mod.attempt_persistent_restore(_player)
+                            with frame_profiler.scope("contacts.persist"):
+                                _target_menu_mod.remember_player_target(_player)
+                                _target_menu_mod.attempt_persistent_restore(_player)
                         except Exception as _e:
                             dev_mode.log_swallowed("persistent target", _e)
 
@@ -11984,679 +13530,25 @@ def run(mission_name: Optional[str] = None,
                         # the keyboard (abandoning the edit) here.
                         text_capture.release()
 
-            frame_profiler.mark("sim")
-            # --- Sim advance: fixed-timestep accumulator ---
-            # frame_dt is the real wall-clock since the previous frame.
-            # While frozen we force it to 0 so the accumulator cannot
-            # grow and there is no catch-up burst on resume. The cap
-            # bounds the inner while-loop after a stalled render frame.
-            # Frozen = pause menu OR the DevTools window (which stops the
-            # world so the overlay under inspection holds still).
-            pause.set_external_freeze(_devtools_frozen(_h))
-            _now = time.monotonic()
-            # The raw wall delta, kept apart from _frame_dt (which the freeze
-            # zeroes): the Bridge Editor's preview clock runs while the
-            # (hidden) pause menu freezes the sim (spec 2026-10-08-bridge-emitters §12.2).
-            _wall_dt = _now - _previous_real_time
-            _frame_dt = _wall_dt
-            _previous_real_time = _now
-            if perf_monitor_panel is not None:
-                perf_monitor_panel.tick(_wall_dt)
-            if pause.sim_frozen:
-                _frame_dt = 0.0
-            _accumulator, _sim_ticks_this_frame = step_accumulator(
-                _accumulator, _frame_dt, TICK_DT, MAX_FRAME_DT
-            )
-            frame_profiler.note_sim_ticks(_sim_ticks_this_frame)
-            # Per-render-frame delta for the player input integrator.
-            # _apply_input runs once per render frame, so its dt must
-            # be the wall-clock delta since the last frame — not the
-            # fixed sim TICK_DT. Otherwise at 120 Hz monitor refresh
-            # the player ship rotates / accelerates 2× too fast (BC
-            # Galaxy 360° yaw collapses from 24 s to 12 s). Clamp
-            # matches step_accumulator's spiral-of-death cap so a
-            # stalled frame doesn't teleport the player.
-            _player_dt = 0.0 if pause.sim_frozen else min(max(_frame_dt, 0.0), MAX_FRAME_DT)
-            _interp_alpha = _accumulator / TICK_DT  # in [0, 1) after step_accumulator
-            # GameLoop = timers, the TimeSliceProcess scheduler, the AI
-            # tree-walk, collision avoidance, motion integration and the
-            # per-ship shield/power/cloak/repair updates. Timed separately
-            # from the weapon/combat pumps below, which it does NOT drive.
-            # advance_ticks rolls the interpolation buffer and, on a frame
-            # that runs 2+ ticks, re-seats its prev just before the last one,
-            # so the drawn pose always blends across exactly one tick.
-            advance_ticks(_xform_buf, _sim_ticks_this_frame,
-                          _tick_gameloop, _interp_live_poses)
-            # The warp tunnel's destination preload: at most one model load
-            # per frame, so no tunnel frame pays for the whole destination.
-            with frame_profiler.scope("warp.preload"):
-                _step_warp_preload()
-
-            # Only snap the camera when a sim tick actually fired —
-            # no tick means no state change to follow.
-            if _sim_ticks_this_frame > 0:
-                had_pending_swap = controller.pending_swap is not None
-                # Clear any stale cutscene from the OUTGOING mission BEFORE the
-                # drain — the drain runs the incoming mission's Initialize()/
-                # Briefing(), which queues that mission's own camera/door
-                # requests. Resetting after the drain would wipe the freshly
-                # queued walk-on (the camera then never moves).
-                if had_pending_swap:
-                    cutscene.reset()
-                    bridge_camera.reset_cutscene_pose()
-                    char_anim.reset()
-                    walk_ctrl.reset()
-                    watch_ctrl.reset()
-                    idle_gestures.reset()
-                    node_anim.reset(renderer=r)
-                    lip_runtime.clear()
-                    _letterbox_anim.reset()
-                    _close_star_map()
-                controller._drain_pending_swap()
-                if had_pending_swap:
-                    _snap_scene()
-                    # Same discontinuity: never blend the player in from a
-                    # pose that belonged to the previous scene.
-                    _handover.cancel()
-                    _prev_interp_player = None
-                    _prev_drawn_player_pose = None
-                    # Nor re-base across a swap: the old sets are gone.
-                    _prev_player_set = (None, None)
-                    _prev_view_set = None
-            else:
-                had_pending_swap = False
-
-            session = controller.session
-            # Fire QuickBattle's stored preload-done event (if pending) BEFORE
-            # reconciliation. Its handler (StartSimulation2) spawns the player
-            # ship; firing first means the reconciliation pass below realizes
-            # that ship in the same tick. Fire-once and fully guarded — a no-op
-            # for missions that never set a preload-done event.
-            _fire_pending_preload_done()
-            # Remove SetDeleteMe(1)-flagged objects from their set (QuickBattle
-            # "End Combat" clears the battle this way); the reconciliation below
-            # then tears down their render instances.
-            _process_object_deletions()
-            # Mirror the SDK config-dialog flag onto the Quick Battle Setup
-            # panel: opens it when the player clicks the XO menu's config
-            # button, closes it on Close/Start. Boot leaves it closed.
-            _sync_quick_battle_panel(controller)
-            # The camera follows session.player; _sync_player_identity (just
-            # below, and again in the scene reconcile after the sim) calls
-            # this when the player's identity changed
-            # (RecreatePlayer's destroy+recreate). Snap so the new player
-            # doesn't lerp from the destroyed ship's pose, and re-seed the
-            # director's ship-radius distances.
-            def _on_player_change(new_player, _d=director, _xb=_xform_buf):
-                _r = new_player.GetRadius()
-                _d.chase.set_ship_radius(_r)
-                _d.tracking.set_ship_radius(_r)
-                _d.snap()
-                _xb.reset_all()
-            # Sync the player BEFORE the sim reads it: the preload-done event
-            # above may have just run RecreatePlayer, and the scene reconcile
-            # that would otherwise catch it runs after the sim (Ruling 11).
-            if session is not None:
-                _sync_player_identity(session, _on_player_change)
-            player = session.player if session is not None else None
-            if had_pending_swap and player is not None:
-                _r = player.GetRadius()
-                director.chase.set_ship_radius(_r)
-                director.tracking.set_ship_radius(_r)
-
-            # Render-pose interpolation (smooth motion on high-refresh displays).
-            # Populated below when the sim is live; left None while paused (and
-            # for the manually-flown player), in which case the camera and
-            # renderer read live poses exactly as before. See
-            # _make_render_pose_provider / _sync_instance_transforms.
-            _pose_of = None
-            _player_interp_pose = None
-
-            # Mouse-wheel routing (runs every frame, paused or not). Scroll
-            # delta is consumed once per tick — the single consumer of the
-            # accumulator. Over a CEF surface (a pause/config modal is open,
-            # or the cursor is over a HUD panel) → scroll that panel; over
-            # open space in exterior view → step the ship throttle. Replaces
-            # the old camera scroll-zoom. Old bindings without the accumulator
-            # return 0.0 via the fallback.
-            scroll_y = _consume_scroll() if _consume_scroll is not None else 0.0
-            _route_scroll_wheel(
-                scroll_y,
-                route_to_panel=(pause.is_open or _cursor_in_panel),
-                mx=_mx, my=_my,
-                send_wheel=_cef_send_wheel,
-                player_control=player_control,
-                can_throttle=(player is not None and view_mode.is_exterior),
-            )
-
-            if not pause.is_open:
-                # Dev-mode keybindings (no-op when --developer is not set).
-                # register_for_frame re-binds handlers that close over the
-                # current player/session each tick; dispatch_dev_key reads
-                # _h.key_pressed for every registered key and fires matching
-                # handlers. Skipped silently when dev_mode.is_enabled() is False.
-                if _h is not None and dev_mode.is_enabled():
-                    dev_keybindings.register_for_frame(_h, session, player)
-                    for key, _desc in dev_mode.keybinding_descriptions():
-                        if host_io.key_pressed(key):
-                            dev_mode.dispatch_dev_key(key)
-
-                # F12: toggle CEF DevTools for the UI overlay.
-                if _h is not None and host_io.key_pressed(_h.keys.KEY_F12):
-                    _h.cef_toggle_devtools()
-
-                # Cmd+R / Ctrl+R: hot-reload the CEF overlay's HTML.
-                # Reload only when Cmd (macOS) or Ctrl (Linux/Windows) is held;
-                # bare R is reverse-thrust and must not be intercepted.
-                if _h is not None and host_io.key_pressed(_h.keys.KEY_R):
-                    _cmd_held = host_io.key_state(_h.keys.KEY_LEFT_SUPER) if hasattr(_h.keys, "KEY_LEFT_SUPER") else False
-                    _ctrl_held = host_io.key_state(_h.keys.KEY_LEFT_CONTROL) if hasattr(_h.keys, "KEY_LEFT_CONTROL") else False
-                    if _cmd_held or _ctrl_held:
-                        _h.cef_reload()
-
-            # This frame's ships, when the sim runs; None on a frozen frame
-            # (the render section keys the combat feed push off it).
-            _ships_this_tick = None
-            # Everything below is SIMULATION — ship/camera input, firing,
-            # weapons, combat, sensors, nebula — so it gates on sim_frozen,
-            # not on the menu. The DevTools keys above deliberately sit in the
-            # is_open block instead: DevTools freezes the sim, so gating F12 on
-            # sim_frozen would make it impossible to press F12 a second time to
-            # close DevTools again.
-            if not pause.sim_frozen:
-                # Apply keyboard input to the player ship's transform and to the
-                # orbit camera (see _apply_input below).
-
-                if player is not None and _h is not None:
-                    # Alert keys (Shift+1/2/3) run before the throttle handler;
-                    # _PlayerControl.apply checks _shift_held() to skip digit
-                    # throttling on the same press.
-                    _apply_alert_keys(_h, player)
-                    # C-key: toggle Chase ↔ Tracking (only enters Tracking if
-                    # the player has a valid target). key_pressed fires once per
-                    # key-down event (not while held). Gate on exterior view so
-                    # the mode cannot flip silently while the bridge is active.
-                    if view_mode.is_exterior and host_io.key_pressed(input_map.code("camera_cycle")):
-                        director.toggle_mode(player=player)
-                    # Z-key: ZoomTarget framing while held. Held-state (not
-                    # press-edge) so the camera enters/exits as the key state
-                    # changes. The `not director.tracking.zoom_target_active`
-                    # retry guard lets a Z-held-during-target-acquisition
-                    # succeed on whichever frame the target appears.
-                    z_held_now = view_mode.is_exterior and host_io.key_state(input_map.code("camera_zoom_target"))
-                    if z_held_now and not director.tracking.zoom_target_active:
-                        director.start_zoom_target(player=player)
-                    elif z_held_prev and not z_held_now:
-                        director.end_zoom_target()
-                    z_held_prev = z_held_now
-                    # =/- sticky zoom: press-edge (OS auto-repeat for hold).
-                    if view_mode.is_exterior and host_io.key_pressed(input_map.code("camera_zoom_in")):
-                        director.zoom_in()
-                    if view_mode.is_exterior and host_io.key_pressed(input_map.code("camera_zoom_out")):
-                        director.zoom_out()
-                    # V-key: Reverse Chase while held. Same hold-state
-                    # edge detection as Z, with a retry guard so a
-                    # V-held-during-mode-transition succeeds on the
-                    # next eligible frame.
-                    v_held_now = view_mode.is_exterior and host_io.key_state(input_map.code("camera_reverse_chase"))
-                    if v_held_now and not director.chase.reverse_active:
-                        director.start_reverse()
-                    elif v_held_prev and not v_held_now:
-                        director.end_reverse()
-                    v_held_prev = v_held_now
-                    # Shift+mouse: orbit yaw/pitch additive on top of
-                    # arrow keys. Drain the mouse delta unconditionally
-                    # in exterior view so non-Shift mouse motion doesn't
-                    # accumulate and snap the camera on the next Shift
-                    # press.
-                    mouse_dx_exterior, mouse_dy_exterior = 0.0, 0.0
-                    if view_mode.is_exterior:
-                        mouse_dx_exterior, mouse_dy_exterior = host_io.consume_mouse_delta()
-                    shift_held = view_mode.is_exterior and (
-                        host_io.key_state(_h.keys.KEY_LEFT_SHIFT) or
-                        host_io.key_state(_h.keys.KEY_RIGHT_SHIFT)
-                    )
-                    if shift_held and director.mode is CameraMode.CHASE:
-                        director.chase.apply_mouse_delta(
-                            mouse_dx_exterior, mouse_dy_exterior)
-                    # dt = _player_dt (wall-clock frame delta), not TICK_DT —
-                    # see comment at the accumulator step. _apply_input fires
-                    # once per render frame, so its dt is the wall delta.
-                    _apply_input(view_mode, player_control, director,
-                                 player=player, dt=_player_dt, h=_h)
-
-                # Bridge crew-menu click. On the bridge the cursor is locked for
-                # mouse-look, so the player AIMS by looking: the reticle is
-                # screen centre.
-                #   - No menu open: centre an officer and left-click → open that
-                #     officer's crew menu (else the click falls through to
-                #     _poll_mouse_buttons and fires phasers).
-                #   - Menu open: the cursor is freed for the CEF menu; a click on
-                #     the menu itself is consumed earlier by the CEF panel
-                #     forwarding, so any left press we still see here is OFF the
-                #     menu → close it.
-                # mouse_button_pressed consumes the edge, so we only call it once
-                # we've decided to intercept — leaving genuine empty-space clicks
-                # to fire phasers.
-                if view_mode.is_bridge and _h is not None:
-                    _bridge_left_pick_active = bridge_officer_picking.handle_click(
-                        _h, r, bridge_camera, crew_menu_panel,
-                        _bridge_left_pick_active)
-
-                # Forward mouse button edges into the input manager (fire
-                # events route via g_kKeyboardBinding → TCW handlers).
-                _poll_mouse_buttons(_h)
-                _poll_function_keys(_h, input_map)
-                _poll_fire_keys(_h, input_map)
-                _poll_modifier_chords(_h)
-                # General key stream → BC's raw ET_KEYBOARD window event.
-                # Runs AFTER the three tables above so their _fn_key_prev
-                # entries are already written for this frame (it skips the
-                # keys they own, but the ordering keeps that invariant
-                # obvious).
-                _poll_raw_keyboard(_h, input_map)
-                _poll_skip_dialogue(_h, input_map)
-
-                # Manual Aim (H): re-pick the cursor's hull point on the
-                # player's target, or revert to the subsystem lock. Sim side
-                # on purpose -- it mutates the player's target offset, which
-                # the weapon tick below and the phaser tick in
-                # _advance_combat both read this same frame.
-                manual_aim.update(
-                    player=player,
-                    tcw=TacticalControlWindow.GetInstance(),
-                    ship_instances=(session.ship_instances if session is not None else None),
-                    is_exterior=view_mode.is_exterior,
-                )
-
-                # Advance weapon charge / reload for every ship in every
-                # active set.  Runs after AI/physics (approximate — the host
-                # loop is single-threaded and Python AI runs in the gameloop
-                # tick above) so emitters are ready when AI fire calls land.
-                # Materialize the ship list once per frame — both consumers
-                # re-walked every set independently before.
-                _ships_this_tick = list(_all_ships_for_tick())
-                with frame_profiler.scope("sim.weapons"):
-                    _advance_weapons(_ships_this_tick, TICK_DT)
-                with frame_profiler.scope("sim.combat"):
-                    _advance_combat(
-                        _ships_this_tick, TICK_DT,
-                        ship_instances=(session.ship_instances if session is not None else None),
-                        ship_emitters=(session.ship_emitters if session is not None else None),
-                        player=player,
-                        # Pushed after the camera, once the render origin is
-                        # set (_push_combat_render_data below).
-                        push_render_data=False,
-                    )
-
-                # Player-only contact manager: bands, proximity events and the
-                # identification dwell (engine/appc/sensor_contacts.py). Sim-gated
-                # by the enclosing `not pause.sim_frozen`; it runs its own 1 s
-                # sweep cadence internally.
-                if player is not None:
-                    import App  # deferred: matches host-loop convention
-                    from engine.appc import sensor_contacts
-                    sensor_contacts.tick(player, App.g_kUtopiaModule.GetGameTime())
-
-                # Crew "raise shields" prompts in asteroids / radiation
-                # (engine/appc/crew_hazard_prompts.py). Sim-gated like the
-                # contact manager above; polls at 1 Hz on game time.
-                if player is not None:
-                    global _crew_hazard_prompts
-                    if _crew_hazard_prompts is None:
-                        from engine.appc.crew_hazard_prompts import CrewHazardPrompts
-                        _crew_hazard_prompts = CrewHazardPrompts()
-                    _crew_hazard_prompts.update(
-                        player, App.g_kUtopiaModule.GetGameTime())
-
-                # Nebula membership → enter/exit events, environmental
-                # damage, sensor scaling. Sim dt (TICK_DT); gated by the
-                # enclosing `not pause.sim_frozen` (no effects while frozen);
-                # no-op for sets without a nebula.
-                _neb_set = _resolve_active_set(player)
-                if _neb_set is not None:
-                    global _nebula_tracker
-                    if _nebula_tracker is None:
-                        from engine.appc.nebula_runtime import NebulaTracker
-                        _nebula_tracker = NebulaTracker()
-                    import App  # deferred: matches host-loop convention
-                    _nebula_tracker.update(
-                        _neb_set,
-                        _neb_set.GetClassObjectList(App.CT_SHIP),
-                        TICK_DT,
-                    )
-
-                    # Radial-profile radiation (engine/appc/radiation.py):
-                    # drain + outages via 16 Hz ET_ENVIRONMENT_DAMAGE. Ships
-                    # inside an armed local nebula ride the tracker's events.
-                    global _radiation_driver
-                    if _radiation_driver is None:
-                        from engine.appc.radiation import RadiationDriver
-                        from engine.systems import profile as _profile
-                        _radiation_driver = RadiationDriver(_profile.sample_for_object)
-                        _nebula_tracker.env_listeners.append(
-                            _radiation_driver.on_local_event)
-                    _radiation_driver.update(
-                        _neb_set.GetClassObjectList(App.CT_SHIP), TICK_DT,
-                        shared=_nebula_tracker.ships_in_armed_nebula())
-
-                    # Shared nebula-state locals used by ALL nebula drivers
-                    # (thunder, hull-discharge, wake).  Computed once here so
-                    # each per-toggle block can read them without duplication.
-                    player_id = id(player) if player is not None else None
-                    in_neb = player_id is not None and any(
-                        player_id in ships
-                        for ships in _nebula_tracker._inside.values()
-                    )
-                    _gt = App.g_kUtopiaModule.GetGameTime()
-
-                    # The radial profile at the player: hull sparks follow its
-                    # radiation, the impulse wake its gas (engine/systems/profile_fx).
-                    from engine.systems import profile as _profile
-                    from engine.systems import profile_fx as _profile_fx
-                    from engine.appc import warp_state as _warp_state
-                    _prof_sample = (_profile.sample_for_object(player)
-                                    if player is not None else _profile.CLEAR)
-                    _warping = (player is not None
-                                and _warp_state.is_ship_warping(player))
-
-                    # Nebula lightning: tick the thunder driver while the player
-                    # is in a clump or the profile's thick cloud
-                    # (profile_fx.lightning_active).  Visual/audio only; gated
-                    # by the toggle.
-                    # Lazy construct (mirrors _nebula_tracker).
-                    global _nebula_thunder
-                    if r.nebula_lightning_enabled():
-                        if _nebula_thunder is None:
-                            from engine.appc.nebula_thunder import NebulaThunderDriver
-                            _nebula_thunder = NebulaThunderDriver()
-                        fwd = player.GetWorldForwardTG() if player is not None else None
-                        fwd_t = (fwd.x, fwd.y, fwd.z) if fwd is not None else (0.0, 1.0, 0.0)
-                        _nebula_thunder.update(
-                            _profile_fx.lightning_active(
-                                in_neb, _prof_sample, _warping),
-                            TICK_DT, _gt, fwd_t)
-                        for name in _nebula_thunder.pop_due_audio(_gt):
-                            try:
-                                from engine.audio.tg_sound import TGSoundManager
-                                TGSoundManager.instance().PlaySound(name)
-                            except Exception:
-                                pass
-                        # Hull electrical discharges: crackle on the hull while
-                        # in a nebula, rate ∝ the nebula's damage.  Gated by
-                        # the Nebula Lightning toggle (shared with the flashes).
-                        # Lazy construct mirrors _nebula_thunder above.
-                        global _hull_discharge
-                        if _hull_discharge is None:
-                            from engine.appc.hull_discharge import HullDischargeDriver
-                            _hull_discharge = HullDischargeDriver()
-                        clump_rate = 0.0
-                        hull_pts = []
-                        if in_neb and player is not None:
-                            pset = player.GetContainingSet()
-                            if pset is not None:
-                                for obj in pset.GetClassObjectList(App.CT_NEBULA):
-                                    neb = App.MetaNebula_Cast(obj)
-                                    if neb is not None and neb.IsObjectInNebula(player):
-                                        clump_rate = neb.GetDamage()[0]
-                                        break
-                        sparking, dmg_rate = _profile_fx.discharge_inputs(
-                            in_neb, clump_rate, _prof_sample, _warping)
-                        if sparking and player is not None:
-                            pset = player.GetContainingSet()
-                            # Anchor sparks across the WHOLE hull (saucer rim,
-                            # nacelles, pylons) via the model's surface-point
-                            # sample, not just the central subsystem mounts.
-                            _piid = (session.ship_instances.get(player)
-                                     if session is not None else None)
-                            # VIEW coordinates, both sources: the discharge
-                            # feed is pushed through frames.view_to_render.
-                            if _piid is not None:
-                                hull_pts = r.instance_surface_points(_piid)
-                            if not hull_pts:
-                                # Fallback: subsystem mounts (central, but better
-                                # than nothing) when no surface sample is available.
-                                from engine.appc.subsystems import subsystem_world_position
-                                _hview = _frames.viewing_set()
-                                for sub in player.GetSubsystems():
-                                    wp = subsystem_world_position(sub, player)
-                                    _hp = _frames.in_view(_hview, pset,
-                                                          wp.x, wp.y, wp.z)
-                                    hull_pts.append(_hp if _hp is not None
-                                                    else (wp.x, wp.y, wp.z))
-                        _hull_discharge.update(sparking, dmg_rate, TICK_DT, hull_pts, _gt)
-
-                    # Nebula ship wake: record the player's path while in a nebula.
-                    # Gated by Volumetric Nebulae ONLY (spec §7: "no cloud → no
-                    # wake"), independent of the Nebula Lightning toggle.
-                    global _nebula_wake
-                    if r.volumetric_nebulae_enabled():
-                        if _nebula_wake is None:
-                            from engine.appc.nebula_wake import NebulaWakeTracker
-                            _nebula_wake = NebulaWakeTracker()
-                        _emitters = []
-                        _waking = _profile_fx.wake_active(in_neb, _prof_sample, _warping)
-                        if _waking and player is not None:
-                            from engine.appc.subsystems import active_impulse_emitters
-                            _emitters = active_impulse_emitters(player)
-                        _nebula_wake.update(_waking, _emitters, _gt)
-
-                # Collision detection + response (ships/asteroids/moons/
-                # planets). Runs once per render frame after motion + player
-                # input, so every body's post-thrust position is current.
-                # Reuses combat.apply_hit for impact damage; injects a
-                # mass-weighted impulse into each body's decaying
-                # _collision_velocity overlay. Spec
-                # docs/superpowers/specs/2026-06-11-collision-response-design.md.
-                # dt = _player_dt (clamped wall-clock frame delta), matching
-                # the player integrator — the collision-velocity overlay is
-                # real-time motion, so it advances/decays on real elapsed time,
-                # not the fixed sim TICK_DT.
-                # BC's warp FSM (dewarp transitions + warp-in slides) advances
-                # on game time inside GameLoop.tick (warp_state.tick_warp_states),
-                # which runs above, before collisions: a ship in warp is
-                # non-collidable (collisions._collisions_enabled), so a dewarp
-                # that completes this frame is collidable THIS frame, not next.
-                # sync_flythrough is the leak guard — once the warp animator is
-                # inactive the flythrough ship cannot still read as warping,
-                # however the sequence ended.
-                from engine.appc import warp_state as _warp_state
-                from engine import warp_vfx as _wv_state
-                _warp_state.sync_flythrough(_wv_state.get().is_active())
-
-                with frame_profiler.scope("sim.debris_chunks"):
-                    from engine.appc import debris_chunk as _debris_chunk
-                    with frame_profiler.scope("dc.tick"):
-                        _debris_chunk.tick(_player_dt, r)
-                    from engine.appc import hull_breakup as _hull_breakup
-                    with frame_profiler.scope("dc.breakup_drain"):
-                        _hull_breakup.drain()
-                    from engine.appc import hull_wear as _hull_wear
-                    with frame_profiler.scope("dc.wear_drain"):
-                        _hull_wear.drain()
-
-                with frame_profiler.scope("sim.collisions"):
-                    collisions.tick_collisions(
-                        _player_dt,
-                        ship_instances=(session.ship_instances if session is not None else None),
-                    )
-
-                # Rock breakup, render side (rock-class spec §2): the death
-                # burst (crack flash, dust, light) engine.rocks.death queued
-                # -- this frame's collision kills included. Breakup debris is
-                # a free minor cloud (engine.rocks.minors), not bodies here.
-                with frame_profiler.scope("sim.rock_breakup"):
-                    from engine.rocks import vfx as rock_vfx
-                    rock_vfx.pump()
-                    _pump_minor_contact(player, session=session)
-                    _pump_scenery_contact(player, session=session)
-
-                with frame_profiler.scope("sim.rock_promotion"):
-                    _pump_rock_promotion(player, session=session)
-
-                # The player's dash (engine/appc/dash.py): its align, its
-                # engage, and the drop-out of a flight that ended this frame
-                # -- before the hand-off tick, so a drop-out's own hand-off
-                # lands first.
-                if player is not None:
-                    from engine.appc import dash
-                    dash.tick(player, _player_dt)
-
-                # The impulse region hand-off (in-system-warp spec section 3,
-                # rule H): the player crosses into another region's sphere
-                # under its own power. Runs after collisions (this frame's
-                # last mover of the player) and before the scene reconcile,
-                # which reads the player's containing set to decide what the
-                # render scope shows this frame. A no-op while the player is
-                # dashing (handoff._is_dashing) -- Task 4's drop-out calls
-                # handoff.hand_off directly once the flight ends.
-                if player is not None:
-                    from engine.systems import handoff
-                    handoff.tick(player)
-
-                # The scene reconcile (_reconcile_scene): load the player's
-                # system, realize / tear down / cull / hide ships for the
-                # render scope, and diff the viewed frame's map bodies. It
-                # reads frames.viewing_set(), so it runs HERE -- after every
-                # part of the frame's sim that can change the view (the timers
-                # in loop.tick, input and clicks that engage a warp, combat,
-                # the warp FSM, collisions) and immediately before
-                # _sync_instance_transforms, the camera and
-                # _apply_render_origin, which read the same view. Before the
-                # sim, a frame that changed the view drew map bodies in the
-                # OLD view's coordinates. INVARIANT: it is the FIRST visibility
-                # writer of the frame -- warp hide (in _sync_instance_
-                # transforms), SPV, bridge player and cloak all run after it
-                # and AND their conditions with scope_hidden, and the scope
-                # only writes on a change. Order guarded by
-                # tests/host/test_scene_reconcile_ordering.py.
-                _reconcile_scene(
-                    session, controller.renderer, nif_cache=controller,
-                    on_player_change=_on_player_change, verbose=verbose)
-                # It may have retargeted session.player (RecreatePlayer).
-                player = session.player if session is not None else None
-                # The reconcile above may have just realized a player ship
-                # RecreatePlayer created with an unknown (0) radius -- catch
-                # up the cameras now that GetRadius() is real.
-                _reconcile_camera_radius(director, player)
-
-                # Sync transforms for known instances.
-                #
-                # Player ship: pushed live (it is integrated per render
-                # frame on wall-clock dt in _PlayerControl, so it is
-                # already smooth in world space).
-                #
-                # Non-player ships: integrated on the fixed 60 Hz tick,
-                # so they are rendered at lerp(prev, cur, _interp_alpha)
-                # to hide the discrete steps. _xform_buf.roll() ran above
-                # before this frame's ticks (only when a tick fired); here
-                # we capture the new current state and push the interpolated
-                # pose. This only affects what is sent to the renderer — the
-                # ship objects keep live transforms, so physics/AI/combat
-                # (which ran earlier this frame) are unaffected.
-                if session is not None:
-                    # Render-pose provider: the camera (below) and the renderer
-                    # must anchor on IDENTICAL per-ship poses. Non-player ships
-                    # are captured into _xform_buf by _sync_instance_transforms
-                    # (which runs before the camera this frame). The player is
-                    # captured here, but ONLY when a helm-AI / waypoint order
-                    # drives it (then it moves on the 60 Hz tick and needs
-                    # interpolation) — a manually-flown player keeps its live,
-                    # already-smooth per-frame pose.
-                    _player_iid_i = (session.ship_instances.get(player)
-                                     if player is not None else None)
-                    # Interpolate the player render when it is NOT being flown
-                    # per render frame by _PlayerControl: a helm-AI / waypoint
-                    # order (GetAI) OR an active in-space cutscene (the player
-                    # is scripted, never manually flown then, and a cutscene
-                    # camera is commonly locked onto it — so its 60 Hz-stepped
-                    # motion must be interpolated or the whole shot judders).
-                    # An in-system dash too: its flight steps the ship on the
-                    # tick (_player_render_interpolated).
-                    _interp_player = _player_render_interpolated(
-                        player, sim_frozen=pause.sim_frozen,
-                        cutscene_active=_active_cutscene_camera() is not None)
-                    if _interp_player and _player_iid_i is not None:
-                        _xform_buf.set_current(
-                            _player_iid_i,
-                            player.GetWorldLocation(),
-                            player.GetWorldRotation())
-                    # A hand-off (the same player, another region set): the
-                    # slot and any handover window hold the old set's
-                    # coordinates -- re-seed / drop them, and never open a
-                    # window from last frame's (old-set) drawn pose.
-                    _pset = (player.GetContainingSet()
-                             if player is not None else None)
-                    if (player is not None
-                            and _prev_player_set[0] is player
-                            and _prev_player_set[1] is not None
-                            and _pset is not _prev_player_set[1]):
-                        _rebase_player_render(_xform_buf, _handover,
-                                              _player_iid_i, player)
-                        _prev_drawn_player_pose = None
-                    _prev_player_set = (player, _pset)
-                    # The viewed set changed within the frame (a hand-off):
-                    # re-base the cameras and drop the dust history before
-                    # the camera is solved below.
-                    _view_now = _frames.viewing_set()
-                    _view_off = _view_rebase_offset(_prev_view_set, _view_now)
-                    if _view_off is not None:
-                        _rebase_view(r, director, _view_off)
-                    _prev_view_set = _view_now
-                    # Handover easing: the pipeline the player is drawn from
-                    # flips between live (manual) and interpolated (AI /
-                    # scripted), and those sit a tick apart. Open a smoothing
-                    # window on the flip, starting from the pose that was
-                    # actually on screen last frame.
-                    _drive_handover_smoother(
-                        _handover, _prev_interp_player, _interp_player,
-                        _prev_drawn_player_pose)
-                    _pose_of = _make_render_pose_provider(
-                        session, _xform_buf, _interp_alpha,
-                        interpolate_player=_interp_player,
-                        player_iid=_player_iid_i,
-                        smoother=_handover)
-                    # ALWAYS resolved now, not just when interpolated: the
-                    # renderer draws the player from this same pose, so the
-                    # camera and the hull cannot disagree during the window.
-                    _player_interp_pose = (
-                        _pose_of(player) if player is not None else None)
-                    _prev_interp_player = _interp_player
-                    _prev_drawn_player_pose = _player_interp_pose
-                    _handover.advance(_player_dt)
-                    # Same game clock the decal system ages on
-                    # (engine.appc.damage_decals). Read once per frame.
-                    _sync_instance_transforms(
-                        r, session, player, _xform_buf, _interp_alpha,
-                        App.g_kUtopiaModule.GetGameTime(), BC_MODEL_SCALE,
-                        player_control=player_control,
-                        player_interp_pose=_player_interp_pose,
-                        player_is_interpolated=_interp_player)
-            else:
-                # Frozen frame (pause, DevTools): no sim ran, so nothing
-                # changed the view; reconcile as every frame always has, still
-                # ahead of the SPV / bridge-player / cloak visibility writers.
-                _reconcile_scene(
-                    session, controller.renderer, nif_cache=controller,
-                    on_player_change=_on_player_change, verbose=verbose)
-                player = session.player if session is not None else None
-                # Same catch-up as the live branch above -- a frozen frame
-                # (e.g. the pause menu opened the same tick RecreatePlayer
-                # ran) must not leave the cameras on an unknown radius.
-                _reconcile_camera_radius(director, player)
+            # --- frame sim: call ---
+            (_now, _wall_dt, _frame_dt, _player_dt, _frame_game_dt,
+             _interp_alpha, _sim_ticks_this_frame, _ships_this_tick, _pose_of,
+             _player_interp_pose, session, player) = _run_frame_sim(
+                _frame_ctx, mx=_mx, my=_my, cursor_in_panel=_cursor_in_panel)
+            # --- frame sim: call end ---
 
             # --- Ship Property Viewer's FORCED articulation pose ---
             # DELIBERATELY OUTSIDE the `if not pause.sim_frozen:` above. The
             # SPV opens the pause menu, which freezes the sim, so everything
-            # in that block -- including the articulation push inside
-            # _sync_instance_transforms -- is skipped on every frame the
-            # viewer is open. Leaving the forced pose in there made it dead
+            # in that block -- the render sync included -- is skipped on
+            # every frame the viewer is open. Leaving the forced pose in there made it dead
             # code: the hologram kept whatever pose was last pushed before
             # the pause, and no forced pose could move a wing.
             # Dev-only and SPV-only inside the helper, so a production paused
             # frame is byte-identical (one False bool, then return).
-            if session is not None:
-                _sync_spv_articulation(session, ship_property_viewer)
+            with frame_profiler.scope("sim.spv_sync"):
+                if session is not None:
+                    _sync_spv_articulation(session, ship_property_viewer)
 
             frame_profiler.mark("render_prep")
             # --- Render (always runs, including while paused) ---
@@ -12669,199 +13561,205 @@ def run(mission_name: Optional[str] = None,
             # render-target authority; bridge_flag()/GetRenderedSet() are
             # untouched). Reverts when CutsceneCameraEnd pops the mode.
             _cc = None if pause.sim_frozen else _active_cutscene_camera()
-            _apply_bridge_pass_state(
-                view_mode.is_bridge and _cc is None, _h, view_mode)
-            # AT_MOVE walk completion advances the mission TGSequence (E1M1
-            # UndockCutscene -> Inspection enables the crew menus), so it must be
-            # pumped every unpaused frame regardless of view — NOT inside the
-            # is_bridge render block below (that block is purely visual). See
-            # _pump_walk_controller.
-            _pump_walk_controller(walk_ctrl, r, _player_dt, paused=pause.sim_frozen)
-            # The door half of the bridge cutscene pump is likewise
-            # view-independent — see _pump_bridge_doors.
-            _pump_bridge_doors(cutscene, r, paused=pause.sim_frozen)
-            # ...and so is the character anim controller: it drains the pending
-            # turn/glance/default queues and fires the settled actions'
-            # on_complete, which advances the mission TGSequence (an AT_SAY_LINE
-            # with a turn target defers the LINE ITSELF behind its turn). Gating
-            # it on bridge view left every such line unspoken and its sequence
-            # hung whenever the player was in tactical view. See _pump_char_anim.
-            _pump_char_anim(char_anim, r, _player_dt, paused=pause.sim_frozen)
-            if fixed_camera:
-                fixed_radius = player.GetRadius() if player is not None else 1.0
-                eye = (0.0, 0.0, CAM_MAX_RADII * fixed_radius)
-                target = (0.0, 0.0, 0.0)
-                up_vec = (0.0, 1.0, 0.0)
-            elif player is not None:
-                # The camera is solved in the VIEWED set's coordinates, like
-                # the scene: a subject in another set of the viewed frame (the
-                # player through a sibling-region cutscene) is moved into them
-                # first (_view_pose_of). Same set: _pose_of's own poses.
-                _cam_pose_of = _view_pose_of(_pose_of, _frames.viewing_set())
-                eye, target, up_vec = _compute_camera(
-                    view_mode, director,
-                    player=player, dt=_player_dt, pose_of=_cam_pose_of)
-                # Cutscene camera (computed above) drives the main-scene pose,
-                # converting the mode's forward DIRECTION to a look-at POINT.
-                if _cc is not None:
-                    eye, target, up_vec = _cutscene_pose(
-                        _cc[1], _player_dt, _cam_pose_of)
-                # Camera shake — apply to the exterior view. The bridge
-                # first-person camera below gets its own perturb call
-                # against the shared shake state.
-                eye, target, up_vec = camera_shake.perturb(eye, target, up_vec)
-                # If a cutscene camera path is queued or playing, pull the
-                # view back to bridge so the update pump below can reach it.
-                if cutscene.has_pending_camera() and not pause.sim_frozen:
-                    view_mode.set_bridge()
-                if view_mode.is_bridge:
-                    import App as _App
-                    # Bridge cutscene SHOT (PlacementWatch "bridge"): drive the
-                    # bridge camera from it -- see _bridge_cutscene_camera.
-                    _sync_bridge_mode_pose(bridge_camera, _player_dt,
-                                           exterior_active=_cc is not None,
-                                           paused=pause.sim_frozen)
-                    if not pause.sim_frozen:
-                        # CAMERA half only — the door half (_update_doors) is
-                        # pumped view-independently above (_pump_bridge_doors).
-                        cutscene.update(
-                            _player_dt,
-                            bridge_camera=bridge_camera,
-                            view_mode=view_mode,
-                            renderer=r,
-                            anim_mgr=_App.g_kAnimationManager,
+            with frame_profiler.scope("prep.crew"):
+                _apply_bridge_pass_state(
+                    view_mode.is_bridge and _cc is None, _h, view_mode)
+                # AT_MOVE walk completion advances the mission TGSequence (E1M1
+                # UndockCutscene -> Inspection enables the crew menus), so it must be
+                # pumped every unpaused frame regardless of view — NOT inside the
+                # is_bridge render block below (that block is purely visual). See
+                # _pump_walk_controller.
+                _pump_walk_controller(walk_ctrl, r, _player_dt, paused=pause.sim_frozen)
+                # The door half of the bridge cutscene pump is likewise
+                # view-independent — see _pump_bridge_doors.
+                _pump_bridge_doors(cutscene, r, paused=pause.sim_frozen)
+                # ...and so is the character anim controller: it drains the pending
+                # turn/glance/default queues and fires the settled actions'
+                # on_complete, which advances the mission TGSequence (an AT_SAY_LINE
+                # with a turn target defers the LINE ITSELF behind its turn). Gating
+                # it on bridge view left every such line unspoken and its sequence
+                # hung whenever the player was in tactical view. See _pump_char_anim.
+                _pump_char_anim(char_anim, r, _player_dt, paused=pause.sim_frozen)
+            with frame_profiler.scope("prep.camera"):
+                if fixed_camera:
+                    fixed_radius = player.GetRadius() if player is not None else 1.0
+                    eye = (0.0, 0.0, CAM_MAX_RADII * fixed_radius)
+                    target = (0.0, 0.0, 0.0)
+                    up_vec = (0.0, 1.0, 0.0)
+                elif player is not None:
+                    # The camera is solved in the VIEWED set's coordinates, like
+                    # the scene: a subject in another set of the viewed frame (the
+                    # player through a sibling-region cutscene) is moved into them
+                    # first (_view_pose_of). Same set: _pose_of's own poses.
+                    _cam_pose_of = _view_pose_of(_pose_of, _frames.viewing_set())
+                    eye, target, up_vec = _compute_camera(
+                        view_mode, director,
+                        player=player, dt=_player_dt, pose_of=_cam_pose_of)
+                    # Cutscene camera (computed above) drives the main-scene pose,
+                    # converting the mode's forward DIRECTION to a look-at POINT.
+                    if _cc is not None:
+                        eye, target, up_vec = _cutscene_pose(
+                            _cc[1], _player_dt, _cam_pose_of)
+                    # Camera shake — apply to the exterior view. The bridge
+                    # first-person camera below gets its own perturb call
+                    # against the shared shake state.
+                    eye, target, up_vec = camera_shake.perturb(eye, target, up_vec)
+                    # If a cutscene camera path is queued or playing, pull the
+                    # view back to bridge so the update pump below can reach it.
+                    if cutscene.has_pending_camera() and not pause.sim_frozen:
+                        view_mode.set_bridge()
+                    if view_mode.is_bridge:
+                        import App as _App
+                        # Bridge cutscene SHOT (PlacementWatch "bridge"): drive the
+                        # bridge camera from it -- see _bridge_cutscene_camera.
+                        _sync_bridge_mode_pose(bridge_camera, _player_dt,
+                                               exterior_active=_cc is not None,
+                                               paused=pause.sim_frozen)
+                        if not pause.sim_frozen:
+                            # CAMERA half only — the door half (_update_doors) is
+                            # pumped view-independently above (_pump_bridge_doors).
+                            cutscene.update(
+                                _player_dt,
+                                bridge_camera=bridge_camera,
+                                view_mode=view_mode,
+                                renderer=r,
+                                anim_mgr=_App.g_kAnimationManager,
+                            )
+                            # Idle fidgets ARE purely visual — they stay view-gated.
+                            # They submit into char_anim, which is pumped
+                            # view-independently above (_pump_char_anim); do NOT
+                            # call char_anim.update() here as well, or every clip
+                            # steps twice per frame in bridge view.
+                            idle_gestures.update(
+                                _player_dt, _live_bridge_characters(),
+                                renderer=r, anim_mgr=_App.g_kAnimationManager,
+                                controller=char_anim)
+                            # walk_ctrl is pumped view-independently above
+                            # (_pump_walk_controller) — its completion drives the
+                            # mission sequence and must not be gated on bridge view.
+                            try:
+                                lip_runtime.update()
+                            except Exception as _e:
+                                dev_mode.log_swallowed("lip-sync update", _e)
+                            # node_anim reads node_overrides written by r.frame() above; intentionally one frame behind — do NOT reorder.
+                            node_anim.update(r)
+                        mouse_dx, mouse_dy = host_io.consume_mouse_delta()
+                        # While paused we still drain the accumulated mouse
+                        # delta (so it doesn't snap the look on resume) but
+                        # skip the yaw/pitch advance so the bridge camera
+                        # stays frozen alongside the rest of the world.
+                        if not pause.sim_frozen:
+                            # Zoom-to-officer still runs while a crew menu is open
+                            # (that's what frames the station). But the cursor is
+                            # freed to click the menu, so zero the mouse-look delta
+                            # — otherwise moving toward a menu row swings the view.
+                            # (The maincamera zoom already suspends mouse-look once
+                            # an officer resolves; this also covers the case where
+                            # no officer resolves and the zoom stays at 0.)
+                            # Free-look is also suppressed during a cutscene: the
+                            # letterbox pins the view where the mission wants it.
+                            from engine.appc.top_window import TopWindow_GetTopWindow
+                            _tw = TopWindow_GetTopWindow()
+                            if _bridge_freelook_suppressed(
+                                    crew_menu_open=crew_menu_panel.has_open_menu(),
+                                    cutscene_active=_tw.IsCutsceneMode(),
+                                    bridge_cutscene_pending=cutscene.has_pending_camera()):
+                                mouse_dx, mouse_dy = 0.0, 0.0
+                            # Resolve the single active engagement this frame, in
+                            # precedence order: AT_WATCH_ME/LOOK_AT target > open crew
+                            # menu > viewscreen hail. The winner supplies a world
+                            # look-at + FOV factor; MenuEventHandler reconciles the
+                            # maincamera zoom; advance() eases it on _player_dt so it
+                            # freezes under pause.
+                            _w = (watch_ctrl.resolve_target_world(r)
+                                  if watch_ctrl is not None else None)
+                            _wc, _zoom_off = _active_zoom_officer(crew_menu_panel, r)
+                            _menu_zoom = _officer_zoom_factor(_zoom_off)
+                            if _menu_zoom == POSITION_ZOOM_SENTINEL:
+                                _menu_zoom = _BRIDGE_ZOOM_MIN
+                            _engaged, _look_at, _zoom_factor, _engaged_char = \
+                                _pick_bridge_engagement(
+                                    watch_world=_w,
+                                    watch_holds=(watch_ctrl is not None
+                                                 and watch_ctrl.is_holding()),
+                                    watch_char=(watch_ctrl.watched_character()
+                                                if watch_ctrl is not None else None),
+                                    menu_world=_wc, menu_char=_zoom_off,
+                                    menu_zoom=_menu_zoom,
+                                    hail=_viewscreen_hail_engagement(controller))
+                            _drv = _engaged_char or _last_engaged_char[0]
+                            if _drv is not None:
+                                _drv.MenuEventHandler(_engaged, _look_at, _zoom_factor,
+                                                      now=_App.g_kUtopiaModule.GetGameTime())
+                            if _engaged_char is not None:
+                                _last_engaged_char[0] = _engaged_char
+                            if _BRIDGE_ZOOM_CAM is not None:
+                                _BRIDGE_ZOOM_CAM.advance(_player_dt)
+                            if _BRIDGE_ZOOM_CAM is not None and watch_ctrl is not None \
+                                    and watch_ctrl.consume_snap():
+                                _BRIDGE_ZOOM_CAM.advance(1e9)   # AT_LOOK_AT_ME_NOW
+                            # SP4: tooltip owner = focused officer (open menu wins
+                            # over hover), then run the real SDK UpdateToolTip
+                            # handler on a throttle so its status rows populate.
+                            from engine.appc.characters import (
+                                CharacterClass_SetCurrentToolTipOwner)
+                            from engine.ui import tooltip_dispatch
+                            if tooltip_dispatch.tooltip_suppressed(
+                                    cutscene_active=_tw.IsCutsceneMode(),
+                                    bridge_cutscene_pending=cutscene.has_pending_camera()):
+                                # No tooltip box during a cutscene -- it would float
+                                # over the letterbox bars. Drop any owner and skip.
+                                CharacterClass_SetCurrentToolTipOwner(None)
+                            else:
+                                # pick() hands back the CHARACTER, and the open
+                                # menu resolves its owner off the menu itself, so
+                                # both work for a guest -- who has no station label
+                                # for resolve_character to match.
+                                _hover = None
+                                _aimed = bridge_officer_picking.pick(_h, r, bridge_camera)
+                                if _aimed is not None:
+                                    _hover = _aimed["officer"]
+                                _menu_off = crew_menu_panel.open_officer()
+                                _owner = tooltip_dispatch.select_owner(hover=_hover,
+                                                                       open_menu=_menu_off)
+                                CharacterClass_SetCurrentToolTipOwner(_owner)
+                                tooltip_dispatch.run_update_tooltip(
+                                    _owner, now=_App.g_kUtopiaModule.GetGameTime(),
+                                    state=_tooltip_dispatch_state)
+                            bridge_camera.apply(mouse_dx, mouse_dy)
+                        # Bridge first-person camera uses separate (eye, target,
+                        # up) vectors from the exterior view, so it needs its own
+                        # perturb call. The camera_shake module is global state,
+                        # so the shake energy / phase is shared with the
+                        # exterior perturb above. While the Bridge Editor
+                        # editor has a fly pose, it takes over the bridge camera
+                        # unshaken -- you are aiming at shapes, not flying the
+                        # ship.
+                        b_eye, b_target, b_up, b_fov = _bridge_camera_pose(
+                            bridge_emitters, bridge_camera, camera_shake.perturb)
+                        r.set_bridge_camera(
+                            eye=b_eye, target=b_target, up=b_up,
+                            fov_y_rad=b_fov,
+                            near=_BridgeCamera.NEAR,
+                            far=_BridgeCamera.FAR,
                         )
-                        # Idle fidgets ARE purely visual — they stay view-gated.
-                        # They submit into char_anim, which is pumped
-                        # view-independently above (_pump_char_anim); do NOT
-                        # call char_anim.update() here as well, or every clip
-                        # steps twice per frame in bridge view.
-                        idle_gestures.update(
-                            _player_dt, _live_bridge_characters(),
-                            renderer=r, anim_mgr=_App.g_kAnimationManager,
-                            controller=char_anim)
-                        # walk_ctrl is pumped view-independently above
-                        # (_pump_walk_controller) — its completion drives the
-                        # mission sequence and must not be gated on bridge view.
-                        try:
-                            lip_runtime.update()
-                        except Exception as _e:
-                            dev_mode.log_swallowed("lip-sync update", _e)
-                        # node_anim reads node_overrides written by r.frame() above; intentionally one frame behind — do NOT reorder.
-                        node_anim.update(r)
-                    mouse_dx, mouse_dy = host_io.consume_mouse_delta()
-                    # While paused we still drain the accumulated mouse
-                    # delta (so it doesn't snap the look on resume) but
-                    # skip the yaw/pitch advance so the bridge camera
-                    # stays frozen alongside the rest of the world.
-                    if not pause.sim_frozen:
-                        # Zoom-to-officer still runs while a crew menu is open
-                        # (that's what frames the station). But the cursor is
-                        # freed to click the menu, so zero the mouse-look delta
-                        # — otherwise moving toward a menu row swings the view.
-                        # (The maincamera zoom already suspends mouse-look once
-                        # an officer resolves; this also covers the case where
-                        # no officer resolves and the zoom stays at 0.)
-                        # Free-look is also suppressed during a cutscene: the
-                        # letterbox pins the view where the mission wants it.
-                        from engine.appc.top_window import TopWindow_GetTopWindow
-                        _tw = TopWindow_GetTopWindow()
-                        if _bridge_freelook_suppressed(
-                                crew_menu_open=crew_menu_panel.has_open_menu(),
-                                cutscene_active=_tw.IsCutsceneMode(),
-                                bridge_cutscene_pending=cutscene.has_pending_camera()):
-                            mouse_dx, mouse_dy = 0.0, 0.0
-                        # Resolve the single active engagement this frame, in
-                        # precedence order: AT_WATCH_ME/LOOK_AT target > open crew
-                        # menu > viewscreen hail. The winner supplies a world
-                        # look-at + FOV factor; MenuEventHandler reconciles the
-                        # maincamera zoom; advance() eases it on _player_dt so it
-                        # freezes under pause.
-                        _w = (watch_ctrl.resolve_target_world(r)
-                              if watch_ctrl is not None else None)
-                        _wc, _zoom_off = _active_zoom_officer(crew_menu_panel, r)
-                        _menu_zoom = _officer_zoom_factor(_zoom_off)
-                        if _menu_zoom == POSITION_ZOOM_SENTINEL:
-                            _menu_zoom = _BRIDGE_ZOOM_MIN
-                        _engaged, _look_at, _zoom_factor, _engaged_char = \
-                            _pick_bridge_engagement(
-                                watch_world=_w,
-                                watch_holds=(watch_ctrl is not None
-                                             and watch_ctrl.is_holding()),
-                                watch_char=(watch_ctrl.watched_character()
-                                            if watch_ctrl is not None else None),
-                                menu_world=_wc, menu_char=_zoom_off,
-                                menu_zoom=_menu_zoom,
-                                hail=_viewscreen_hail_engagement(controller))
-                        _drv = _engaged_char or _last_engaged_char[0]
-                        if _drv is not None:
-                            _drv.MenuEventHandler(_engaged, _look_at, _zoom_factor,
-                                                  now=_App.g_kUtopiaModule.GetGameTime())
-                        if _engaged_char is not None:
-                            _last_engaged_char[0] = _engaged_char
-                        if _BRIDGE_ZOOM_CAM is not None:
-                            _BRIDGE_ZOOM_CAM.advance(_player_dt)
-                        if _BRIDGE_ZOOM_CAM is not None and watch_ctrl is not None \
-                                and watch_ctrl.consume_snap():
-                            _BRIDGE_ZOOM_CAM.advance(1e9)   # AT_LOOK_AT_ME_NOW
-                        # SP4: tooltip owner = focused officer (open menu wins
-                        # over hover), then run the real SDK UpdateToolTip
-                        # handler on a throttle so its status rows populate.
-                        from engine.appc.characters import (
-                            CharacterClass_SetCurrentToolTipOwner)
-                        from engine.ui import tooltip_dispatch
-                        if tooltip_dispatch.tooltip_suppressed(
-                                cutscene_active=_tw.IsCutsceneMode(),
-                                bridge_cutscene_pending=cutscene.has_pending_camera()):
-                            # No tooltip box during a cutscene -- it would float
-                            # over the letterbox bars. Drop any owner and skip.
-                            CharacterClass_SetCurrentToolTipOwner(None)
-                        else:
-                            # pick() hands back the CHARACTER, and the open
-                            # menu resolves its owner off the menu itself, so
-                            # both work for a guest -- who has no station label
-                            # for resolve_character to match.
-                            _hover = None
-                            _aimed = bridge_officer_picking.pick(_h, r, bridge_camera)
-                            if _aimed is not None:
-                                _hover = _aimed["officer"]
-                            _menu_off = crew_menu_panel.open_officer()
-                            _owner = tooltip_dispatch.select_owner(hover=_hover,
-                                                                   open_menu=_menu_off)
-                            CharacterClass_SetCurrentToolTipOwner(_owner)
-                            tooltip_dispatch.run_update_tooltip(
-                                _owner, now=_App.g_kUtopiaModule.GetGameTime(),
-                                state=_tooltip_dispatch_state)
-                        bridge_camera.apply(mouse_dx, mouse_dy)
-                    # Bridge first-person camera uses separate (eye, target,
-                    # up) vectors from the exterior view, so it needs its own
-                    # perturb call. The camera_shake module is global state,
-                    # so the shake energy / phase is shared with the
-                    # exterior perturb above. While the Bridge Editor
-                    # editor has a fly pose, it takes over the bridge camera
-                    # unshaken -- you are aiming at shapes, not flying the
-                    # ship.
-                    b_eye, b_target, b_up, b_fov = _bridge_camera_pose(
-                        bridge_emitters, bridge_camera, camera_shake.perturb)
-                    r.set_bridge_camera(
-                        eye=b_eye, target=b_target, up=b_up,
-                        fov_y_rad=b_fov,
-                        near=_BridgeCamera.NEAR,
-                        far=_BridgeCamera.FAR,
-                    )
-            else:
-                eye = (0.0, 30.0, 200.0)
-                target = (0.0, 0.0, 0.0)
-                up_vec = (0.0, 1.0, 0.0)
+                else:
+                    eye = (0.0, 30.0, 200.0)
+                    target = (0.0, 0.0, 0.0)
+                    up_vec = (0.0, 1.0, 0.0)
 
             # --- The floating render origin (system-frames spec §5) ---
             # The exterior eye, in the VIEWED set's coordinates, set once per
             # running frame now that the camera is solved and BEFORE any
             # Space-pass feed is built; the combat feeds the sim produced
-            # above are built here for that reason. A frozen frame keeps the
-            # last origin and pushes no new combat feeds (as before).
+            # above are built here for that reason. A frame frozen from its
+            # top (pause, DevTools) ran no tick: it keeps the last origin and
+            # pushes no new combat feeds. A frame frozen mid-frame by a dev
+            # key in sim.keys still ran its whole ticks (ruling 2), so it has
+            # a ship list and applies the origin and pushes their feeds.
             if _ships_this_tick is not None:
-                _apply_render_origin(r, eye)
+                with frame_profiler.scope("prep.origin"):
+                    _apply_render_origin(r, eye)
                 _push_combat_render_data(
                     _ships_this_tick,
                     ship_instances=(session.ship_instances if session is not None else None),
@@ -13205,7 +14103,8 @@ def run(mission_name: Optional[str] = None,
                     camera_position=eye,
                     camera_forward=(_fx0/_flen, _fy0/_flen, _fz0/_flen),
                     camera_up=up_vec,
-                    dt=TICK_DT,
+                    dt=_player_dt,
+                    source_dt=_frame_game_dt,
                     player=player,
                 )
 
@@ -13265,7 +14164,11 @@ def run(mission_name: Optional[str] = None,
             # original engine scaled, instrumentation Q3). Feeding wall
             # time made the LCARS animation play noticeably faster than
             # in stock BC; game time matches the original cadence.
-            r.set_bridge_wall_time(App.g_kUtopiaModule.GetGameTime())
+            # The Bridge Editor freezes game time; its preview clock keeps
+            # the panels playing while it is open (_bridge_texture_time).
+            r.set_bridge_wall_time(_bridge_texture_time(
+                _bridge_texture_offset, App.g_kUtopiaModule.GetGameTime(),
+                bridge_emitters, _bridge_dt))
 
             # Age every ship's persistent damage-decal ring on the same game
             # clock used for decal birth_time (engine.appc.damage_decals).
@@ -13374,14 +14277,21 @@ def run(mission_name: Optional[str] = None,
 
             frame_profiler.mark("r.frame")
             r.frame()
+            if _notice_ended_at is not None:
+                import time as _time
+                print("[boot-notice] first game frame %.2f s after the notice "
+                      "ended" % (_time.monotonic() - _notice_ended_at),
+                      file=sys.stderr, flush=True)
+                _notice_ended_at = None
             if motion_trace.enabled():
-                _mt_interp = locals().get("_interp_player")
+                _mt_interp = _frame_ctx.interp_player
                 motion_trace.record(
                     t_start=_now, frame_dt=_frame_dt,
                     ticks=_sim_ticks_this_frame, alpha=_interp_alpha,
                     interp=_mt_interp,
                     ai=(player is not None and player.GetAI() is not None),
-                    cutscene=_cc is not None, handover=_handover.active,
+                    cutscene=_cc is not None,
+                    handover=host_io.interp_handover_active(),
                     live=(player.GetWorldLocation()
                           if player is not None else None),
                     drawn=(_player_interp_pose[0]
@@ -13454,8 +14364,14 @@ def run(mission_name: Optional[str] = None,
         _qb_spawn.set_radius_fn(None)
         from engine.quickbattle import late_arrivals as _qb_late
         _qb_late.reset()
+        from engine.quickbattle import battle_end as _qb_end
+        _qb_end.reset()
+        from engine.ui import target_markers as _target_markers
+        _target_markers.clear()
         from engine.appc import warp_state as _warp_state
         _warp_state.set_radius_seeder(None)
+        from engine.appc import pose_sink as _pose_sink
+        _pose_sink.reset()
         from engine import bridge_selection as _bs
         _bs.set_player_type_resolver(None)
         shutdown_audio()

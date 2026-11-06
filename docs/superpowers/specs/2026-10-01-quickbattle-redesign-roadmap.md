@@ -32,7 +32,7 @@ offers a flat catalog, two rosters and a player-ship pick
 | 1 | **Ship metadata**: the fields, where they live, stock defaults, how mods declare them, the catalog API the game reads | — | **complete**, merged `acf76808`: `2026-10-01-ship-metadata-catalog-design.md` |
 | — | **In-game keyboard capture for CEF text fields** (prerequisite of 2, general infrastructure) | — | **complete**, merged `751fa00e`, live-verified: `2026-10-02-cef-text-input-keyboard-capture-design.md` |
 | 2 | **Quick Battle setup screen and battle start**: the CEF screen, groups, presets, persistence, group spawning, named ships | 1, keyboard capture | **complete**, merged `be043c1d`, live-verified 2026-10-02: `2026-10-02-quickbattle-setup-screen-design.md` |
-| 2c | **Scenario objectives**: a win/lose condition builder on the setup screen, saved in presets (e.g. "no more than X neutrals destroyed → lose", "an enemy within N km of Y → lose"). Needs its own brainstorm, not least a reference frame for "location Y" on a screen with no map (player start, another group, a specific ship). Will replace BC's fixed win/lose with an evaluator over conditions. | 2 | not started |
+| 2c | **Scenario objectives**: a win/lose condition builder on the setup screen, saved in presets (e.g. "no more than X neutrals destroyed → lose", "an enemy within N km of Y → lose"). Needs its own brainstorm, not least a reference frame for "location Y" on a screen with no map (player start, another group, a specific ship). Will replace BC's fixed win/lose with an evaluator over conditions. | 2 | built, not live-verified: Victory / Defeat condition stacks (ships-destroyed ANY/ALL, timers) replace the named types, see 2026-10-27 spec |
 | 3 | **Mod metadata gate**, grown into a pre-boot **Mod Ships screen**: gate mode (supply missing metadata), read-only home mode (`--mods`, pause **Quit and Manage Mods** relaunch), CEF keyboard input, a class-by-name catalog model, and the shim `SubMenu` fix | 1 | **complete**, merged `2948c98d` |
 | 4 | **Mod manager**: grows sub-project 3's home mode into a real manager, starting with enabling and disabling mods per mod (persisted, effective on relaunch), then whatever else is needed (load order, conflicts, editing complete ships' metadata) | 3 | not started |
 
@@ -124,7 +124,7 @@ The spike is the reference for every point below.
   the player's "Variant of" answers, which is why the old panel's nested
   "Defiant Class" menu doesn't rename.
 - **Style:** the runtime **cp-\*** modal family (`configuration_panel.css`), not
-  `docs/ui_designs/08` — Mark confirmed cp-\* is current.
+  `docs/superpowers/ui_designs/08` — Mark confirmed cp-\* is current.
 - **Off-screen CEF rules out three things**, verified in code: no HTML5
   drag-and-drop (the host implements no `StartDragging`), no native `<select>`
   popup (no `PET_POPUP` handling), and no native tooltips. Menus, dropdowns and

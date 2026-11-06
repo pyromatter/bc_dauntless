@@ -23,6 +23,7 @@
     <link rel="stylesheet" href="css/star_map.css">
     <link rel="stylesheet" href="css/first_run.css">
     <link rel="stylesheet" href="css/mods_screen.css">
+    <link rel="stylesheet" href="css/boot_notice.css">
     <link rel="stylesheet" href="css/perf_monitor.css">
 </head>
 <body>
@@ -46,7 +47,7 @@
          via setPauseMenu({items:[...], focused:N}). Row clicks call
          dauntlessEvent(action), which navigates to dauntless://event/<a>;
          OnBeforeBrowse on the C++ side intercepts and dispatches.
-         Spec: docs/ui_designs/10-pause-menu.md -->
+         Spec: docs/superpowers/ui_designs/10-pause-menu.md -->
     <div id="pause-menu">
         <div class="pause-panel">
             <div class="pause-header">Game Paused</div>
@@ -94,6 +95,25 @@
                 <button type="button" class="cp-done-button" id="fr-continue"
                         onclick="dauntlessEvent('first-run/continue')">Continue</button>
             </div>
+        </div>
+    </section>
+
+    <!-- Boot notice splash: Activision's required notice (SDK licence,
+         "New Game Materials"), shown before the bridge on every launch.
+         setBootNotice(payload|null) drives it; engine/ui/boot_notice_panel.py
+         is the state machine and owns the fade. Event:
+         dauntlessEvent('boot-notice/shown'). -->
+    <section id="boot-notice">
+        <div class="bn-text" id="bn-text">
+            <div class="bn-lockup">
+                <div class="bn-eyebrow">
+                    <span class="bn-spread"><span>B</span><span>R</span><span>I</span><span>D</span><span>G</span><span>E</span><span class="bn-gap"></span><span>C</span><span>O</span><span>M</span><span>M</span><span>A</span><span>N</span><span>D</span><span>E</span><span>R</span></span>
+                </div>
+                <div class="bn-wordmark">DAUNTLESS</div>
+            </div>
+            <div class="bn-notice" id="bn-notice"></div>
+            <div class="bn-credit" id="bn-credit"></div>
+            <div class="bn-ai-credit" id="bn-ai-credit"></div>
         </div>
     </section>
 
@@ -220,10 +240,16 @@
         <div class="cp-header">Quick Battle Setup</div>
         <div class="cp-content">
           <aside id="qbs-groups" class="qbs-groups"></aside>
-          <main class="cp-body qbs-catalog">
+          <main id="qbs-main" class="cp-body qbs-catalog">
             <div id="qbs-eras" class="cp-segmented qbs-strip"></div>
             <div id="qbs-species" class="cp-segmented qbs-strip qbs-species-strip"></div>
             <div id="qbs-catalog" class="qbs-catalog-body"></div>
+          </main>
+          <!-- Victory view (the footer cog): the Victory and Defeat condition
+               stacks side by side (spec 2026-10-27-quickbattle-condition-stacks). -->
+          <main id="qbs-vcond" class="vc-cols" hidden>
+            <div id="qbs-vc-victory" class="vc-col"></div>
+            <div id="qbs-vc-defeat" class="vc-col"></div>
           </main>
         </div>
         <div class="cp-footer qbs-footer">
@@ -232,6 +258,7 @@
             <button class="cp-done-button qbs-preset-add" id="qbs-save-btn" data-action="preset-save-menu" aria-label="Save current scenario as a preset">+</button>
           </div>
           <span id="qbs-summary" class="qbs-summary"></span>
+          <button class="cp-done-button qbs-victory-btn" id="qbs-victory-btn" data-action="victory-view" aria-label="Victory conditions">⚙</button>
           <button class="cp-done-button" id="qbs-close" data-action="close">Close</button>
           <button class="cp-done-button" id="qbs-start" data-action="start">Start Battle</button>
         </div>
@@ -960,7 +987,7 @@
              bottom: sensors / radar disc (pinned via flex split)
            #tactical-bottom-row — bottom-right cluster:
              player ship-display today; weapons / speed / alerts join later
-         See docs/ui_designs/tactical_ui_state.md "Layout gap". -->
+         See docs/superpowers/ui_designs/tactical_ui_state.md "Layout gap". -->
     <div id="tactical-left-column">
         <div id="tactical-target-stack">
             <!-- Crew-menu panel — officer/tactical menus summoned by F1-F5
@@ -987,16 +1014,17 @@
                   <div class="ship-display__shield shield--rear"   data-bind="shield-rear"   data-integrity="down"></div>
                   <div class="ship-display__shield shield--left"   data-bind="shield-left"   data-integrity="down"></div>
                   <div class="ship-display__shield shield--right"  data-bind="shield-right"  data-integrity="down"></div>
-                  <div class="ship-display__damage-overlay" data-bind="damage-overlay"></div>
+                  <div class="ship-display__icon-frame">
+                    <div class="ship-display__damage-overlay" data-bind="damage-overlay"></div>
+                    <div class="ship-display__lock-layer" data-bind="lock-layer"></div>
+                  </div>
+                  <span class="ship-display__speed" data-bind="speed">&#8212; kph</span>
                 </div>
                 <div class="ship-display__hull-bar">
                   <div class="ship-display__hull-fill" data-bind="hull-fill"></div>
                   <span class="ship-display__hull-pct" data-bind="hull-pct">0%</span>
                 </div>
-                <div class="ship-display__target-extras" data-bind="target-extras">
-                  <span data-bind="range">&#8212; km</span>
-                  <span data-bind="speed">&#8212; kph</span>
-                </div>
+                <div class="ship-display__subsystems" data-bind="subsystems"></div>
               </div>
             </section>
 
@@ -1004,10 +1032,59 @@
                  State pushed via setTargetList({visible, selected, rows});
                  row clicks fire dauntlessEvent('target/<ship>'); PanelRegistry
                  routes to TargetListView.dispatch_event in Python.
-                 Spec: docs/ui_designs/02-tactical-cluster.md -->
+                 Spec: docs/superpowers/ui_designs/02-tactical-cluster.md -->
             <div id="target-list-panel" class="target-list--hidden">
                 <div class="target-list__header">Targets</div>
+                <!-- Filter tabs and sort strip: static markup, reflected by
+                     setTargetList. Icons: Lucide (ISC), see THIRD_PARTY_NOTICES.md. -->
+                <div class="target-list__tabs" id="target-list-tabs">
+                    <button class="target-list__tab target-list__tab--FRIENDLY target-list__tab--on"
+                            data-aff="FRIENDLY" data-tip="Friendlies" aria-label="Friendlies">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>
+                      </svg>
+                    </button>
+                    <button class="target-list__tab target-list__tab--NEUTRAL target-list__tab--on"
+                            data-aff="NEUTRAL" data-tip="Neutrals">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M18 12a6 6 0 00-6-6"/>
+                        <path d="M2.824 10.459a8 8 0 0010.717 10.717c.558-.276.623-1.012.183-1.452l-9.448-9.448c-.44-.44-1.176-.375-1.452.183"/>
+                        <path d="M22 12A10 10 0 0012 2"/>
+                        <path d="m9 15 4-4"/>
+                      </svg>
+                    </button>
+                    <button class="target-list__tab target-list__tab--ENEMY target-list__tab--on"
+                            data-aff="ENEMY" data-tip="Enemies">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="2" x2="5" y1="12" y2="12"/><line x1="19" x2="22" y1="12" y2="12"/>
+                        <line x1="12" x2="12" y1="2" y2="5"/><line x1="12" x2="12" y1="19" y2="22"/>
+                        <circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/>
+                      </svg>
+                    </button>
+                </div>
                 <div class="target-list__body" id="target-list-body"></div>
+                <div class="target-list__sort" id="target-list-sort" role="radiogroup" aria-label="Sort targets">
+                    <button class="target-list__sort-opt target-list__sort-opt--on" data-sort="name" role="radio" aria-checked="true" data-tip="Sort by name">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M13 19a4 4 0 00-8 0"/><path d="M16 10h2"/><path d="M16 14h2"/>
+                        <circle cx="9" cy="12" r="3"/><rect x="2" y="5" width="20" height="14" rx="2"/>
+                      </svg>
+                    </button>
+                    <button class="target-list__sort-opt" data-sort="distance" role="radio" aria-checked="false" data-tip="Sort by distance (closest first)">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M19.07 4.93A10 10 0 0 0 6.99 3.34"/><path d="M4 6h.01"/>
+                        <path d="M2.29 9.62A10 10 0 1 0 21.31 8.35"/><path d="M16.24 7.76A6 6 0 1 0 8.23 16.67"/>
+                        <path d="M12 18h.01"/><path d="M17.99 11.66A6 6 0 0 1 15.77 16.67"/>
+                        <circle cx="12" cy="12" r="2"/><path d="m13.41 10.59 5.66-5.66"/>
+                      </svg>
+                    </button>
+                    <button class="target-list__sort-opt" data-sort="health" role="radio" aria-checked="false" data-tip="Sort by health (weakest first)">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M2 9.5a5.5 5.5 0 0 1 9.591-3.676.56.56 0 0 0 .818 0A5.49 5.49 0 0 1 22 9.5c0 2.29-1.5 4-3 5.5l-5.492 5.313a2 2 0 0 1-3 .019L5 15c-1.5-1.5-3-3.2-3-5.5"/>
+                        <path d="M3.22 13H9.5l.5-1 2 4.5 2-7 1.5 3.5h5.27"/>
+                      </svg>
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -1016,7 +1093,7 @@
              radar is flex: 0 0 auto).
              State pushed via setRadar({visible, minimizable, minimized,
              range_gu, contacts:[...]}). Header caret toggles collapse.
-             Spec: docs/ui_designs/05-sensors-radar.md -->
+             Spec: docs/superpowers/ui_designs/05-sensors-radar.md -->
         <div id="tactical-radar">
             <div id="sensors-panel" class="sensors--hidden">
                 <div class="sensors__header">
@@ -1044,7 +1121,7 @@
     <!-- Bottom-row cluster: player ShipDisplay + WeaponsDisplay.
          WeaponsDisplay folds the speed readout into its header in
          BC's "Speed {imp} : {vel} kph" format — see the spec at
-         docs/ui_designs/04-weapons-and-speed.md and BridgeHandlers
+         docs/superpowers/ui_designs/04-weapons-and-speed.md and BridgeHandlers
          HelmUpdateToolTip (sdk/.../BridgeHandlers.py:1389-1396). -->
     <div id="tactical-bottom-row">
         <section class="bc-panel ship-display" id="ship-display-player" data-role="player" hidden>
@@ -1062,7 +1139,9 @@
               <div class="ship-display__shield shield--rear"   data-bind="shield-rear"   data-integrity="down"></div>
               <div class="ship-display__shield shield--left"   data-bind="shield-left"   data-integrity="down"></div>
               <div class="ship-display__shield shield--right"  data-bind="shield-right"  data-integrity="down"></div>
-              <div class="ship-display__damage-overlay" data-bind="damage-overlay"></div>
+              <div class="ship-display__icon-frame">
+                <div class="ship-display__damage-overlay" data-bind="damage-overlay"></div>
+              </div>
             </div>
             <div class="ship-display__hull-bar">
               <div class="ship-display__hull-fill" data-bind="hull-fill"></div>
@@ -1141,6 +1220,7 @@
     <script src="js/sensors.js"></script>
     <script src="js/reticle_text.js"></script>
     <script src="panels/ship_display/ship_display.js"></script>
+    <script src="panels/ship_display/subsystem_picker.js"></script>
     <script src="panels/weapons_display/weapons_display.js"></script>
     <script src="js/sdk_mirror.js"></script>
     <script src="js/crew_menus.js"></script>
@@ -1158,6 +1238,7 @@
     <script src="js/engineering_power.js"></script>
     <script src="js/first_run.js"></script>
     <script src="js/mods_screen.js"></script>
+    <script src="js/boot_notice.js"></script>
     <script src="js/perf_monitor.js"></script>
     <script src="js/modal_layer.js"></script>
 </body>

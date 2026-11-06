@@ -29,6 +29,10 @@ class TGModelProperty:
 
     def SetName(self, value: str) -> None:
         self._name = value
+        # The SPV preview overlay (physical_parents.explicit_parent) is keyed
+        # by this name: every native part slot reads stale now.
+        from engine.appc import native_combat
+        native_combat.bump_part_gen()
 
     def __bool__(self) -> bool:
         return True
@@ -75,9 +79,16 @@ class TGModelProperty:
     def SetPhysicalParent(self, name) -> None:
         """Mesh part this mount rides on; ``None`` means Auto (unset)."""
         self._physical_parent = None if name is None else str(name)
+        # An input of the native part slots: they all read stale now.
+        from engine.appc import native_combat
+        native_combat.bump_part_gen()
 
     def GetPhysicalParent(self):
         return self._physical_parent
+
+    def _field_value(self, field: str, args: tuple = ()):
+        """The single data-bag lookup behind every generated ``Get*``."""
+        return self._data.get((field, _hashable_key(args)), None)
 
     def __getattr__(self, attr: str):
         if attr.startswith("Set"):
@@ -86,6 +97,15 @@ class TGModelProperty:
             cls_name = type(self).__name__
             def setter(*args):
                 data[(field, _hashable_key(args[:-1]))] = args[-1]
+                if field in _MIRRORED_FIELDS:
+                    # A shared template's max condition or per-tick power or
+                    # repair value: every subsystem whose _property names it
+                    # reads it (GetMaxCondition; the native power and repair
+                    # pieces in subsystem_step.h), so the mirror's one
+                    # Property row must hold it: every ship using the
+                    # template sees the write.
+                    from engine.appc import native_combat
+                    native_combat.push_property(self)
                 # Empirical consumer tracking: if any arg is a TGColorA, log
                 # which shim setter received it (off unless harness enables).
                 import App as _App
@@ -102,11 +122,18 @@ class TGModelProperty:
             return setter
         if attr.startswith("Get"):
             field = attr[3:]
-            data = self._data
             def getter(*args):
-                return data.get((field, _hashable_key(args)), None)
+                return self._field_value(field, args)
             return getter
         raise AttributeError(attr)
+
+
+#: The data-bag fields a native Property row mirrors (native_combat.
+#: MIRRORED_PROPERTY_FIELDS, spelled here so a setter needs no import).
+_MIRRORED_FIELDS = frozenset(("MaxCondition", "PowerOutput",
+                              "MainBatteryLimit", "BackupBatteryLimit",
+                              "MainConduitCapacity", "BackupConduitCapacity",
+                              "MaxRepairPoints", "NumRepairTeams"))
 
 
 def _copy_point(p):
@@ -501,6 +528,8 @@ class WeaponProperty(SubsystemProperty):
         WeaponProperty+0x50). Previously a silent _Stub no-op even though
         every stock hardpoint authors it (galaxy.py:22 etc.)."""
         self._groups = int(mask)
+        from engine.appc import native_combat
+        native_combat.push_property(self)       # K1 reads the mask natively
 
     def GetGroups(self) -> int:
         return int(getattr(self, "_groups", 0))
@@ -897,6 +926,11 @@ class WeaponSystemProperty(PoweredSubsystemProperty):
 
     def SetTorpedoScript(self, slot, module_name) -> None:
         self._torpedo_scripts[int(slot)] = str(module_name)
+        if int(slot) == 0:
+            # The script a tube with no ammo type launches: its launch, read
+            # now (fire control native only, M8.2).
+            from engine.appc import native_combat
+            native_combat.push_slot0_launch(self)
 
     def GetTorpedoScript(self, slot):
         return self._torpedo_scripts.get(int(slot))
@@ -934,6 +968,8 @@ class WeaponSystemProperty(PoweredSubsystemProperty):
                     chains.append((label, indices))
                 i += 2
         self._firing_chains = chains
+        from engine.appc import native_combat
+        native_combat.push_property(self)       # K1 reads the chains natively
 
     def GetFiringChainString(self):
         """Return the raw chain string. The return type is _TGString —

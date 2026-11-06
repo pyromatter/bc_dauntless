@@ -142,9 +142,9 @@ def test_moving_asteroid_striking_the_facility_counts_as_a_station_hit(monkeypat
     monkeypatch.setattr(mod, "AsteroidHitStation", lambda: beats.append("station"))
     monkeypatch.setattr(mod, "AsteroidDestroyed", lambda: beats.append("destroyed"))
     fp = fac.GetWorldLocation()
-    # Clear of the widest boundary any radius rule gives (raw x scale), so
+    # Clear of the widest boundary any radius rule gives (GetRadius() is already base x scale), so
     # the rock is approaching, not born overlapping.
-    r = fac.GetRadius() * fac.GetScale() + rock.GetRadius() * rock.GetScale()
+    r = fac.GetRadius() + rock.GetRadius()
     rock.SetTranslateXYZ(fp.x + r + 0.3, fp.y, fp.z)
     rock.SetVelocity(App.TGPoint3(-6.6, 0.0, 0.0))
     loop = GameLoop()
@@ -192,6 +192,8 @@ def test_asteroid_killed_against_haven_does_not_cascade():
             if strikes:
                 break
         assert strikes, "the asteroid never reached Haven"
+        from engine.appc import effect_queue
+        effect_queue.boundary()             # the death check's boundary (M5)
         assert rock.IsDying() or rock.IsDead()
         seen = set()
         for _ in range(120):            # 2 s after it
@@ -314,6 +316,8 @@ def test_largest_asteroid_breaks_into_one_target_small_rocks_and_debris():
     assert target.IsTargetable()
     minors._pending_free.clear()
     target.DamageSystem(target.GetHull(), 1e9)
+    from engine.appc import effect_queue
+    effect_queue.boundary()                 # the death check's boundary (M5)
     remnant_name = name + " - Remnant"
     remnant = next((x for x in iter_rocks() if x.GetName() == remnant_name),
                    None)

@@ -2,6 +2,8 @@ import re
 from functools import lru_cache
 
 import engine.dev_mode as dev_mode
+from engine.appc import proximity_cache
+from engine.appc import native_combat
 from engine.appc.events import TGEventHandlerObject
 
 
@@ -76,6 +78,13 @@ class SetClass(TGEventHandlerObject):
         super().__init__()
         self._name: str = ""
         self._objects: dict[str, object] = {}
+        # `_objects` minus torpedoes, in the same order: the proximity walk's
+        # candidates (planet.ProximityManager._candidates). A fight keeps
+        # ~1,500 torpedoes in its set, none occupying space, and walking them
+        # per AvoidObstacles query was a quarter of all AI time at 64 ships.
+        # Kept by _index_member and the two removals; nothing else mutates
+        # `_objects`.
+        self._non_torpedo: dict[str, object] = {}
         # Camera registry — driven by AddCameraToSet / SetActiveCamera.
         # CutsceneCameraBegin (sdk/.../Actions/CameraScriptActions.py) checks
         # `if not pSet.GetCamera(sCamera):` to decide whether to add a new
@@ -103,6 +112,10 @@ class SetClass(TGEventHandlerObject):
         self._subscribers: list = []
         # Lazily-created SetEffectRoot handle. See GetEffectRoot().
         self._effect_root: "SetEffectRoot | None" = None
+        # The native combat mirror row (engine/appc/native_combat.py): the
+        # set's ordered ship/nebula lists and its resolved profile frame.
+        # Last, so the first push sees a complete set.
+        native_combat.register(self, "Set")
 
     def subscribe(self, callback) -> None:
         """Register a callback notified on every AddObjectToSet /
@@ -148,6 +161,9 @@ class SetClass(TGEventHandlerObject):
 
     def SetName(self, name: str) -> None:
         self._name = name
+        # The profile frame is resolved from the name (QuickBattle renames a
+        # set in place, which unmaps it): push the resolved frame.
+        native_combat.push_set_frame(self)
 
     def GetDisplayName(self, out_string=None):
         """SDK out-param idiom: ``kName = App.TGString();
@@ -187,7 +203,9 @@ class SetClass(TGEventHandlerObject):
             obj.SetName(identifier)
         if hasattr(obj, "_containing_set"):
             obj._containing_set = self
+        previous = self._objects.get(identifier)
         self._objects[identifier] = obj
+        self._index_member(identifier, obj, previous)
         from engine.appc.ships import ShipClass
         from engine.appc import ship_lifecycle
         from engine.appc import contact_index
@@ -242,6 +260,24 @@ class SetClass(TGEventHandlerObject):
         if pGame is not None and pGame.GetPlayer() is not obj:
             pGame.SetPlayer(obj)
 
+    def _index_member(self, identifier: str, obj, previous) -> None:
+        from engine.appc.projectiles import Torpedo
+        # Bump (engine.appc.proximity_cache) only when `_non_torpedo` changes:
+        # torpedoes are not candidates, and a sized one is covered by the
+        # projectiles `_radius` setter bump.
+        if isinstance(obj, Torpedo):
+            if self._non_torpedo.pop(identifier, None) is not None:
+                proximity_cache.bump()
+        elif previous is not None and isinstance(previous, Torpedo):
+            # The name kept its slot in `_objects` but is new to the index,
+            # which would append it: rebuild so the two orders agree.
+            self._non_torpedo = {k: v for k, v in self._objects.items()
+                                 if not isinstance(v, Torpedo)}
+            proximity_cache.bump()
+        else:
+            self._non_torpedo[identifier] = obj
+            proximity_cache.bump()
+
     def GetObject(self, name: str):
         return self._objects.get(name)
 
@@ -260,7 +296,11 @@ class SetClass(TGEventHandlerObject):
             from engine.appc.objects import ObjectGroup
             ObjectGroup.broadcast_membership(obj, entered=False)
             self._clear_containing_set(obj)
-        return self._objects.pop(name, None)
+        if self._non_torpedo.pop(name, None) is not None:
+            proximity_cache.bump()  # after the handlers, at the index pop
+        removed = self._objects.pop(name, None)
+        self._forget_in_proximity(removed)
+        return removed
 
     def DeleteObjectFromSet(self, name: str) -> None:
         obj = self._objects.get(name)
@@ -278,7 +318,23 @@ class SetClass(TGEventHandlerObject):
             ObjectGroup.broadcast_membership(obj, entered=False)
             broadcast_object_deleted(obj)
             self._clear_containing_set(obj)
-        self._objects.pop(name, None)
+        if self._non_torpedo.pop(name, None) is not None:
+            proximity_cache.bump()  # after the handlers, at the index pop
+        self._forget_in_proximity(self._objects.pop(name, None))
+
+    def _forget_in_proximity(self, obj) -> None:
+        """An object that left this set leaves its manager list too (ruling
+        6): Quick Battle UpdateObject's every ship in and never RemoveObject's
+        one, so an evicted hulk, a ship deleted at End Combat or one that
+        warped away was still returned by AvoidObstacles' queries. Not while
+        it is still a member under another name (including one a handler on
+        the removal broadcast re-added it under)."""
+        pm = self.__dict__.get("_proximity_manager")
+        if obj is None or pm is None or not pm._holds(obj):
+            return
+        if any(o is obj for o in self._objects.values()):
+            return
+        pm._forget(obj)
 
     def _clear_containing_set(self, obj) -> None:
         """Stop `obj` reporting THIS set once it has left it, so

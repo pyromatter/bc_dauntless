@@ -162,7 +162,7 @@ class Episode(TGObject):
             self._goals.append(goal_id)
         self._disabled_goals.discard(goal_id)
         from engine.appc import mission_goals
-        mission_goals.add_goal_button(self._goal_label(goal_id))
+        mission_goals.add_goal_button(self._goal_label(goal_id), goal_id)
 
     def RemoveGoal(self, goal_id) -> None:
         goal_id = str(goal_id)
@@ -419,6 +419,12 @@ class Game(TGObject):
         # tests the event surface may be absent — repopulation re-runs on the
         # next SetPlayer / mission swap.
         if player is not None:
+            # Attach the bridge officers BEFORE the broadcast, as Appc ran
+            # LoadBridge.ConfigureForShip on player assignment: the
+            # ET_SET_PLAYER listeners must register their player handlers on
+            # top of the officers' (bridge_officers.configure_for_player).
+            from engine.bridge_officers import configure_for_player
+            configure_for_player(player)
             try:
                 import App
                 evt = App.TGEvent_Create()

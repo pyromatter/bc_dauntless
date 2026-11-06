@@ -85,6 +85,8 @@ import os
 
 import App
 
+from engine.core import frame_profiler
+
 
 class ManagePower:
     """Mirror of the native ManagePower CodeAI (ctor 0x00486FA0).
@@ -259,7 +261,7 @@ def _engine_avoidance_class(base: type) -> type:
     against the real ``AI.Preprocessors.AvoidObstacles`` defaults -- but it is a
     real divergence, and a mod that varied any of them per-doctrine would be
     silently ignored. Closing it means threading the four off the node in
-    ``course_override_for``; see docs/engine/avoidance-duplication.md.
+    ``course_override_for``; see docs/reference/engine/avoidance-duplication.md.
     """
     cached = _ENGINE_AVOIDANCE_CLASSES.get(base)
     if cached is not None:
@@ -303,8 +305,18 @@ def _phased_avoidance_class(base: type) -> type:
         state[_PHASE_ATTR] = True
         return delay * _phase_factor(self)
 
-    cls = type("Phased" + base.__name__, (_non_lethal_class(base),),
-               {"GetNextUpdateTime": GetNextUpdateTime})
+    non_lethal = _non_lethal_class(base)
+
+    # Timed as `ai.avoid` (native motion + proximity phase 0): the whole SDK
+    # scan, so phase 1's saving reads off a row. functools.wraps keeps the
+    # SDK's (self, dEndTime) for ai_driver's arity probe.
+    @functools.wraps(base.Update)
+    def Update(self, *args, **kwargs):
+        with frame_profiler.scope("ai.avoid"):
+            return non_lethal.Update(self, *args, **kwargs)
+
+    cls = type("Phased" + base.__name__, (non_lethal,),
+               {"GetNextUpdateTime": GetNextUpdateTime, "Update": Update})
     _PHASED_AVOIDANCE_CLASSES[base] = cls
     globals()[cls.__name__] = cls
     return cls

@@ -33,7 +33,7 @@ BOP_DIR = "data/Models/Ships/BirdOfPrey"
 BOP_MODEL = f"{BOP_DIR}/BirdOfPrey.nif"
 IID = 7
 SCALE = 2.0               # GetScale(); the instance scale is BC_MODEL_SCALE * this
-RADIUS_GU = 10.0          # GetRadius(): UNSCALED GU => 1000 NIF units
+RADIUS_GU = 10.0          # GetBaseRadius(): UNSCALED GU => 1000 NIF units
 AMB_COMMITTED = (Path(__file__).resolve().parents[2] / "native" / "assets"
                  / "replacements" / AMB_DIR / "Masks" / "decals.json")
 
@@ -69,6 +69,9 @@ class _FakeShip:
     def GetRadius(self):
         return RADIUS_GU
 
+    def GetBaseRadius(self):
+        return RADIUS_GU
+
 
 def _instance_world(ship):
     """The render instance's world matrix (row-major 4x4, flat)."""
@@ -101,7 +104,7 @@ def _inverse3(a):
 def _fake_world_to_body(ship):
     """host_io.world_to_body's contract (world point + world normal -> body
     point + unit body normal), inverting the instance matrix generically."""
-    def _w2b(iid, point, normal):
+    def _w2b(iid, point, normal, drawn=False):
         m = _instance_world(ship)
         lin = [[m[4 * r + c] for c in range(3)] for r in range(3)]
         inv = _inverse3(lin)
@@ -143,10 +146,14 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(host_io, "set_instance_decals",
                         lambda iid, decals: calls.append((iid, decals)))
     traces = []
+    drawn_flags = []
     hit = {"value": None}
 
-    def _trace(iid, origin, direction, max_dist):
+    # Mirrors host_io.ray_trace_mesh's signature; the pane asks for the
+    # DRAWN pose (the author clicks what is drawn), recorded in "drawn".
+    def _trace(iid, origin, direction, max_dist, rest_pose=False, drawn=False):
         traces.append((iid, origin, direction, max_dist))
+        drawn_flags.append(drawn)
         return hit["value"]
     monkeypatch.setattr(host_io, "ray_trace_mesh", _trace)
     ship = _FakeShip()
@@ -159,7 +166,7 @@ def env(tmp_path, monkeypatch):
                                 iid_getter=lambda: IID,
                                 model_rel_getter=lambda s: model["rel"])
     p.open()
-    yield {"p": p, "calls": calls, "hit": hit, "traces": traces, "ship": ship,
+    yield {"p": p, "calls": calls, "hit": hit, "traces": traces, "drawn": drawn_flags, "ship": ship,
            "masks": masks, "repl": repl, "tmp": tmp_path, "model": model}
     mods.invalidate_replacements()
     hull_decals.reset()
@@ -246,7 +253,7 @@ def test_add_then_a_hull_click_places_a_chirality_ok_decal(env):
     assert decal_editor.chirality_ok(bottom)
     assert _close(decal_editor.centre(bottom), (50.0, -100.0, -20.0), 1e-6)
     assert _close(bottom.normal, (0.0, 0.0, -1.0))
-    # Width is 25% of the NIF-unit radius: GetRadius() is UNSCALED GU, so
+    # Width is 25% of the NIF-unit radius: GetBaseRadius() is UNSCALED GU, so
     # 10 GU / BC_MODEL_SCALE = 1000 units, whatever GetScale() says.
     assert decal_editor.width(bottom) == pytest.approx(250.0)
     # Zhukov/bottom.png is 200x50: height = width / 4.
@@ -258,6 +265,7 @@ def test_add_then_a_hull_click_places_a_chirality_ok_decal(env):
                                  str(env["masks"] / "Zhukov" / "bottom.png")]
     # The trace went at the SPV instance.
     assert env["traces"][-1][0] == IID
+    assert env["drawn"][-1] is True
 
 
 def test_a_missed_click_sets_the_hint_and_places_nothing(env):

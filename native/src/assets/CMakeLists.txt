@@ -17,11 +17,13 @@ add_library(assets STATIC
     src/mesh_upload.cc
     src/model_build.cc
     src/model_compose.cc
+    src/panel_files.cc
     src/path_resolver.cc
     src/pose_sample.cc
     src/skeleton_build.cc
-    src/skin_weights.cc
     src/skin_offsets.cc
+    src/skin_weights.cc
+    src/smoothing_probe.cc
     src/tessellate.cc
     src/geosphere.cc
     src/texture_decode.cc

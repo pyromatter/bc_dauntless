@@ -5,6 +5,9 @@
 set(HOST_BINDINGS_SOURCES
     host_bindings.cc
     frame_dump.cc
+    combat_write_apply.cc
+    motion_write_apply.cc
+    subsystem_write_apply.cc
 )
 
 # Host logic with C++ tests (native/tests/host): the developer gate and the
@@ -14,6 +17,7 @@ add_library(dauntless_host_core STATIC
     developer_mode.cc
     bridge_highlight.cc
     model_identity_maps.cc
+    combat_effect_queue.cc
 )
 target_compile_features(dauntless_host_core PUBLIC cxx_std_20)
 target_include_directories(dauntless_host_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -23,7 +27,7 @@ set_target_properties(dauntless_host_core PROPERTIES POSITION_INDEPENDENT_CODE O
 # Python extension module (.so / .pyd / .dylib) for pytest.
 pybind11_add_module(_dauntless_host MODULE ${HOST_BINDINGS_SOURCES})
 target_compile_features(_dauntless_host PRIVATE cxx_std_20)
-target_link_libraries(_dauntless_host PRIVATE dauntless_host_core renderer scenegraph assets dauntless_audio dauntless_transforms platform)
+target_link_libraries(_dauntless_host PRIVATE dauntless_host_core renderer scenegraph assets dauntless_audio dauntless_transforms dauntless_combat platform)
 set_target_properties(_dauntless_host PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python"
 )
@@ -47,6 +51,7 @@ target_link_libraries(dauntless
         assets
         dauntless_audio
         dauntless_transforms
+        dauntless_combat
         platform
 )
 
@@ -59,6 +64,28 @@ endif()
 
 target_compile_features(dauntless PRIVATE cxx_std_20)
 target_include_directories(dauntless PRIVATE .)
+
+# /bigobj: host_bindings.cc is past MSVC's object-file section limit.
+#
+# A COFF object may hold 65,279 sections, and cl emits several per function.
+# host_bindings.cc is ~15k lines of pybind11 lambdas -- each one a function,
+# each template instantiation more -- and it crossed the limit when the
+# native combat and motion kernels added their bindings. The build then dies
+# with "fatal error C1128: number of sections exceeded object file format
+# limit: compile with /bigobj", which names the fix but not where to put it.
+#
+# Windows-only by nature: the limit is a COFF property, so ELF and Mach-O
+# never hit it and this never surfaces on macOS or Linux. pybind11 recommends
+# /bigobj for exactly this reason.
+#
+# On both targets, because both compile HOST_BINDINGS_SOURCES -- the exe
+# statically links the same translation unit the module builds. Target-wide
+# rather than per-source: the cost is a larger .obj and nothing at runtime,
+# and the next file to grow should not have to rediscover this error.
+if(MSVC)
+    target_compile_options(_dauntless_host PRIVATE /bigobj)
+    target_compile_options(dauntless       PRIVATE /bigobj)
+endif()
 
 set_target_properties(dauntless PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -150,17 +177,28 @@ if(DAUNTLESS_ENABLE_CEF)
         )
     elseif(UNIX)
         # Linux: same split as Windows -- libcef.so in Release/, the .pak and
-        # locale data in Resources/. Untested (nobody has built CEF here), but
-        # copying only Release/ is wrong on this platform for the same reason.
-        add_custom_command(TARGET dauntless POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${CEF_ROOT}/Release"
-                "${CMAKE_BINARY_DIR}"
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${CEF_ROOT}/Resources"
-                "${CMAKE_BINARY_DIR}"
-            COMMENT "Copying CEF runtime files alongside dauntless"
-            VERBATIM
-        )
+        # locale data in Resources/. Copying only Release/ is wrong on this
+        # platform for the same reason.
+        #
+        # Both targets link libcef.so, so both copy it: a
+        # `--target _dauntless_host` build must be importable without the
+        # full build having run. The rpath points each at build/, where the
+        # copy lands (the extension itself sits one level down, in python/).
+        foreach(_cef_consumer dauntless _dauntless_host)
+            add_custom_command(TARGET ${_cef_consumer} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CEF_ROOT}/Release"
+                    "${CMAKE_BINARY_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CEF_ROOT}/Resources"
+                    "${CMAKE_BINARY_DIR}"
+                COMMENT "Copying CEF runtime files into the build tree"
+                VERBATIM
+            )
+        endforeach()
+        set_target_properties(dauntless PROPERTIES
+            BUILD_RPATH "$ORIGIN")
+        set_target_properties(_dauntless_host PROPERTIES
+            BUILD_RPATH "$ORIGIN/..")
     endif()
 endif()

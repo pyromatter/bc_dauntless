@@ -1,7 +1,6 @@
 import App
 
-from engine.appc import articulation
-from engine.appc.ship_iter import iter_non_rock_ships
+from engine.appc import native_combat, native_subsystems, passive_state
 from engine.core import frame_profiler as _prof
 
 TICK_RATE = 60
@@ -22,12 +21,35 @@ class GameLoop:
     Physics + render run downstream in host_loop, not here.
     """
 
+    def __init__(self, owns_boundary: bool = True) -> None:
+        """`owns_boundary`: this loop's tick is the whole sim tick (the
+        headless harness, tools), so its end is the tick boundary where the
+        held effects of every condition write and hit are delivered, the
+        death check among them (effect_queue.boundary). The host passes
+        False: its boundaries are the per-tick combat flush and the frame's
+        end (host_loop)."""
+        passive_state.configure()
+        native_combat.configure()
+        # Kernel M flies the motion stage (DAUNTLESS_NATIVE_MOTION, on
+        # unless =0): after the mirror is live, which it needs.
+        from engine.appc import native_motion
+        native_motion.configure()
+        self.owns_boundary = owns_boundary
+
     def tick(self) -> None:
+        # The published-pose read window opens at this tick's publish
+        # (native_motion.close_published): close one a driver left open
+        # (no _advance_combat after the last tick, or one that raised
+        # before it), so this tick's AI-stage K1 calls read live.
+        from engine.appc import native_motion
+        native_motion.close_published()
         # Drop the avoidance obstacle snapshot: a new tick means the world has
         # moved. Explicit rather than inferred from the clock -- see
         # collision_avoidance.invalidate_obstacle_snapshot.
         from engine.appc.collision_avoidance import invalidate_obstacle_snapshot
         invalidate_obstacle_snapshot()
+        # Pulse banks re-read their projectile module after a cache reset.
+        native_combat.refresh_stale_pulse_params()
 
         with _prof.scope("gl.timers.game"):
             App.g_kTimerManager.tick(TICK_DELTA)
@@ -69,7 +91,7 @@ class GameLoop:
             evaluate_proximity_checks()
         # NO avoidance phase here, deliberately. Avoidance is BC's
         # AvoidObstacles PREPROCESSOR, dispatched inside tick_all_ai above as
-        # part of each ship's AI tree -- see docs/engine/avoidance-duplication.md.
+        # part of each ship's AI tree -- see docs/reference/engine/avoidance-duplication.md.
         # A second pass here ran a full duplicate controller over every AI ship
         # and overwrote whatever the preprocessor had just decided, so real
         # missions paid for avoidance twice and discarded the first answer.
@@ -84,6 +106,9 @@ class GameLoop:
         from engine.appc import warp_state
         with _prof.scope("gl.warp_states"):
             warp_state.tick_warp_states(TICK_DELTA)
+        from engine.systems import shuttle_service
+        with _prof.scope("gl.shuttles"):
+            shuttle_service.tick(TICK_DELTA)
         from engine.appc import warp_in_flash
         warp_in_flash.advance(TICK_DELTA)
         with _prof.scope("gl.motion"):
@@ -100,6 +125,29 @@ class GameLoop:
         with _prof.scope("gl.subsystems"):
             _update_ship_subsystems()
 
+        # DAUNTLESS_NATIVE_AUDIT=1: every mirror row against its Python
+        # object, once a tick, so a write that bypassed a NativeField is
+        # caught where it happened (engine/appc/native_combat.py).
+        if native_combat.audit_enabled():
+            # After a drain: an off-main push queued since the last one is
+            # not a bypass, and would read as Python != mirror.
+            native_combat.drain()
+            native_combat.audit_mirror()
+
+        # The tick boundary when no host drives this loop: the held damage
+        # effects are delivered, the death check among them (native damage
+        # M2, M5; engine/appc/effect_queue.py).
+        if self.owns_boundary:
+            # The published-pose read window closes first: a combat step a
+            # boundary-owning driver runs after this tick reads live
+            # (native_motion.close_published).
+            from engine.appc import effect_queue
+            native_motion.close_published()
+            effect_queue.boundary()
+            # The mirror's pending frees and off-main pushes (spec
+            # 2026-11-03 ruling R2): host_loop's tick boundary otherwise.
+            native_combat.drain(boundary=True)
+
     def advance(self, n: int) -> None:
         for _ in range(n):
             self.tick()
@@ -110,36 +158,17 @@ class GameLoop:
 
 
 def _update_ship_subsystems() -> None:
-    """Advance every live ship's shield / power / cloak / repair subsystem.
+    """Advance every live ship's shield / power / cloak / repair subsystem
+    and articulation: the native subsystem stage
+    (engine/appc/native_subsystems.py; native/src/combat/src/
+    subsystem_step.cc), the only one (phase 6 A1 Task 8 deleted the Python
+    stage). Rocks are excluded -- a rock's shield/power/cloak/repair/
+    articulation never ticks (rock-class spec §1).
 
     Extracted from GameLoop.tick so the profiler can scope it without
-    re-indenting the body (and so the scope covers the whole walk, including
-    iter_ships itself, rather than only the per-ship work). Rocks are
-    excluded — a rock's shield/power/cloak/repair/articulation never ticks
-    (rock-class spec §1).
+    re-indenting the body (and so the scope covers the whole walk).
     """
-    for ship in iter_non_rock_ships():
-        ss = ship.GetShieldSubsystem()
-        if ss is not None:
-            ss.Update(TICK_DELTA)
-        ps = ship.GetPowerSubsystem()
-        if ps is not None:
-            ps.Update(TICK_DELTA)
-        # Advance any in-progress cloak/decloak transition so it completes
-        # (CloakShip preprocessor sets the intent; the timer lives here).
-        cl = ship.GetCloakingSubsystem()
-        if cl is not None:
-            cl.Update(TICK_DELTA)
-        # Repair bay: advance the repair queue (RE tick — see
-        # RepairSubsystem.Update). AI ships repair themselves too.
-        rs = ship.GetRepairSubsystem()
-        if rs is not None:
-            rs.Update(TICK_DELTA)
-        # Part articulation (BoP wings). Sim-side deliberately: the renderer
-        # reads the eased pose, it does not animate on its own clock, so the
-        # later collision/damage integration consumes the same value. Ships
-        # without a rig return on a cached attribute read.
-        articulation.tick_ship(ship, TICK_DELTA)
+    native_subsystems.step_all(TICK_DELTA)
 
 
 def _pump_bridge_character_queues() -> None:

@@ -990,12 +990,19 @@ g_kVarManager = TGVarManager(event_type_allocator=lambda: Game_GetNextEventType(
 # Headless engine uses Python's random; SetRandomSeed lets tests pin determinism.
 import random as _random
 
+from engine.appc import presentation_rng as _presentation_rng
+
 
 class _SystemWrapper:
     def __init__(self):
         self._rng = _random.Random()
 
     def GetRandomNumber(self, upper_exclusive: int) -> int:
+        # Inside a presentation scope (an SDK script the engine runs only to
+        # present) the draw comes from the presentation generator, so it
+        # never shifts a gameplay roll (engine/appc/presentation_rng.py).
+        if _presentation_rng.in_scope():
+            return _presentation_rng.rand(upper_exclusive)
         if upper_exclusive <= 0:
             return 0
         return self._rng.randrange(int(upper_exclusive))
@@ -1119,7 +1126,7 @@ class _UtopiaModule:
         # (MissionLib.py SetMaxFriendlyFire; read back as GetFriendlyFireTolerance).
         # 5000.0 is the ENGINE DEFAULT, decoded from a real BC save taken in E8M1
         # — a mission that sets neither this nor the warning points, so the saved
-        # values ARE the defaults (docs/engine/
+        # values ARE the defaults (docs/reference/engine/
         # bcs-save-format.md, preamble scalars 1 and 3).
         #
         # This default is load-bearing, not cosmetic. MissionLib:3727 reads
@@ -1828,6 +1835,14 @@ class EngRepairPaneWidget(_DisplayWidget):
         super().__init__("EngRepairPane")
         self._pane_width, self._pane_height, self._pane_rows = width, height, rows
 
+    def GetNthChild(self, n):
+        """The three list areas answer with their live contents (see
+        _repair_area_pane_class); the other slots as _DisplayWidget's."""
+        for name, area in _REPAIR_AREAS.items():
+            if int(n) == getattr(EngRepairPane, name, None):
+                return _repair_area_pane_class()(area)
+        return super().GetNthChild(n)
+
     def IsVisible(self) -> int:
         # _DisplayWidget defines no IsVisible; its __getattr__ catch-all
         # (line ~1380) would return a lambda giving None -> bool(None) ->
@@ -1840,13 +1855,63 @@ class EngRepairPaneWidget(_DisplayWidget):
         return 1
 
 
+def _repair_area_pane_class():
+    """TGPane subclass for one of the repair pane's three list areas, built on
+    first use (TGPane lives in engine.appc.tg_ui, imported late here)."""
+    global _RepairAreaPane
+    if _RepairAreaPane is None:
+        from engine.appc.tg_ui.widgets import TGPane
+
+        class RepairAreaPane(TGPane):
+            """EngRepairPane's REPAIR_AREA / WAITING_AREA / DESTROYED_AREA:
+            one child per subsystem listed there, read live from the player's
+            repair queue (engine.ui.eng_repair_pane.repair_pane_snapshot, the
+            same rows the crew menu draws). E2M0 counts the repair area's
+            children to have Picard suggest repairs (WarbirdsWarpOut) and
+            points its repair-tutorial arrows at these areas."""
+            def __init__(self, area):
+                super().__init__()
+                self._area = area
+
+            def _rows(self):
+                from engine.ui.eng_repair_pane import repair_pane_snapshot
+                return repair_pane_snapshot(Game_GetCurrentPlayer(),
+                                            lambda wid, sub: None)[self._area]
+
+            def GetNumChildren(self) -> int:
+                return len(self._rows())
+
+        _RepairAreaPane = RepairAreaPane
+    return _RepairAreaPane
+
+
+_RepairAreaPane = None
+_g_repair_pane = None
+_REPAIR_AREAS = {"REPAIR_AREA": "repair", "WAITING_AREA": "waiting",
+                 "DESTROYED_AREA": "destroyed"}
+
+
 def EngRepairPane_Create(width=0.0, height=0.0, n=0) -> "EngRepairPaneWidget":
+    global _g_repair_pane
     pane = EngRepairPaneWidget(width, height, n)
     # Pre-seed one child (index 0 = DIVIDER) so GetNthChild(DIVIDER).Layout()
     # keeps working (SDK layout path).
     from engine.appc.tg_ui.widgets import TGPane
     pane.AddChild(TGPane())
+    _g_repair_pane = pane
     return pane
+
+
+def EngRepairPane_GetRepairPane() -> "EngRepairPaneWidget":
+    """The live repair pane (the last one EngineerMenuHandlers created), as
+    BC's singleton accessor returns it; a detached one before any exists, so
+    a caller's GetNthChild(...) still answers. Without this the name fell to
+    the stub and E2M0's WarbirdsWarpOut raised on
+    TGPane_Cast(pane.GetNthChild(REPAIR_AREA)).GetNumChildren() (user report
+    2026-11-03: the Warbirds' retreat never ran)."""
+    if _g_repair_pane is None:
+        return EngRepairPane_Create()
+    return _g_repair_pane
 
 
 # EngPowerDisplay_Create, EngPowerCtrl_GetPowerCtrl and related names are

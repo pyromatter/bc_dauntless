@@ -8,6 +8,7 @@ E2M1.py:649/1079), but the AI, motion and subsystem loops skip it
 land with genus GENUS_ASTEROID -- ShipClass_Create only ever sees a name.
 """
 import engine.dev_mode as dev_mode
+from engine.appc import native_combat
 from engine.appc.objects import PhysicsObjectClass
 from engine.appc.ships import ShipClass
 
@@ -57,12 +58,13 @@ def is_rock(obj) -> bool:
 
 
 def effective_radius(rock) -> float:
-    """The rock's real size in GU: base x GetScale(). Base is GetRadius()
+    """The rock's real size in GU: base x GetScale(). Base is GetBaseRadius()
     when set, else the hull subsystem's radius -- headless a hardpoint rock's
-    GetRadius is 0 (HullProperty.SetRadius sets only the hull), and live the
-    host sets GetRadius from the mesh extent without SetScale. E1M2 scales
-    its rocks 3.7-8.5x, so reading GetRadius alone plans them at ~0.8 GU."""
-    base = float(rock.GetRadius())
+    base radius is 0 (HullProperty.SetRadius sets only the hull), and live the
+    host sets it from the mesh extent without SetScale. E1M2 scales its rocks
+    3.7-8.5x, so a hull radius alone plans them at ~0.8 GU. (GetRadius() is
+    base x scale itself; reading it here would scale twice.)"""
+    base = float(rock.GetBaseRadius())
     if base <= 0.0:
         hull = rock.GetHull()
         base = float(hull.GetRadius()) if hull is not None else 0.0
@@ -84,6 +86,7 @@ def maybe_become_rock(ship) -> bool:
     if genus != App.GENUS_ASTEROID:
         return False
     ship.__class__ = RockClass
+    native_combat.reclassify(ship)
     ship._become_rock()
     return True
 
@@ -183,6 +186,7 @@ def RockClass_Create(radius_gu, *, family="silicate", seed="", name="",
     from engine.rocks import stats
     ship = ShipClass_Create(name)
     ship.__class__ = RockClass
+    native_combat.reclassify(ship)
     ship._become_rock()
     ship.SetGenus(App.GENUS_ASTEROID)
     ship.SetSpecies(App.SPECIES_ASTEROID)

@@ -24,6 +24,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 # tests/known_failures.txt -- a mass-skip would pass the gate green while
 # testing nothing.
 from engine import paths as _paths
+from engine.core import case_paths as _case_paths
 
 _RESOLUTION = _paths.resolve()
 _paths.configure(_RESOLUTION)
@@ -549,13 +550,15 @@ class _SDKLoader(importlib.abc.Loader):
                     setattr(sys.modules[parent], attr, module)
                 except (AttributeError, TypeError):
                     pass
-        # Second pass: engine-owned overrides -- ship data, and the system map
-        # on region modules -- applied after the SDK module registers its own
+        # Second pass: engine-owned overrides -- ship data, the system map
+        # on region modules, and the home-station CreateShip wrap on
+        # loadspacehelper -- applied after the SDK module registers its own
         # data. Fires on reload too, so loadspacehelper's ClearLocalTemplates()
         # -> reload() window is covered. Keep in sync with the twin in
         # tools/mission_harness.py.
         _qual = self.also_register_as or module.__name__
-        if _qual.startswith(("ships.", "Systems.")):
+        if (_qual.startswith(("ships.", "Systems."))
+                or _qual == "loadspacehelper"):
             try:
                 from engine.appc import sdk_overrides
                 sdk_overrides.on_sdk_module_exec(module, _qual)
@@ -679,15 +682,15 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
         if _spec is not None:
             return _spec
         # Regular SDK module
-        candidate = SDK_SCRIPTS / (rel + ".py")
-        if candidate.exists():
+        candidate = _case_paths.resolve(SDK_SCRIPTS, rel + ".py")
+        if candidate is not None:
             loader = _SDKLoader(str(candidate))
             return importlib.machinery.ModuleSpec(
                 fullname, loader, origin=str(candidate)
             )
         # SDK package (directory with __init__.py)
-        pkg_init = SDK_SCRIPTS / rel / "__init__.py"
-        if pkg_init.exists():
+        pkg_init = _case_paths.resolve(SDK_SCRIPTS, rel + "/__init__.py")
+        if pkg_init is not None:
             loader = _SDKLoader(str(pkg_init))
             spec = importlib.machinery.ModuleSpec(
                 fullname, loader, origin=str(pkg_init)
@@ -718,8 +721,8 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
                         fullname, _logical, _logical.replace("/", "."))
                     if _spec is not None:
                         return _spec
-                _cand = _p / (child + ".py")
-                if _cand.exists():
+                _cand = _case_paths.resolve(_p, child + ".py")
+                if _cand is not None:
                     _rel_parts = _cand.relative_to(SDK_SCRIPTS).with_suffix("").parts
                     _qual = ".".join(_rel_parts)
                     if _qual != fullname and _qual in sys.modules:
@@ -727,22 +730,22 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
                     else:
                         loader = _SDKLoader(str(_cand), also_register_as=(_qual if _qual != fullname else None))
                     return importlib.machinery.ModuleSpec(fullname, loader, origin=str(_cand))
-                _pkg = _p / child / "__init__.py"
-                if _pkg.exists():
-                    _rel_parts = (_p / child).relative_to(SDK_SCRIPTS).parts
+                _pkg = _case_paths.resolve(_p, child + "/__init__.py")
+                if _pkg is not None:
+                    _rel_parts = _pkg.parent.relative_to(SDK_SCRIPTS).parts
                     _qual = ".".join(_rel_parts)
                     if _qual != fullname and _qual in sys.modules:
                         loader = _AliasLoader(sys.modules[_qual])
                     else:
                         loader = _SDKLoader(str(_pkg), also_register_as=(_qual if _qual != fullname else None))
                     spec = importlib.machinery.ModuleSpec(fullname, loader, origin=str(_pkg))
-                    spec.submodule_search_locations = [str(_p / child)]
+                    spec.submodule_search_locations = [str(_pkg.parent)]
                     return spec
         # Python 1.5 implicit relative import fallback: BC engine added each SDK
         # package directory to sys.path, so bare `import X` inside Bridge/ found
         # Bridge/X.py.  Search SDK subdirectories for a unique match.
         if "." not in fullname:
-            matches = sorted(SDK_SCRIPTS.rglob(f"{fullname}.py"))
+            matches = _case_paths.rglob_py(SDK_SCRIPTS, fullname)
             # Python 1.5 compat: prefer the file in the same directory as the
             # calling SDK module (covers both load-time and call-time imports).
             # Walk the call stack to find the innermost SDK frame.
@@ -796,6 +799,16 @@ class _SDKFinder(importlib.abc.MetaPathFinder):
 
 
 def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "mutates_engine_classes: the test deliberately leaves an engine class "
+        "changed; the engine class guard (_guard_engine_classes) skips it")
+    config.addinivalue_line(
+        "markers",
+        "deep: runs only in the full gate (scripts/gate_full.sh); set from "
+        "the GENERATED tests/gate_tiers/deep_pytest.txt, never by hand. The "
+        "merge gate (scripts/gate_merge.sh) runs -m 'not deep'")
+
     # Our App.py must shadow sdk/Build/scripts/App.py
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
@@ -904,6 +917,18 @@ def pytest_configure(config):
             pass
 
 
+def pytest_collection_modifyitems(config, items):
+    """Mark the full-gate-only tests `deep` (spec
+    docs/superpowers/specs/2026-11-06-two-tier-test-gate-design.md).
+    Everything not listed is in the merge tier: a new test is by rule."""
+    from tests.helpers import gate_tiers
+    is_deep = gate_tiers.deep_matcher(gate_tiers.load_deep_pytest())
+    mark = pytest.mark.deep
+    for item in items:
+        if is_deep(item.nodeid):
+            item.add_marker(mark)
+
+
 # ── Per-test isolation of leak-prone engine globals ──────────────────────────
 #
 # Several engine modules hold module-level mutable state that a mission/bridge
@@ -915,7 +940,7 @@ def pytest_configure(config):
 # left stale broadcast handlers that swallowed the next test's fire event ->
 # "0 torpedoes"; a leaked ShipDisplay registry -> "duplicate panel name").
 # These only surfaced once the full suite became runnable (see
-# docs/test-suite-memory.md); focused subsets hid them.
+# docs/reference/architecture/test-suite-memory.md); focused subsets hid them.
 #
 # This autouse fixture gives every test a clean slate for exactly that
 # forward-leakable state. It deliberately does NOT clear g_kSetManager._sets or
@@ -937,6 +962,57 @@ def _reset_leakable_engine_globals():
         _mods.configure(None)
     except Exception:
         pass
+    try:
+        from engine.appc import passive_state as _passive_state
+        _passive_state.reset()
+    except Exception:
+        pass
+    # Mission-scoped module state: the SAME list the game clears on a mission
+    # swap (engine.host_loop.reset_mission_state), so the two cannot drift.
+    # They had: 15 swap-time resets had no counterpart here, and two of them
+    # (ship_lifecycle._live, registry_texture._pending) held a strong
+    # reference to every ship any test built, with its whole subsystem/AI
+    # graph, to the end of the run -- the root of the 4.3 GB full-suite peak
+    # (docs/reference/architecture/test-suite-memory.md). NOT swallowed: a
+    # reset that raises must fail loudly, or the leak returns silently.
+    import engine.host_loop as _hl_mission
+    _hl_mission.reset_mission_state(None)
+    # SDK MissionLib.CallFunctionWhenConditionChanges keeps (trigger, module,
+    # function) per mission id until the SDK's MissionDeleted handler sees the
+    # mission object deleted -- which a test's mission never is, so the
+    # triggers (and the conditions, AIs and ships they reach) outlived it.
+    # Test-only: the game deletes its missions.
+    _ml = sys.modules.get("MissionLib")
+    if _ml is not None and isinstance(getattr(_ml, "g_dConditionEventTriggers", None), dict):
+        _ml.g_dConditionEventTriggers.clear()
+    # Native combat mirror: reset (mirror off), and every C++ row dropped
+    # (process-lifetime state). Objects a previous test left alive would keep
+    # a stale handle; forget_rows() drops them all at once (one at a time is
+    # a quadratic re-push cascade that hung the gate for over an hour).
+    try:
+        from engine.appc import native_combat as _native_combat
+        _native_combat.reset()
+    except Exception:
+        pass
+    try:
+        import _dauntless_host as _host
+        _host.combat_clear()
+        _native_combat.forget_rows()
+    except Exception:
+        pass
+    # Then the mirror live again and the switch where configure() puts it
+    # from the environment (on unless DAUNTLESS_NATIVE_COMBAT=0): fire
+    # control is native in every test, as in the game (fire control native
+    # only, ruling R1). A test needing the Python arm of K0, K2, K3, K4 or
+    # damage pins =0 itself. NOT swallowed: a stale build or a failed
+    # self-check must fail loudly here too (M10).
+    from engine.appc import native_combat as _native_combat
+    _native_combat.configure()
+    # Native motion likewise (on unless DAUNTLESS_NATIVE_MOTION=0), so a test
+    # calling tick_all_ship_motion directly flies kernel M as the game does;
+    # reset() above turned it off. A test needing the Python arm pins =0.
+    from engine.appc import native_motion as _native_motion
+    _native_motion.configure()
     # Warp-in: radius seeder hook + live dial values are module globals.
     try:
         from engine.appc import warp_in_dials as _warp_in_dials
@@ -945,6 +1021,13 @@ def _reset_leakable_engine_globals():
         from engine.appc import warp_in_flash as _warp_in_flash
         _warp_in_flash.reset()
         _warp_state_mod.set_radius_seeder(None)
+    except Exception:
+        pass
+    # Proximity pass table (engine/appc/proximity_table.py): holds the last
+    # pass's sets, checks and watched objects alive until the next pass.
+    try:
+        from engine.appc import proximity_table as _proximity_table
+        _proximity_table.reset()
     except Exception:
         pass
     # Warp preload: begin/active/end hold one module-global Preload.
@@ -1031,6 +1114,13 @@ def _reset_leakable_engine_globals():
         _articulation.reset()
     except Exception:
         pass
+    # The articulation pose sink: a test that installs one must not leave it
+    # pushing (through a fake session) for every later test's ticks.
+    try:
+        from engine.appc import pose_sink as _pose_sink
+        _pose_sink.reset()
+    except Exception:
+        pass
     # Physical-parent preview overlay + one-time missing-part warnings.
     try:
         from engine.appc import physical_parents as _physical_parents
@@ -1064,6 +1154,27 @@ def _reset_leakable_engine_globals():
         _qb_late.reset()
     except Exception:
         pass
+    # Quick Battle battle end: the armed battle, its timers, Objectives and
+    # protect marker are module-global; a leaked end timer or countdown would
+    # fire into the next test's battle.
+    try:
+        from engine.quickbattle import battle_end as _qb_end
+        _qb_end.reset()
+    except Exception:
+        pass
+    try:
+        from engine.ui import target_markers as _target_markers
+        _target_markers.clear()
+    except Exception:
+        pass
+    # Quick Battle's real-object snapshot (sim_restore) holds live objects of
+    # the battle that set it; a leaked one would be "restored" into a later
+    # test's EndSimulation.
+    try:
+        from engine.quickbattle import sim_restore as _qb_sim_restore
+        _qb_sim_restore.reset()
+    except Exception:
+        pass
     # Same leak hazard, the home-ship RecreatePlayer resolver: a process
     # global a test wires via bridge_selection.set_player_type_resolver(),
     # which would otherwise make a later pure-unit bridge-hook test see a
@@ -1088,6 +1199,21 @@ def _reset_leakable_engine_globals():
     except Exception:
         pass
     try:
+        from engine.systems import home_stations as _home_stations
+        _home_stations.reset()
+    except Exception:
+        pass
+    try:
+        from engine.systems import shuttle_service as _shuttle_service
+        _shuttle_service.reset()
+    except Exception:
+        pass
+    try:
+        from engine.systems import station_hostility as _station_hostility
+        _station_hostility.reset()
+    except Exception:
+        pass
+    try:
         from engine.systems import frames as _frames
         _frames.reset_render_origin()
     except Exception:
@@ -1107,6 +1233,24 @@ def _reset_leakable_engine_globals():
     # module sees BC's original CreateAI replaced for the rest of the
     # session. Only touch the module if it is already imported -- importing
     # it here just to reset it would itself be a new leak.
+    # Felix's Tactical orders (Bridge.TacticalMenuHandlers): module globals
+    # that a mission giving Felix an order (E1M2's tactical tutorial, a free
+    # roam fight) or a test setting one by hand leaves set for the whole
+    # session. The next scene's first player target change then ran
+    # UpdateOrders and installed an attack AI on the player (an extra
+    # ET_AI_DONE in the k1_ops goldens). Back to the SDK file's own initial
+    # values (tests/unit/test_conftest_resets_tactical_orders.py); only when
+    # the module is already imported.
+    _tmh = sys.modules.get("Bridge.TacticalMenuHandlers")
+    if _tmh is not None:
+        _tmh.g_bIgnoreNextAIDone = 0
+        _tmh.g_fLastWarnTime = 0
+        _tmh.g_lPlayerFireAIs = []
+        _tmh.g_idCurrentAI = None
+        _tmh.g_iAutoTargetChange = 0
+        _tmh.g_iOrderState = -1
+        _tmh.g_iTacticState = 0
+        _tmh.g_iManeuverState = 0
     _orbit_mod = sys.modules.get("AI.Player.OrbitPlanet")
     if _orbit_mod is not None:
         _orbit_orig = getattr(_orbit_mod.CreateAI,
@@ -1161,6 +1305,9 @@ def _reset_leakable_engine_globals():
     try:
         from engine.appc import hit_feedback as _hf
         _hf._last_decal_emit.clear()
+        # HIT_PRESENT's delivery map (the last a hit was given) holds an
+        # earlier test's ships.
+        _hf.use_instances(None)
         from engine.appc import hull_wear as _hw
         _hw.reset()
     except Exception:
@@ -1328,6 +1475,14 @@ def _reset_leakable_engine_globals():
         App.Game_SetDifficulty(1)
     except Exception:
         pass
+    # Difficulty multipliers are global game state a mission sets at init
+    # (E2M2.py:155 defensive 0.75); a mission that sets none (E1M2) built its
+    # player with the last test's (tests/unit/test_conftest_resets_
+    # difficulty_multipliers.py).
+    try:
+        App.Game_SetDefaultDifficultyMultipliers()
+    except Exception:
+        pass
     # Audio singleton: the audio tests' teardown (shutdown_audio_for_tests)
     # leaves TGSoundManager._instance and App.g_kSoundManager as None. A later
     # bridge load then calls App.g_kSoundManager.GetSound(...) -> AttributeError
@@ -1353,32 +1508,10 @@ def _reset_leakable_engine_globals():
         _ai_driver.reset_script_error_log()
     except Exception:
         pass
-    # Accumulator lists drained per mission tick in production.
-    for _mod, _attr in (
-        ("engine.appc.projectiles", "_active"),
-        ("engine.appc.hit_vfx", "_active"),
-        ("engine.appc.ship_death", "_active"),
-        ("engine.appc.object_lifetime", "_timed"),
-        ("engine.appc.visible_damage", "_pending"),
-        ("engine.appc.internal_blast", "_pending"),
-        ("engine.appc.warp_core_breach", "_growing"),
-        # The single-fire guarantee's queue + set: a ship armed or breached
-        # by one test would never detonate (or detonate) in a later one.
-        ("engine.appc.warp_core_breach", "_armed"),
-        ("engine.appc.warp_core_breach", "_breached"),
-        ("engine.audio.attached_sources", "_attached"),
-        ("engine.audio.hum_allocator", "_humming"),
-        # Detached hull chunks + the per-ship breakup throttle: a chunk left
-        # live by one test is yielded by collisions.iter_collidables() in
-        # every later test, and a stale _pending_wear entry re-runs a split
-        # on a ship that no longer exists.
-        ("engine.appc.debris_chunk", "_live"),
-        ("engine.appc.hull_breakup", "_pending_wear"),
-        ("engine.appc.hull_breakup", "_last_wear_check"),
-        ("engine.appc.hull_breakup", "_severed"),
-        ("engine.appc.hull_breakup", "_part_labels"),
-        ("engine.appc.hull_breakup", "_awaiting"),
-    ):
+    # Accumulator lists drained per mission tick in production (one list,
+    # shared with headless_mission.clear_in_flight).
+    from tests.helpers.in_flight import IN_FLIGHT as _in_flight
+    for _mod, _attr in _in_flight:
         try:
             _m = sys.modules.get(_mod)
             if _m is not None:
@@ -1602,6 +1735,13 @@ def _reset_leakable_engine_globals():
         reset_random_unit_vector_rng()
     except Exception:
         pass
+    # The presentation generator (engine/appc/presentation_rng.py): reseeded
+    # at every mission load in play, so per test here, for the same reason.
+    try:
+        from engine.appc import presentation_rng
+        presentation_rng.reset()
+    except Exception:
+        pass
     # Defensive-cloak controller: per-ship DEFENSIVE mode set (mirrors
     # collision_avoidance's per-tick reconciliation) leaks between tests
     # since nothing else clears it. A ship id surviving from a prior test
@@ -1609,6 +1749,18 @@ def _reset_leakable_engine_globals():
     try:
         from engine.appc.defensive_cloak import reset_defensive_cloak_state
         reset_defensive_cloak_state()
+    except Exception:
+        pass
+    # The AI sensor gate (engine/appc/ai_sensor_gate.py) is a process-lifetime
+    # CLASS patch the host bootstrap installs (host_loop.run ->
+    # _bootstrap_firing_pipeline). Left on, every later headless fight's
+    # SelectTarget filtered candidates through can_detect: after the native
+    # combat scene audit's host run, the K1 game-loop differential's AI dropped
+    # its targets at the first cloak and never fired a torpedo. Tests that
+    # want the gate install it themselves.
+    try:
+        from engine.appc.ai_sensor_gate import uninstall_ai_sensor_gate
+        uninstall_ai_sensor_gate()
     except Exception:
         pass
     # Warp-state facade: begin_flythrough registers a ship on the module
@@ -1648,6 +1800,12 @@ def _reset_leakable_engine_globals():
     try:
         from engine.appc import running_light_dials as _rl_dials
         _rl_dials.reset()
+    except Exception:
+        pass
+    # Bridge AO dials: same leak shape, plus a push callback into native.
+    try:
+        from engine import bridge_ao_dials as _bao_dials
+        _bao_dials.reset()
     except Exception:
         pass
     # Occlusion caches: per-(observer,target) and per-set major-rock lists
@@ -1966,6 +2124,41 @@ def bop_fixture_rig():
 def _isolate_engine_globals():
     _reset_leakable_engine_globals()
     yield
+
+
+# ── Fail the test that mutates an engine class and leaves it changed ─────────
+#
+# A bare `ShipClass.GetRadius = lambda ...` in a test outlives it and breaks
+# unrelated files far later in the run (2026-11-01: ~190 native-combat
+# failures an hour after the two polluting tests). This compares every engine
+# class's own methods/descriptors across the test's window and FAILS that test
+# (reported as an ERROR in teardown) naming class and attribute, after
+# restoring the original so one polluter does not cascade. Defined after
+# _isolate_engine_globals so the reset's own changes are part of the baseline;
+# being a root-conftest autouse fixture it is set up before monkeypatch and the
+# test's own fixtures and so torn down AFTER they have undone their changes
+# (pinned by tests/unit/test_engine_class_guard.py). Plain data attributes are
+# ignored. Escape hatch for a test that deliberately leaves a change:
+# @pytest.mark.mutates_engine_classes (none today).
+from tests.helpers.engine_class_guard import (  # noqa: E402
+    EngineClassGuard as _EngineClassGuard,
+    fail_on_mutations as _fail_on_mutations,
+)
+
+_ENGINE_CLASS_GUARD = _EngineClassGuard()
+
+
+@pytest.fixture(autouse=True)
+def _guard_engine_classes(request):
+    _ENGINE_CLASS_GUARD.sync()
+    yield
+    if request.node.get_closest_marker("mutates_engine_classes") is None:
+        # The engine's own boot hooks (ai_sensor_gate wraps
+        # ObjectGroup.GetActiveObjectTupleInSet, ...) are uninstalled by the
+        # reset, which otherwise only runs at the NEXT test's setup: run it
+        # now, so only a change the reset does not undo counts as a leak.
+        _reset_leakable_engine_globals()
+        _fail_on_mutations(_ENGINE_CLASS_GUARD.check())
 
 
 @pytest.fixture(scope="session", autouse=True)

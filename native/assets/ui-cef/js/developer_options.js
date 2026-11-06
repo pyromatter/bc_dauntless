@@ -35,6 +35,7 @@ function _doFocusableList(state) {
         out.push({kind: 'ctrl', target: 'normal_strength'});
         out.push({kind: 'ctrl', target: 'bridge_pbr'});
         out.push({kind: 'ctrl', target: 'bridge_debug_view'});
+        out.push({kind: 'ctrl', target: 'reload_bridge_panels'});
     }
     if (state.selected_tab === 'environments') {
         out.push({kind: 'ctrl', target: 'rock_catalogue'});
@@ -149,7 +150,7 @@ function _doRenderDiagnosticsBody(state, focusables) {
     // the repetition is what made the old backtick binding so noisy.
     html += '<div class="cp-row cp-capture-hint">Times both halves of the frame and prints a '
           + 'report to the terminal every 120 frames (~2 s at 60 fps) until '
-          + 'switched off. See docs/engine/frame-profiler.md before drawing a '
+          + 'switched off. See docs/reference/engine/frame-profiler.md before drawing a '
           + 'conclusion from it.</div>';
     html += _doToggleRow('Performance Monitor', 'perf_monitor', s.perf_monitor,
                          isFoc('perf_monitor'));
@@ -180,6 +181,8 @@ function _doRenderLightingBody(state, focusables) {
     html += _doToggleRow('Bridge PBR', 'bridge_pbr', s.bridge_pbr, isFoc('bridge_pbr'));
     html += _doValueRow('Bridge Debug View', 'bridge_debug_view',
                         s.bridge_debug_view, isFoc('bridge_debug_view'));
+    html += _doActionRow('Reload Bridge Panels', 'reload_bridge_panels',
+                         'Reload', isFoc('reload_bridge_panels'));
     return html;
 }
 

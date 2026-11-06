@@ -181,9 +181,9 @@ def _arc_fallback_radius(ship) -> float:
     """Envelope radius for Length-0 weapons: a fraction of the ship's
     bounding radius, floored at ARC_FALLBACK_MIN game units."""
     r = 0.0
-    if hasattr(ship, "GetRadius"):
+    if hasattr(ship, "GetBaseRadius"):
         try:
-            r = float(ship.GetRadius() or 0.0)
+            r = float(ship.GetBaseRadius() or 0.0)
         except (TypeError, ValueError):
             r = 0.0
     return max(ARC_FALLBACK_MIN, r * ARC_FALLBACK_FRAC)
@@ -235,7 +235,7 @@ def build_strip_beams(banks, ship) -> List[dict]:
 
     We deliberately do NOT draw an inner rim at Length−Width or end-caps: the
     SDK `Width` is unused by the emit math and its meaning is unvalidated
-    (docs/instrumented_experiments/hardpoint_handling_research.md flags it
+    (docs/reference/instrumented_experiments/hardpoint_handling_research.md flags it
     "Unvalidated"). Drawing it produced spurious pie-wedges reaching into the
     saucer centre that do not correspond to any real emitter geometry."""
     beams: List[dict] = []

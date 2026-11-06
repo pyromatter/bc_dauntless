@@ -275,3 +275,190 @@ def test_stale_baseline_judges_inproc_lines_only_when_that_pass_ran():
     assert gate.stale_baseline(known, set(), suites_ran={"ctest"}) == ["ctest:C.d"]
     assert gate.stale_baseline(known, set(), suites_ran={"ctest", "inproc"}) \
         == ["ctest:C.d", "inproc:A.b"]
+
+
+# --- pytest pass: streamed, verbose, hang-dumping ------------------------------
+# The gate used to run pytest with capture_output=True and -q: nothing printed
+# until the end, so a hanging test was 80 minutes of silence. It now streams
+# pytest's output line by line, prints each test's name (-v: a hang shows the
+# last finished test) and has pytest dump every thread's stack for any test
+# running past 5 minutes (faulthandler_timeout).
+
+# Verbatim shape of `pytest -v -rfE --tb=no` output.
+_PYTEST_VERBOSE_OUT = """\
+WATCHDOG ceiling=4000 MB  cmd=uv run pytest tests -v
+============================= test session starts ==============================
+collecting ... collected 5 items
+
+tests/unit/test_s.py::test_ok PASSED                                     [ 20%]
+tests/unit/test_s.py::test_fail FAILED                                   [ 40%]
+tests/unit/test_s.py::test_err PASSED                                    [ 60%]
+tests/unit/test_s.py::test_err ERROR                                     [ 60%]
+tests/unit/test_s.py::test_p[c] PASSED                                   [100%]
+
+=========================== short test summary info ============================
+FAILED tests/unit/test_s.py::test_fail - assert 0
+ERROR tests/unit/test_s.py::test_err - RuntimeError: teardown
+===================== 1 failed, 3 passed, 1 error in 0.01s =====================
+WATCHDOG DONE peak_rss=300.0 MB  killed=False  rc=1
+"""
+
+
+def _fake_stream(out, rc, calls):
+    def stream(cmd, **kw):
+        calls.append((cmd, kw))
+        return rc, out
+    return stream
+
+
+def test_run_pytest_is_verbose_with_a_hang_timeout_and_parses_the_summary(
+        monkeypatch):
+    calls = []
+    monkeypatch.setattr(gate, "_stream", _fake_stream(_PYTEST_VERBOSE_OUT, 1, calls))
+    failed, harness_error = gate.run_pytest()
+    # The per-test "::test_fail FAILED" progress lines are not counted twice;
+    # only the -rfE summary lines are.
+    assert failed == {"pytest:tests/unit/test_s.py::test_fail",
+                      "pytest:tests/unit/test_s.py::test_err"}
+    assert not harness_error
+    (cmd, kw), = calls
+    pytest_args = cmd[cmd.index("pytest"):]
+    assert "-v" in pytest_args and "-q" not in pytest_args
+    assert "-rfE" in pytest_args
+    i = pytest_args.index("-o")
+    assert pytest_args[i + 1] == "faulthandler_timeout=300"
+    # Still under the RSS watchdog, and every Python in the chain unbuffered
+    # so lines arrive as they are written, not in 8 KB blocks at the end.
+    assert "tools/pytest_rss_watchdog.py" in cmd
+    assert kw["env"]["PYTHONUNBUFFERED"] == "1"
+
+
+def test_run_pytest_without_a_summary_line_is_a_harness_error(monkeypatch):
+    monkeypatch.setattr(gate, "_stream", _fake_stream("WATCHDOG died\n", 1, []))
+    failed, harness_error = gate.run_pytest()
+    assert failed == set() and harness_error
+
+
+def test_run_pytest_watchdog_kill_is_a_harness_error(monkeypatch):
+    monkeypatch.setattr(gate, "_stream", _fake_stream(_PYTEST_VERBOSE_OUT, 99, []))
+    failed, harness_error = gate.run_pytest()
+    assert harness_error
+    assert "pytest:tests/unit/test_s.py::test_fail" in failed
+
+
+def test_stream_echoes_each_line_before_the_child_exits(tmp_path):
+    # The child prints one line, then waits (up to 20 s) for the echo of that
+    # line to be seen before printing the next. A gate that buffered until
+    # exit would never echo in time and the child would print "late".
+    import sys
+    flag = tmp_path / "echoed"
+    child = (
+        "import os, sys, time\n"
+        "print('first', flush=True)\n"
+        "print('to stderr', file=sys.stderr, flush=True)\n"
+        "t = time.time()\n"
+        "while not os.path.exists(%r) and time.time() - t < 20:\n"
+        "    time.sleep(0.01)\n"
+        "print('second' if os.path.exists(%r) else 'late', flush=True)\n"
+        "sys.exit(3)\n" % (str(flag), str(flag)))
+    echoed = []
+
+    def echo(line):
+        echoed.append(line)
+        if line.strip() == "first":
+            flag.write_text("")
+
+    rc, out = gate._stream([sys.executable, "-c", child], echo=echo)
+    assert rc == 3
+    assert echoed == ["first\n", "to stderr\n", "second\n"]
+    assert out == "first\nto stderr\nsecond\n"   # stderr merged, all collected
+
+
+# ── Two tiers (docs/superpowers/specs/2026-11-06-two-tier-test-gate-design.md)
+
+_CTEST_JSON_PREFIXED = """{
+  "tests": [
+    {"name": "combat_K.one", "command": ["/b/combat_tests", "--gtest_filter=K.one"]},
+    {"name": "A.one", "command": ["/b/nif_tests", "--gtest_filter=A.one"]}
+  ]
+}"""
+
+
+def test_gtest_prefixes_recover_each_binarys_ctest_prefix():
+    assert gate.gtest_prefixes(_CTEST_JSON_PREFIXED) == {
+        "/b/combat_tests": "combat_", "/b/nif_tests": ""}
+
+
+def test_ctest_to_gtest_maps_a_ctest_name_to_its_binary_and_case():
+    assert gate.ctest_to_gtest(_CTEST_JSON_PREFIXED) == {
+        "combat_K.one": ("combat_tests", "K.one"), "A.one": ("nif_tests", "A.one")}
+
+
+def test_parse_gtest_skips_reads_only_the_per_case_lines():
+    out = ("[ RUN      ] M.Skipped\n[  SKIPPED ] M.Skipped (0 ms)\n"
+           "[  SKIPPED ] 1 test, listed below:\n[  SKIPPED ] M.Skipped\n")
+    assert gate.parse_gtest_skips(out) == {"M.Skipped"}
+
+
+def test_parse_peak_rss_takes_the_watchdogs_last_report():
+    assert gate.parse_peak_rss(_PYTEST_VERBOSE_OUT) == 300.0
+    assert gate.parse_peak_rss("no watchdog line") is None
+
+
+def test_merge_tier_pytest_deselects_the_deep_marker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gate, "_stream", _fake_stream(_PYTEST_VERBOSE_OUT, 1, calls))
+    gate.run_pytest("merge")
+    (cmd, _kw), = calls
+    i = cmd.index("-m")
+    assert cmd[i + 1] == "not deep"
+    calls.clear()
+    gate.run_pytest("full")
+    assert "-m" not in calls[0][0]
+
+
+def test_full_tier_pytest_records_durations_into_the_artefacts(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(gate, "_stream", _fake_stream(_PYTEST_VERBOSE_OUT, 1, calls))
+    gate.run_pytest("full", str(tmp_path))
+    (cmd, kw), = calls
+    assert cmd[cmd.index("-p", cmd.index("pytest")) + 1] in (
+        "no:cacheprovider", "tools.pytest_durations_plugin")
+    assert "tools.pytest_durations_plugin" in cmd
+    assert kw["env"]["GATE_DURATIONS_OUT"] == str(tmp_path / "pytest_durations.json")
+    assert gate.RUN_INFO["peak_rss_mb"] == 300.0
+
+
+def test_attribute_splits_merge_catchable_from_deep_only():
+    deep_py = ["tests/unit/test_slow.py", "tests/unit/test_mix.py::test_slow"]
+    deep_cc = {"renderer_tests": {"R.slow"}}
+    ctest_map = {"R.slow": ("renderer_tests", "R.slow"),
+                 "R.fast": ("renderer_tests", "R.fast")}
+    merge, deep = gate.attribute(
+        ["pytest:tests/unit/test_slow.py::test_a",
+         "pytest:tests/unit/test_mix.py::test_slow[3]",
+         "pytest:tests/unit/test_mix.py::test_fast",
+         "ctest:R.slow", "ctest:R.fast", "inproc:R.slow",
+         "inproc:renderer_tests(did-not-complete)"],
+        deep_py, deep_cc, ctest_map)
+    assert merge == ["pytest:tests/unit/test_mix.py::test_fast", "ctest:R.fast",
+                     "inproc:renderer_tests(did-not-complete)"]
+    assert deep == ["pytest:tests/unit/test_slow.py::test_a",
+                    "pytest:tests/unit/test_mix.py::test_slow[3]",
+                    "ctest:R.slow", "inproc:R.slow"]
+
+
+def test_merge_tier_never_reports_a_baselined_deep_test_as_passing(monkeypatch, tmp_path):
+    """The merge tier skips the deep tests, so a baselined failure that did
+    not run there must not be reported 'now passing'."""
+    monkeypatch.setattr(gate, "_load_baseline",
+                        lambda: {"pytest:tests/unit/test_slow.py::test_a"})
+    monkeypatch.setattr(gate, "run_pytest", lambda tier, art: (set(), False))
+    monkeypatch.setattr(gate, "content_root", lambda: None)
+    monkeypatch.setattr(gate, "mods_root", lambda: None)
+    monkeypatch.setenv("GATE_ARTEFACT_DIR", str(tmp_path))
+    monkeypatch.setattr(gate.sys, "argv", ["x", "--tier", "merge", "--pytest-only"])
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+    assert gate.main() == 0
+    assert not any("NOW PASSING" in p for p in printed)

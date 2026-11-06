@@ -7,6 +7,8 @@
 #include "renderer/hull_fill_cache.h"
 #include "renderer/dynamic_lights.h"
 #include "renderer/aabb.h"
+#include "renderer/hull_cull.h"
+#include <cfloat>
 #include "renderer/part_severance_check.h"
 #include <renderer/atmosphere_math.h>
 #include <renderer/asset_path.h>
@@ -450,19 +452,42 @@ int bind_hull_decal_list(const Shader& prog,
 // model silently inherits the old model's bounding radius.
 // The box centre is cached beside the radius: a sphere of that radius bounds
 // the model only around the centre (interior_is_near), not the origin.
+// `cullable` (phase 5a hull cull): every mesh has a finite rest-pose box, so
+// the sphere really bounds what draw_model draws. A mesh with no CPU data, no
+// drawing node or a parentless non-root node (mesh_body_aabbs' unbounded box),
+// or a skinned model (bones deform past the bind pose), is never culled.
 struct ModelBounds {
     glm::vec3 centre{0.0f};
     float radius = 0.0f;
+    bool cullable = false;
 };
 std::unordered_map<scenegraph::ModelHandle, ModelBounds> g_model_radius_cache;
+
+const std::vector<Aabb>& model_mesh_boxes(scenegraph::ModelHandle handle,
+                                          const assets::Model& model);
 
 const ModelBounds& model_bounds(scenegraph::ModelHandle handle, const assets::Model& model) {
     auto it = g_model_radius_cache.find(handle);
     if (it != g_model_radius_cache.end()) return it->second;
     const Aabb box = compute_model_aabb(model);
+    const std::vector<Aabb>& boxes = model_mesh_boxes(handle, model);
+    bool cullable = !boxes.empty() && model.skeleton.bones.empty();
+    for (const Aabb& b : boxes)
+        if (b.half_extents.x == FLT_MAX || b.half_extents.y == FLT_MAX ||
+            b.half_extents.z == FLT_MAX)
+            cullable = false;
     return g_model_radius_cache
-        .emplace(handle, ModelBounds{box.center, glm::length(box.half_extents)})
+        .emplace(handle, ModelBounds{box.center, glm::length(box.half_extents), cullable})
         .first->second;
+}
+
+// Whether the hull may be frustum-culled: its model has a real rest-pose
+// bound AND it is not posed. A posed part (node override) is a full rigid
+// transform that can sit anywhere, so a posed hull is always submitted. A
+// rigged hull AT REST has no overrides (the identity pose clears them) and
+// draws its rest pose exactly, so it culls like any other.
+bool hull_cullable(const ModelBounds& b, const scenegraph::Instance& inst) {
+    return b.cullable && inst.node_overrides.empty();
 }
 
 float model_bounding_radius(scenegraph::ModelHandle handle,
@@ -505,6 +530,27 @@ int select_instance_dynamic_lights(
 void reset_model_radius_cache() {
     g_model_radius_cache.clear();
     g_mesh_boxes_cache.clear();
+}
+
+ShadowFocus pick_shadow_focus(
+        const scenegraph::World& world, const glm::vec3& focus,
+        const std::function<const assets::Model*(unsigned long long)>& lookup) {
+    ShadowFocus out;
+    float best_d2 = std::numeric_limits<float>::max();
+    world.for_each_visible_in_pass(
+        scenegraph::Pass::Space, [&](const scenegraph::Instance& inst) {
+            if (!inst.rim_eligible) return;
+            const assets::Model* m = lookup(inst.model_handle);
+            if (m == nullptr) return;
+            const glm::vec3 pos = glm::vec3(inst.world[3]);
+            const float d2 = glm::dot(pos - focus, pos - focus);
+            if (d2 >= best_d2) return;
+            best_d2 = d2;
+            out.instance = &inst;
+            const float scale = glm::length(glm::vec3(inst.world[0]));
+            out.radius_gu = model_bounding_radius(inst.model_handle, *m) * scale;
+        });
+    return out;
 }
 
 void reset_decal_mask_sampler() {
@@ -657,6 +703,9 @@ int g_plating_mesh_subset_computations = 0;
 int g_plating_record_uploads = 0;
 int g_draw_model_program_binds = 0;
 int g_draw_model_plating_mesh_draws = 0;
+// Every mesh glDrawElements draw_model_pass issues; submit_opaque_in_pass
+// reads the delta into opaque_stats().mesh_draws.
+int g_draw_model_mesh_draws = 0;
 
 class MeshRecordUploader {
 public:
@@ -1219,6 +1268,7 @@ static void draw_model_pass(const assets::Model& model,
 
             glBindVertexArray(draw_mesh.vao());
             glDrawElements(GL_TRIANGLES, draw_mesh.index_count(), GL_UNSIGNED_INT, nullptr);
+            ++g_draw_model_mesh_draws;
             if (plating_list != nullptr) ++g_draw_model_plating_mesh_draws;
         }
     }
@@ -1554,11 +1604,26 @@ void FrameSubmitter::submit_opaque_in_pass(const scenegraph::World& world,
     const GLuint black = ensure_black_texture();
     static const std::vector<SunDescriptor> kNoSuns;
 
+    const int mesh_draws_before = g_draw_model_mesh_draws;
+    const bool cull = hull_cull_enabled();
+    const Frustum frustum(camera.proj_matrix() * camera.view_matrix());
     world.for_each_visible_in_pass(pass, [&](const scenegraph::Instance& inst) {
         // Far tier (far-tier spec §3): a mesh fully handed to its impostor is
         // not drawn at all.
         if (inst.far_fade >= 1.0f) return;
         const assets::Model* m = lookup(inst.model_handle);
+        // Phase 5a: a hull wholly outside THIS camera's frustum is skipped
+        // before any per-instance work (the viewscreen feed culls against its
+        // own camera, the main view against its).
+        if (cull && m) {
+            const ModelBounds& b = model_bounds(inst.model_handle, *m);
+            if (!hull_visible(frustum, inst.world, b.centre, b.radius,
+                              hull_cullable(b, inst))) {
+                ++opaque_stats_.culled;
+                return;
+            }
+        }
+        ++opaque_stats_.instances;
         const float rim_strength =
             (dauntless_rim::enabled() && inst.rim_eligible)
                 ? inst.rim_strength * dauntless_rim::kStrengthScale : 0.0f;
@@ -1701,6 +1766,7 @@ void FrameSubmitter::submit_opaque_in_pass(const scenegraph::World& world,
             }
         }
     });
+    opaque_stats_.mesh_draws += g_draw_model_mesh_draws - mesh_draws_before;
 }
 
 FrameSubmitter::PlatingListCacheEntry& FrameSubmitter::plating_entry_for(
@@ -1972,7 +2038,10 @@ bool          g_active_shadow_enabled = false;
 void submit_shadow_depth(const scenegraph::World& world,
                          const ShadowLight& light,
                          Pipeline& pipeline,
-                         const FrameSubmitter::ModelLookup& lookup) {
+                         const FrameSubmitter::ModelLookup& lookup,
+                         HullDrawStats* stats) {
+    HullDrawStats local;
+    HullDrawStats& st = stats != nullptr ? *stats : local;
     // Depth-only state. Color writes off (FBO also has no color attachment).
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
@@ -2004,13 +2073,27 @@ void submit_shadow_depth(const scenegraph::World& world,
     // lives in the bind-pose VAOs that draw_model renders. (A skinned model
     // handed here would draw in bind pose, but no rim_eligible Space
     // instance is skinned, so it never is.)
+    // Phase 5a: casters are culled against the LIGHT's box, never a view
+    // camera -- a hull the player cannot see still shadows the player.
+    const bool cull = hull_cull_enabled();
+    const Frustum frustum(light.view_proj);
     world.for_each_visible_in_pass(
         scenegraph::Pass::Space, [&](const scenegraph::Instance& inst) {
             if (!inst.rim_eligible) return;  // ships + stations only
             const assets::Model* m = lookup(inst.model_handle);
             if (!m) return;
+            if (cull) {
+                const ModelBounds& b = model_bounds(inst.model_handle, *m);
+                if (!hull_visible(frustum, inst.world, b.centre, b.radius,
+                                  hull_cullable(b, inst))) {
+                    ++st.culled;
+                    return;
+                }
+            }
+            ++st.instances;
             if (inst.severed_parts == 0 && inst.shown_parts == 0) {
-                draw_model_positions_only(*m, inst.world, prog, &inst.node_overrides);
+                st.mesh_draws +=
+                    draw_model_positions_only(*m, inst.world, prog, &inst.node_overrides);
                 return;
             }
             // A hull that has lost a part casts no shadow from it, and a
@@ -2026,8 +2109,9 @@ void submit_shadow_depth(const scenegraph::World& world,
             upload_structure_parts(parts_prog, renderer::structure_parts_for(m->source),
                                    inst.severed_parts, inst.shown_parts);
             parts_prog.set_mat4("u_ship_world_inv", glm::inverse(inst.world));
-            draw_model_positions_only(*m, inst.world, parts_prog, &inst.node_overrides,
-                                      /*mesh_mask=*/nullptr, /*rest_fix=*/true);
+            st.mesh_draws +=
+                draw_model_positions_only(*m, inst.world, parts_prog, &inst.node_overrides,
+                                          /*mesh_mask=*/nullptr, /*rest_fix=*/true);
             prog.use();
         });
 

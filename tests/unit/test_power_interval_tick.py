@@ -1,4 +1,4 @@
-"""PowerSubsystem.Update — BC interval-tick semantics (Task 3).
+"""The plant's native tick (THE POWER PIECE) — BC interval-tick semantics (Task 3).
 
 BC's power plant accumulates elapsed game time and fires a 1-second
 interval tick: generate output*elapsed into batteries (main first, spill
@@ -14,6 +14,7 @@ arithmetic that the implementation uses, not from multiplication.
 """
 from engine.appc.subsystems import PowerSubsystem
 from engine.appc.properties import PowerProperty
+from tests.helpers.subsystem_stage import tick_subsystem
 
 # 1/60 s tick (BC fixed at 60 Hz)
 _DT = 1.0 / 60.0
@@ -46,12 +47,12 @@ def _bind(ps, output=1000.0, main=250000.0, backup=80000.0,
 def _run_ticks(ps, n, dt=_DT):
     """Run exactly n ticks of dt."""
     for _ in range(n):
-        ps.Update(dt)
+        tick_subsystem(ps, dt)
 
 
 def _run_seconds(ps, seconds, dt=_DT):
     for _ in range(int(seconds / dt)):
-        ps.Update(dt)
+        tick_subsystem(ps, dt)
 
 
 # ── Recharge / spill / discard ────────────────────────────────────────────────
@@ -223,5 +224,5 @@ def test_update_no_property_is_noop():
     """No property bound — Update should return silently, battery unchanged."""
     ps = PowerSubsystem("Warp Core")
     ps.SetMainBatteryPower(500.0)
-    ps.Update(_DT)
+    tick_subsystem(ps, _DT)
     assert ps.GetMainBatteryPower() == 500.0

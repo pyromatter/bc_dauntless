@@ -7,6 +7,8 @@ from engine.appc import running_light_dials
 from engine.appc.math import TGPoint3
 from engine.appc.properties import TGModelPropertySet
 from engine.appc.subsystems import CloakingSubsystem
+from tests.helpers import host_frame_source
+from tests.helpers.subsystem_stage import tick_subsystem
 
 
 class _FakeRenderer:
@@ -92,7 +94,7 @@ def test_push_scope_hidden_ship_is_dark():
 def test_push_reads_cloak_fraction():
     c = CloakingSubsystem("Cloak")
     c.StartCloaking()
-    c.Update(c._transition_duration * 0.5)
+    tick_subsystem(c, c._transition_duration * 0.5)
     frac = c.GetTransitionFraction()
     r = _FakeRenderer()
     ship = _Ship(2, cloak=c)
@@ -205,10 +207,10 @@ class _StreakingWarp:
 
 def _sync_with_warp(monkeypatch, r, session, streak):
     from engine import warp_vfx
-    from engine.core.transform_buffer import TransformBuffer
+    from engine.core.native_transform_buffer import NativeTransformBuffer
     monkeypatch.setattr(warp_vfx, "get", lambda: _StreakingWarp(streak))
     host_loop._sync_instance_transforms(
-        r, session, None, TransformBuffer(), 1.0,
+        r, session, None, NativeTransformBuffer(), 1.0,
         game_time=1.0, model_scale=1.0)
 
 
@@ -242,8 +244,7 @@ def test_run_feeds_both_hull_hides_to_the_running_light_push():
     tests/host/test_scene_reconcile_ordering.py): the bridge-view hide's
     result reaches _push_running_lights, and the warp hide (inside
     _sync_instance_transforms) has run before it."""
-    import inspect
-    src = inspect.getsource(host_loop.run)
+    src = host_frame_source.run_source()
     push = src.find("_push_running_lights(r, session, "
                     "hidden_iids=_bridge_hidden_iids,")
     bridge = src.find("_bridge_hidden_iids = _apply_bridge_player_visibility(")
@@ -411,7 +412,6 @@ def test_without_a_preview_a_pose_change_still_resends():
 def test_run_feeds_the_spv_preview_iid_only_while_open():
     """Source guard: run() passes the SPV's previewed iid(s), gated on the
     dev-only `_spv_open`, so production sends ()."""
-    import inspect
-    src = inspect.getsource(host_loop.run)
+    src = host_frame_source.run_source()
     assert ("preview_iids=(ship_property_viewer.running_light_preview_iids()"
             "\n                          if _spv_open else ())") in src

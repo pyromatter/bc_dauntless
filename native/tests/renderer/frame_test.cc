@@ -2599,6 +2599,67 @@ TEST_F(FrameTest, ScorchFlickerBlacksOutThenRestoresForLongDurations) {
     EXPECT_EQ(glGetError(), GL_NO_ERROR);
 }
 
+// The random hit blackout never reaches inside a light volume (glow region):
+// a volume's lights belong to its subsystem and go out only with it, so one
+// hit can't black out PART of a warp nacelle and leave the rest lit. Same
+// geometry as the blackout test above, plus a HEALTHY box volume over the
+// right sample block: there the hit must leave the glow alone, while the
+// left block, sitting under the same decal but outside the volume, still
+// blacks out.
+TEST_F(FrameTest, ScorchBlackoutSkipsLightVolumes) {
+    auto model_h = cache->load(kGalaxyNif, kGalaxyTex);
+    auto lut = [model_h](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h); };
+
+    // Healthy (never disabled) volume over body +X, i.e. the right block.
+    scenegraph::Instance::GlowRegion vol = dark_right_half_region();
+    vol.dim_target   = 1.0f;
+    vol.disable_time = -1.0f;
+
+    struct Blocks { double left, right; };
+    auto sample = [&](float birth, float decal_time, bool with_decal,
+                      bool with_volume) -> Blocks {
+        scenegraph::World w;
+        auto iid = w.create_instance(
+            reinterpret_cast<scenegraph::ModelHandle>(model_h.get()));
+        w.set_world_transform(iid, glm::mat4(1.0f));
+        if (with_decal) {
+            // Centred on the volume's inner face (x = 10) and wide enough to
+            // cover both sample blocks.
+            w.get(iid)->decals.add(glm::vec3(10.0f, 0.0f, 20.0f), glm::vec3(0, 0, 1),
+                                   200.0f, 0.25f, scenegraph::WeaponClass::Scorch, birth);
+        }
+        if (with_volume) w.get(iid)->glow_regions[0] = vol;
+        render_galaxy_zero_ambient(w, *p, lut, decal_time);
+        return {block_mean(93, 100, 25, 50), block_mean(130, 100, 25, 50)};
+    };
+
+    const Blocks B = sample(0.0f, 0.0f, false, true);
+    ASSERT_EQ(glGetError(), GL_NO_ERROR);
+    ASSERT_GT(B.left, 0.0)  << "left block has no glow; test would be vacuous";
+    ASSERT_GT(B.right, 0.0) << "right block has no glow; test would be vacuous";
+
+    // A birth whose blackout darkens the right block WITHOUT the volume, so
+    // the decal demonstrably reaches it; the left block must go dark too.
+    float found = -1.0f;
+    for (int b = 0; b < 16 && found < 0.0f; ++b) {
+        const Blocks d = sample(static_cast<float>(b), static_cast<float>(b) + 14.0f,
+                                true, false);
+        if (d.right < B.right * 0.4 && d.left < B.left * 0.4)
+            found = static_cast<float>(b);
+    }
+    ASSERT_GE(found, 0.0f)
+        << "no probed birth_time blacked out both blocks at age 14 s without "
+           "a volume; the decal does not cover the sample geometry";
+
+    const Blocks V = sample(found, found + 14.0f, true, true);
+    ASSERT_EQ(glGetError(), GL_NO_ERROR);
+    EXPECT_GT(V.right, B.right * 0.7)
+        << "the hit blackout reached inside a light volume";
+    EXPECT_LT(V.left, B.left * 0.4)
+        << "the blackout stopped outside the light volume too";
+}
+
 // Test 2: A HeatGlow (phaser, weapon_class == 0) decal's glow region is
 // MONOTONIC across the SAME in-window ages where a SCORCH oscillates.
 //
@@ -3806,4 +3867,240 @@ TEST_F(FrameTest, RunningLightFlooredSpriteOnAPixelCornerLightsItsNeighbours) {
     glReadPixels(kW / 2 - 1, kH / 2 - 1, 2, 2, GL_RGBA, GL_FLOAT, px);
     for (int i = 0; i < 4; ++i)
         EXPECT_GT(px[i * 4 + 0], 0.1f) << "neighbour pixel " << i << " went dark";
+}
+
+// ── Hull draw counters (phase 5a Task 1) ──────────────────────────────────
+// The frame profiler's `hulls:` line reads these. The opaque stats sum every
+// call until reset, so one frame's main view and viewscreen feed add up.
+namespace {
+scenegraph::Camera hull_stats_camera() {
+    scenegraph::Camera cam;
+    cam.eye = glm::vec3(0.0f, 0.0f, 1500.0f);
+    cam.target = glm::vec3(0.0f, 0.0f, 0.0f);
+    cam.aspect = 1.0f;
+    return cam;
+}
+}  // namespace
+
+TEST_F(FrameTest, OpaqueStatsCountInstancesAndMeshDraws) {
+    auto model_h = cache->load(kGalaxyNif, kGalaxyTex);
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    world.set_world_transform(world.create_instance(handle), glm::mat4(1.0f));
+    const auto cam = hull_stats_camera();
+    renderer::Lighting lighting;
+    glViewport(0, 0, 256, 256);
+
+    renderer::FrameSubmitter one;
+    one.submit_opaque_in_pass(world, cam, *p, lookup, lighting, scenegraph::Pass::Space);
+    const int per_hull = one.opaque_stats().mesh_draws;
+    ASSERT_GT(per_hull, 0);
+
+    world.set_world_transform(world.create_instance(handle),
+                              glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -200.0f)));
+    renderer::FrameSubmitter s;
+    s.submit_opaque_in_pass(world, cam, *p, lookup, lighting, scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().instances, 2);
+    EXPECT_EQ(s.opaque_stats().culled, 0);
+    EXPECT_EQ(s.opaque_stats().mesh_draws, 2 * per_hull);
+
+    s.submit_opaque_in_pass(world, cam, *p, lookup, lighting, scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().instances, 4);
+    EXPECT_EQ(s.opaque_stats().mesh_draws, 4 * per_hull);
+
+    s.reset_opaque_stats();
+    EXPECT_EQ(s.opaque_stats().instances, 0);
+    EXPECT_EQ(s.opaque_stats().culled, 0);
+    EXPECT_EQ(s.opaque_stats().mesh_draws, 0);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+TEST_F(FrameTest, ShadowStatsCountCasters) {
+    auto model_h = cache->load(kGalaxyNif, kGalaxyTex);
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    for (int i = 0; i < 2; ++i) {
+        const auto iid = world.create_instance(handle);
+        world.set_rim_eligible(iid, true);
+        world.set_world_transform(iid, glm::mat4(1.0f));
+    }
+    renderer::ShadowLight light;
+    light.view_proj = glm::ortho(-800.0f, 800.0f, -800.0f, 800.0f, -800.0f, 800.0f);
+    renderer::HullDrawStats stats;
+    renderer::submit_shadow_depth(world, light, *p, lookup, &stats);
+    EXPECT_EQ(stats.instances, 2);
+    EXPECT_EQ(stats.culled, 0);
+    EXPECT_GT(stats.mesh_draws, 0);
+    EXPECT_EQ(stats.mesh_draws % 2, 0);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+// ── Hull frustum cull (phase 5a Task 2) ───────────────────────────────────
+// The cull needs each mesh's rest-pose box, built from CPU vertices, so these
+// tests load through a cache configured like production's
+// (host_bindings.cc: cfg.keep_cpu_data = true). The fixture's own cache drops
+// CPU data, which is exactly the "no bound" case: never culled.
+namespace {
+std::unique_ptr<assets::AssetCache> production_like_cache() {
+    assets::AssetCache::Config cfg;
+    cfg.keep_cpu_data = true;
+    return std::make_unique<assets::AssetCache>(cfg);
+}
+}  // namespace
+
+TEST_F(FrameTest, OpaqueNeverCullsAModelWithoutBounds) {
+    auto model_h = cache->load(kGalaxyNif, kGalaxyTex);   // no CPU data
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    world.set_world_transform(world.create_instance(handle),
+                              glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 3000.0f)));
+    renderer::Lighting lighting;
+    glViewport(0, 0, 256, 256);
+    renderer::FrameSubmitter s;
+    s.submit_opaque_in_pass(world, hull_stats_camera(), *p, lookup, lighting,
+                            scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().instances, 1);
+    EXPECT_EQ(s.opaque_stats().culled, 0);
+}
+TEST_F(FrameTest, OpaqueCullsInstanceBehindCamera) {
+    auto cpu_cache = production_like_cache();
+    auto model_h = cpu_cache->load(kGalaxyNif, kGalaxyTex);
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    world.set_world_transform(world.create_instance(handle), glm::mat4(1.0f));
+    // 3000 units past the origin, 1500 behind an eye at z=1500: well beyond
+    // the Galaxy's bound behind the camera.
+    world.set_world_transform(world.create_instance(handle),
+                              glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 3000.0f)));
+    renderer::Lighting lighting;
+    glViewport(0, 0, 256, 256);
+    renderer::FrameSubmitter s;
+    s.submit_opaque_in_pass(world, hull_stats_camera(), *p, lookup, lighting,
+                            scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().instances, 1);
+    EXPECT_EQ(s.opaque_stats().culled, 1);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+TEST_F(FrameTest, OpaqueCullUsesEachCallsCamera) {
+    auto cpu_cache = production_like_cache();
+    auto model_h = cpu_cache->load(kGalaxyNif, kGalaxyTex);
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    world.set_world_transform(world.create_instance(handle),
+                              glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -3000.0f)));
+    world.set_world_transform(world.create_instance(handle),
+                              glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 3000.0f)));
+    scenegraph::Camera fore;   // the main view
+    fore.eye = glm::vec3(0.0f);
+    fore.target = glm::vec3(0.0f, 0.0f, -1.0f);
+    fore.aspect = 1.0f;
+    scenegraph::Camera aft = fore;   // a second feed, facing the other way
+    aft.target = glm::vec3(0.0f, 0.0f, 1.0f);
+    renderer::Lighting lighting;
+    glViewport(0, 0, 256, 256);
+    renderer::FrameSubmitter s;
+    s.submit_opaque_in_pass(world, fore, *p, lookup, lighting, scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().instances, 1);
+    EXPECT_EQ(s.opaque_stats().culled, 1);
+    s.submit_opaque_in_pass(world, aft, *p, lookup, lighting, scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().instances, 2);
+    EXPECT_EQ(s.opaque_stats().culled, 2);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+TEST_F(FrameTest, ShadowCullsCastersOutsideTheLight) {
+    auto cpu_cache = production_like_cache();
+    auto model_h = cpu_cache->load(kGalaxyNif, kGalaxyTex);
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    const glm::vec3 where[2] = {glm::vec3(0.0f), glm::vec3(20000.0f, 0.0f, 0.0f)};
+    for (const auto& w : where) {
+        const auto iid = world.create_instance(handle);
+        world.set_rim_eligible(iid, true);
+        world.set_world_transform(iid, glm::translate(glm::mat4(1.0f), w));
+    }
+    // The light's box holds the first caster only. No view camera is
+    // involved: a caster the player cannot see still shadows the player.
+    renderer::ShadowLight light;
+    light.view_proj = glm::ortho(-800.0f, 800.0f, -800.0f, 800.0f, -800.0f, 800.0f);
+    renderer::HullDrawStats stats;
+    renderer::submit_shadow_depth(world, light, *p, lookup, &stats);
+    EXPECT_EQ(stats.instances, 1);
+    EXPECT_EQ(stats.culled, 1);
+    EXPECT_EQ(glGetError(), GL_NO_ERROR);
+}
+
+// Final review (Important 1): a posed part is a full rigid transform -- a
+// mod rig may translate it arbitrarily far from the rest-pose sphere -- so no
+// slack on that sphere bounds it. A hull with node overrides is never culled,
+// however far outside the frustum its rest sphere lies.
+TEST_F(FrameTest, OpaqueNeverCullsAPosedHull) {
+    auto cpu_cache = production_like_cache();
+    auto model_h = cpu_cache->load(kGalaxyNif, kGalaxyTex);
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    const auto iid = world.create_instance(handle);
+    world.set_world_transform(iid,
+                              glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 3000.0f)));
+    world.get(iid)->node_overrides[0] = glm::mat4(1.0f);
+    renderer::Lighting lighting;
+    glViewport(0, 0, 256, 256);
+    renderer::FrameSubmitter s;
+    s.submit_opaque_in_pass(world, hull_stats_camera(), *p, lookup, lighting,
+                            scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().instances, 1);
+    EXPECT_EQ(s.opaque_stats().culled, 0);
+
+    // The shadow casters follow the same rule.
+    world.set_rim_eligible(iid, true);
+    renderer::ShadowLight light;
+    light.view_proj = glm::ortho(-800.0f, 800.0f, -800.0f, 800.0f, -800.0f, 800.0f);
+    renderer::HullDrawStats stats;
+    renderer::submit_shadow_depth(world, light, *p, lookup, &stats);
+    EXPECT_EQ(stats.instances, 1);
+    EXPECT_EQ(stats.culled, 0);
+}
+
+// A rigged hull AT REST (identity pose clears node_overrides) draws its rest
+// pose exactly, so it culls like any other hull.
+TEST_F(FrameTest, OpaqueCullsARiggedHullAtRest) {
+    auto cpu_cache = production_like_cache();
+    auto model_h = cpu_cache->load(kGalaxyNif, kGalaxyTex);
+    const auto handle = reinterpret_cast<scenegraph::ModelHandle>(model_h.get());
+    const auto lookup = [](scenegraph::ModelHandle h) -> const assets::Model* {
+        return reinterpret_cast<const assets::Model*>(h);
+    };
+    scenegraph::World world;
+    const auto iid = world.create_instance(handle);
+    world.set_world_transform(iid,
+                              glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 3000.0f)));
+    world.get(iid)->rigged = true;
+    renderer::Lighting lighting;
+    glViewport(0, 0, 256, 256);
+    renderer::FrameSubmitter s;
+    s.submit_opaque_in_pass(world, hull_stats_camera(), *p, lookup, lighting,
+                            scenegraph::Pass::Space);
+    EXPECT_EQ(s.opaque_stats().culled, 1);
 }

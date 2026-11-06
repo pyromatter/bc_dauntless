@@ -223,12 +223,20 @@ attract, PUSH ≈ repel, DOCK_STAGE_1/2 ≈ progressive position lock. No
 instrumentation needed as a starting point; empirical measurement optional
 if the feel is wrong after initial tuning.
 
-**Audited 2026-08-09 — the prescribed Phase 2 force law is BUILT; fidelity to BC
-remains unverifiable.** `engine/appc/tractor.py` implements a mass-aware,
-reciprocal spring model (`TRACTOR_REFERENCE_SPEED_GUPS = 5.0`; mass-scaled
-engagement speed with an inverse-mass split mirroring `collisions.py`; hulls
-reporting `mass <= 0` fall back to effectively immovable). All six modes are
-present. 93 tractor tests pass (`uv run pytest tests/ -k tractor`).
+**Audited 2026-08-09 — a Phase 2 force law is BUILT; fidelity to BC
+remains unverifiable.** *Corrected 2026-11-03:* what is built is **not** the
+spring-damper prescribed above. It is a mass-capped kinematic displacement.
+Each tick the body moves toward its mode's destination by at most
+`speed · dt`, and snaps to it when within one step. There is no force,
+restoring term or damping. The speed is
+`min(TRACTOR_REFERENCE_SPEED_GUPS · TRACTOR_REFERENCE_MASS / mass,
+TRACTOR_MAX_SPEED_GUPS)` = `min(5 · 100 / mass, 20)` GU/s. A ship reporting
+`mass <= 0` reads `TRACTOR_FALLBACK_MASS` (1e4, effectively immovable), and
+anything not a ShipClass reads 0. PULL, PUSH and TOW also move the source,
+at its own speed. The step runs natively in
+`native/src/combat/src/tractor_force.cc` (fire-control native-only spec
+R7), with its constants still in `engine/appc/tractor.py`. All six modes are
+present.
 
 Stays ⚠️ deliberately. What is built is a *designed approximation*, signed off in
 the design — **not** a reconstruction of BC's law, and nothing available can
@@ -301,7 +309,7 @@ files in NifSkope, identify damage-related node naming conventions.
 Each hull has a paired `*_vox.nif` containing `NiBinaryVoxelExtraData` /
 `NiBinaryVoxelData` — a binary occupancy mask of the hull interior. The on-disk
 format is reverse-engineered and validated against the full 84-file `*_vox.nif`
-corpus (`docs/engine/nibinaryvoxeldata-format-v3.1.md`) and implemented in
+corpus (`docs/reference/engine/nibinaryvoxeldata-format-v3.1.md`) and implemented in
 `native/src/voxel/` (`decode.cc`, `plane_index.cc`, `volume.h`, `voxelize.h`)
 with the block parsed at `native/src/nif/src/blocks/extra_data.cc`. Covered by
 ctest `VoxelDataHeader.GalaxyHeaderDecodesToConfirmedValues`,
@@ -666,7 +674,7 @@ above the adapter works.
 
 **2026-08-10, second live run: still silent.** The `LoadSound` fix did not do it
 either. Deferred to a dedicated session — see
-`docs/engine/music-not-playing-handoff.md`, which records what is proven working,
+`docs/reference/engine/music-not-playing-handoff.md`, which records what is proven working,
 the five hypotheses already ruled out (assets, MP3 support, DynamicMusic reach,
 and two wrong adapter forms), and the ordered diagnostic steps. The failure is
 silent at every layer, which is why three static fixes have missed it; it needs a
@@ -769,7 +777,7 @@ testable — preferable for a TDD approach.
 ### Open questions requiring investigation
 
 *(All four questions below are formally tracked and prioritised in*
-*`open_questions.md`)*
+*`reference/instrumented_experiments/open_questions.md`)*
 
 **OQ-7.1 — Tick rate** ✅  
 **60 Hz fixed.** Measured at 59.61 Hz (16.78 ms/tick) over 86.3s / 5145
@@ -799,7 +807,7 @@ appears in exactly two scripts (`ConditionIncomingTorps`, `FriendliesInPlayerSet
 `CRITICAL` and `UNSTOPPABLE` have zero Python call sites — they are C++
 internal priorities for rendering and physics. Reliable polling intervals
 are safe to assume for all Python-visible processes. No instrumentation needed.
-*(Also tracked as Q4 in `open_questions.md` — closed there too.)*
+*(Also tracked as Q4 in `reference/instrumented_experiments/open_questions.md` — closed there too.)*
 
 ---
 

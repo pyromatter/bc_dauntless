@@ -17,7 +17,7 @@ load from the dev mission picker.
         DAUNTLESS_PROFILE_FRAMES=100000000 ./build/dauntless --developer
 
 Each step prints a `[felix_destroy]` line, which marks it in a profiler log.
-See docs/engine/perf-register.md (B2).
+See docs/reference/engine/perf-register.md (B2).
 """
 import math
 import os
@@ -85,7 +85,7 @@ def _seed_radius(pShip) -> None:
     if not _headless():
         return
     try:
-        if pShip.GetRadius() <= 0.0:
+        if pShip.GetBaseRadius() <= 0.0:
             pShip.SetRadius(NOMINAL_HULL_RADIUS_GU)
     except Exception:
         pass

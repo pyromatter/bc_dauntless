@@ -30,6 +30,7 @@ InstanceId = _h.InstanceId
 #   resolved at the import above) is deliberately excluded: its absence already
 #   hard-fails `import`, so it needs no manifest entry.
 _REQUIRED_BINDINGS = frozenset({
+    "set_fullscreen", "fullscreen",
     "add_box_region", "add_cylinder_region", "add_sphere_region",
     "running_light_count", "running_lights_enabled", "running_lights_set_enabled",
     "set_running_light_dials", "set_running_light_levels", "set_running_lights",
@@ -37,6 +38,7 @@ _REQUIRED_BINDINGS = frozenset({
     "set_interior_near_gu", "interior_near_gu", "interior_near_gu_default",
     "ambient_gradient_get", "ambient_gradient_set", "ambient_gradient_set_enabled",
     "assemble_officer", "bridge_pass_set_enabled", "bridge_quality",
+    "set_bridge_ao_tuning",
     "cef_composite", "cef_devtools_open", "cef_initialize", "cef_pump",
     "cef_reload", "cef_shutdown",
     "cef_toggle_devtools", "clear_glow_regions", "clear_hologram_ship",
@@ -94,7 +96,7 @@ _REQUIRED_BINDINGS = frozenset({
     "minors_drain_contacts", "minors_stats", "minors_clear",
     "far_set_catalogue", "far_set_rocks", "far_set_sources",
     "far_set_frame", "far_set_dials", "far_set_enabled", "far_enabled",
-    "far_stats", "far_clear", "far_prefetch_atlases", "far_pump_atlas_uploads",
+    "far_stats", "hull_stats", "far_clear", "far_prefetch_atlases", "far_pump_atlas_uploads",
     "rock_specks_set_enabled", "rock_specks_enabled",
     "rock_puffs_set_enabled", "rock_puffs_enabled",
     "rockfield_drain_contacts", "rockfield_set_shield_inflate",
@@ -186,6 +188,21 @@ def init(width: int, height: int, title: str) -> None:
 
 def shutdown() -> None:
     _h.shutdown()
+
+
+def set_fullscreen(on: bool) -> None:
+    """Full-screen the window on the monitor it occupies, or restore it.
+
+    The monitor's CURRENT video mode is used, so nothing changes resolution
+    and alt-tab stays quick. Idempotent, which matters because the settings
+    pass re-applies every value at boot.
+    """
+    _h.set_fullscreen(bool(on))
+
+
+def fullscreen() -> bool:
+    """True while the window is full-screen."""
+    return bool(_h.fullscreen())
 
 
 def should_close() -> bool:
@@ -356,6 +373,21 @@ def set_bridge_wall_time(t: float) -> None:
     this to compute the current animation frame per material.
     """
     _h.set_bridge_wall_time(t)
+
+
+def set_bridge_ao_tuning(radius: float, strength: float, bias: float,
+                         bias_dist: float, bias_facing: float, min_len: float,
+                         main_direct: float, main_final: float,
+                         detail_samples: int, detail_radius: float,
+                         detail_strength: float, detail_bias: float,
+                         detail_direct: float, detail_final: float) -> None:
+    """Bridge AO kernel look (engine/bridge_ao_dials.py). Developer dials."""
+    _h.set_bridge_ao_tuning(float(radius), float(strength), float(bias),
+                            float(bias_dist), float(bias_facing), float(min_len),
+                            float(main_direct), float(main_final),
+                            int(detail_samples), float(detail_radius),
+                            float(detail_strength), float(detail_bias),
+                            float(detail_direct), float(detail_final))
 
 
 def set_bridge_quality(level: int) -> None:
@@ -732,6 +764,13 @@ def rock_puffs_set_enabled(enabled: bool) -> None:
 def rock_puffs_enabled() -> bool:
     """Whether the rock-fields puffs draw."""
     return _h.rock_puffs_enabled()
+
+
+def hull_stats() -> dict:
+    """{"opaque_instances", "opaque_culled", "opaque_mesh_draws",
+    "shadow_instances", "shadow_culled", "shadow_mesh_draws"} for the last
+    frame; the opaque half is summed over every camera that frame drew."""
+    return _h.hull_stats()
 
 
 def far_stats() -> dict:
@@ -1392,11 +1431,12 @@ def instance_node_world(iid: InstanceId, node_name: str,
     return fn(iid, node_name, animated) if fn is not None else None
 
 
-def instance_surface_points(iid: InstanceId):
+def instance_surface_points(iid: InstanceId, drawn: bool = False):
     """World-space sample of the instance model's hull surface points (spread
-    across the hull) for VFX anchoring. Returns a list of (x,y,z), or []."""
+    across the hull) for VFX anchoring. Returns a list of (x,y,z), or [].
+    On the SIM pose (phase 3a); `drawn=True` samples the drawn hull."""
     fn = getattr(_h, "instance_surface_points", None)
-    r = fn(iid) if fn is not None else None
+    r = fn(iid, drawn=drawn) if fn is not None else None
     return r if r else []
 
 

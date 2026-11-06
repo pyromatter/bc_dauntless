@@ -1,7 +1,7 @@
 """A cloaked contact is targetable at ship level only — its subsystem tree is
 suppressed. This is `Contact.subsystems_targetable`, set by
-`perception.perceived_by`, consumed by `target_list_view._snapshot` (empty
-`subsystems` tuple) and `reconcile_subsystem_lock` (drops a live subsystem
+`perception.perceived_by`, consumed by the target panel's `families`
+(`ShipDisplayPanel._tree_state`) and `reconcile_subsystem_lock` (drops a live subsystem
 lock back to ship level when its ship cloaks).
 
 Named for the effect (subsystems_targetable), not the cause (cloak), because
@@ -24,6 +24,14 @@ from engine.appc.subsystems import CloakingSubsystem
 from engine.appc.perception import perceived_by
 from engine.appc.target_menu import STTargetMenu_CreateW
 from tests.helpers.cloak_geometry import inside_gu, outside_gu, sensorless_gu
+
+# A test marked native_switch_zero checks the Python sensor rules with a
+# double only the Python sees (a monkeypatched flag or dial entry, a fake
+# nebula or cache spy): DAUNTLESS_NATIVE_COMBAT=0, now the switch defaults on
+# (fire control native only, R1; tests/helpers/native_off.py). Every other
+# test here runs on the default.
+import pytest  # noqa: E402
+from tests.helpers.native_off import native_switch_zero  # noqa: E402,F401
 
 
 def _pump(menu, player):
@@ -77,49 +85,48 @@ def _row_for(state, ship_name):
     return next(r for r in state["rows"] if r["name"] == ship_name)
 
 
+def _target_payload(player, enemy, panel=None):
+    """The target panel's payload for `enemy`, as the page receives it."""
+    from engine.ui.ship_display_panel import ShipDisplayPanel, ROLE_TARGET
+    player.SetTarget(enemy)
+    player.GetSensorSubsystem().AddKnownObject(enemy)
+    panel = panel or ShipDisplayPanel(ROLE_TARGET)
+    panel.invalidate()
+    script = panel.render_payload()
+    assert script is not None
+    return json.loads(script[len('setShipDisplay("target", '):-2])
+
+
 def test_cloaked_contact_inside_bubble_lists_ship_with_no_subsystems():
-    """Ship-level row is present — you can still shoot at it — but its
-    subsystem tree is empty, so there is nothing to expand or click."""
-    from engine.ui.target_list_view import (
-        TargetListView, reconcile_subsystem_lock)
+    """Ship-level row is present — you can still shoot at it — but the target
+    panel carries no families, so there is nothing to open or click."""
     pSet, player, enemy, menu = _scene()
     restore = _with_current_game(player)
     try:
         enemy.GetCloakingSubsystem().InstantCloak()
         _pump(menu, player)
 
-        view = TargetListView()
-        view._expanded_ships.add("Enemy")
-        script = view.render_payload()
-        assert script is not None
-        state = json.loads(script[len("setTargetList("):-2])
+        from engine.ui.target_list_view import TargetListView
+        state = json.loads(
+            TargetListView().render_payload()[len("setTargetList("):-2])
+        assert _row_for(state, "Enemy")  # the ship stays listed
 
-        row = _row_for(state, "Enemy")
-        assert row["subsystems"] == []
-        # ...and the caret flag agrees, so a collapsed row is suppressed too.
-        assert row["has_subsystems"] is False
+        payload = _target_payload(player, enemy)
+        assert payload["families"] == []
+        assert payload["locked"] is None
     finally:
         restore()
 
 
 def test_uncloaked_contact_at_same_distance_still_carries_subsystems():
-    """Control: identical inside-the-bubble separation, no cloak. Subsystems must still
-    be present — proving the gate is cloak-driven, not distance-driven."""
-    from engine.ui.target_list_view import (
-        TargetListView, reconcile_subsystem_lock)
+    """Control: identical inside-the-bubble separation, no cloak. Families must
+    still be present — proving the gate is cloak-driven, not distance-driven."""
     pSet, player, enemy, menu = _scene()
     restore = _with_current_game(player)
     try:
         _pump(menu, player)  # never cloaked
-
-        view = TargetListView()
-        view._expanded_ships.add("Enemy")
-        script = view.render_payload()
-        state = json.loads(script[len("setTargetList("):-2])
-
-        row = _row_for(state, "Enemy")
-        assert len(row["subsystems"]) > 0
-        assert row["has_subsystems"] is True
+        payload = _target_payload(player, enemy)
+        assert len(payload["families"]) > 0
     finally:
         restore()
 
@@ -233,6 +240,7 @@ def test_dispatch_event_subsystem_click_rechecks_cloak_flag():
         restore()
 
 
+@pytest.mark.usefixtures("native_switch_zero")
 def test_enhanced_sensor_contest_off_cloaked_ship_undetected_untouched(monkeypatch):
     """With the stage-4 toggle off, cloak is absolute again — the ship never
     becomes a contact at all, so the subsystem question doesn't arise. Pins
@@ -260,10 +268,9 @@ def test_enhanced_sensor_contest_off_cloaked_ship_undetected_untouched(monkeypat
 def test_cached_subsystem_rows_survive_cloak_then_decloak_without_rebuild():
     """Proves suppression happens at the VIEW, not by touching the cache:
     the STSubsystemMenu row's cached subsystem children are the SAME objects
-    before cloaking, while cloaked (merely hidden from the payload), and
-    after decloaking — nothing ever rebuilds them."""
-    from engine.ui.target_list_view import (
-        TargetListView, reconcile_subsystem_lock)
+    before cloaking, while cloaked (merely hidden from the panel's families),
+    and after decloaking — nothing ever rebuilds them."""
+    from engine.ui.ship_display_panel import ShipDisplayPanel, ROLE_TARGET
     pSet, player, enemy, menu = _scene()
     restore = _with_current_game(player)
     try:
@@ -273,31 +280,20 @@ def test_cached_subsystem_rows_survive_cloak_then_decloak_without_rebuild():
         cached_children_before = list(row._children)
         assert cached_children_before  # sanity: real subsystem rows exist
 
-        view = TargetListView()
-        view._expanded_ships.add("Enemy")
-        state = json.loads(view.render_payload()[len("setTargetList("):-2])
-        assert len(_row_for(state, "Enemy")["subsystems"]) > 0
+        panel = ShipDisplayPanel(ROLE_TARGET)
+        assert len(_target_payload(player, enemy, panel)["families"]) > 0
 
-        # Cloak: the row survives, the cache is untouched, but the payload
-        # suppresses subsystems.
         enemy.GetCloakingSubsystem().InstantCloak()
         _pump(menu, player)
         assert menu.GetObjectEntry(enemy) is row
         assert list(row._children) == cached_children_before
-        view.invalidate()
-        state = json.loads(view.render_payload()[len("setTargetList("):-2])
-        assert _row_for(state, "Enemy")["subsystems"] == []
-        assert _row_for(state, "Enemy")["has_subsystems"] is False
+        assert _target_payload(player, enemy, panel)["families"] == []
         assert list(row._children) == cached_children_before  # still untouched
 
-        # Decloak: subsystems reappear, still the SAME cached objects — no
-        # rebuild was needed to bring them back.
         enemy.GetCloakingSubsystem().InstantDecloak()
         _pump(menu, player)
         assert menu.GetObjectEntry(enemy) is row
         assert list(row._children) == cached_children_before
-        view.invalidate()
-        state = json.loads(view.render_payload()[len("setTargetList("):-2])
-        assert len(_row_for(state, "Enemy")["subsystems"]) > 0
+        assert len(_target_payload(player, enemy, panel)["families"]) > 0
     finally:
         restore()

@@ -34,6 +34,15 @@ MAX_GLOW_REGIONS = 12
 HEALTHY = "healthy"
 DISABLED = "disabled"
 DESTROYED = "destroyed"
+# Not a subsystem state: a HEALTHY subsystem that just lost condition, shown
+# with the disabled flicker until its damage window runs out. Tracked as the
+# region's previous state so the next real edge still stamps a fresh time.
+DAMAGED = "damaged"
+
+# Damage flicker: seconds of flicker per 1% of max condition lost (1% -> 1 s,
+# 10% -> 10 s). A hit during a flicker ADDS its time to what is left, so the
+# total flicker is the total damage. Tunable here with no rebuild.
+DAMAGE_FLICKER_SECS_PER_PERCENT = 1.0
 
 # Impulse exhaust faces point aft = model -Y. The shader gates the impulse
 # brightening to faces whose normal points this way, so only the aft engine
@@ -63,6 +72,11 @@ PULSE_AMP = 0.15     # peak pulse fraction at full throttle (scales with speed)
 # Time constant (s) for easing the commanded throttle, so stepping between
 # impulse notches ramps the glow smoothly instead of jumping. Larger = slower.
 IMPULSE_EASE_TAU = 0.35
+# Below this the eased throttle snaps to exactly 0 once the target is 0, so a
+# stopped ship's gain settles on GAIN_IDLE and stops being re-pushed (an
+# exponential ease never reaches 0 on its own, and every tiny residue moves the
+# pulse).
+IMPULSE_SETTLE_EPS = 1e-3
 
 # Warp-engine glow (the nacelle analogue of the impulse boost above). Driven by
 # the cross-system warp sequence's own clock via WarpVFX.engine_glow(), NOT by
@@ -136,12 +150,18 @@ def warp_gain(drive: float, burst: float, now: float) -> float:
     return gain + (WARP_BURST_GAIN - gain) * burst
 
 
+_dev_light_preview = None  # engine.dev_light_preview, imported on first use
+
+
 def glow_state(sub) -> str:
     """Three-state classification. Destroyed dominates disabled; None=healthy.
     A dev-only forced-state preview (Developer Options -> Lighting) overrides
     this for ALL subsystems when set -- purely visual, gated on dev mode."""
-    from engine import dev_light_preview          # lazy: avoids an import cycle
-    forced = dev_light_preview.forced_glow_state()
+    global _dev_light_preview
+    if _dev_light_preview is None:
+        # Lazy (import cycle), cached: this runs per region per frame.
+        from engine import dev_light_preview as _dev_light_preview
+    forced = _dev_light_preview.forced_glow_state()
     if forced is not None:
         return forced
     if sub is None:
@@ -179,6 +199,23 @@ def glow_edge(prev_state, cur_state, prev_time, now) -> float:
     if cur_state != prev_state:
         return now
     return prev_time
+
+
+def damage_flicker_secs(lost_frac: float) -> float:
+    """Seconds of damage flicker for losing `lost_frac` (0..1) of max
+    condition."""
+    return max(0.0, lost_frac) * 100.0 * DAMAGE_FLICKER_SECS_PER_PERCENT
+
+
+def _condition_frac(sub):
+    """0..1 condition of `sub`, or None when it has none to read."""
+    fn = getattr(sub, "GetConditionPercentage", None)
+    if fn is None:
+        return None
+    try:
+        return float(fn())
+    except Exception:  # noqa: BLE001 - glow is best-effort VFX
+        return None
 
 
 def warp_pods(warp_subsystem):
@@ -353,7 +390,7 @@ def region_ops(raws, default_pos, pod_name="") -> list:
 
 
 class ShipGlowController:
-    """Per-ship: register glow regions once, push state each frame.
+    """Per-ship: register glow regions once, push state when it changes.
 
     Warp pods, impulse pods, and the sensor array all register their BAKED
     hardpoint regions (no in-engine derivation). Holds
@@ -451,11 +488,19 @@ class ShipGlowController:
                 continue
             self._regions.append(
                 {"sub": pod, "idx": idx, "prev": HEALTHY, "etime": -1.0,
-                 "boost": boost, "warp": warp, "wgain": 1.0})
+                 "boost": boost, "warp": warp, "wgain": 1.0,
+                 # Last (dim, etime, flick) / impulse gain sent; None until
+                 # the first update, which therefore always pushes.
+                 "pushed_dim": None, "pushed_gain": None,
+                 # Damage flicker: last condition seen (None until the first
+                 # update, so damage present at spawn never flickers) and the
+                 # current window [dmg_start, dmg_until) in game time.
+                 "cond": None, "dmg_start": -1.0, "dmg_until": -1.0})
 
     def update(self, now: float, throttle_frac=None, warp_glow=None) -> None:
-        """Push dim/edge/flicker each frame; brighten the impulse region by the
-        (time-eased) commanded throttle + slow pulse. `throttle_frac` is the
+        """Push dim/edge/flicker on change; brighten the impulse region by the
+        (time-eased) commanded throttle + slow pulse, pushed when it changes
+        (every frame while moving, since the pulse runs on `now`). `throttle_frac` is the
         player's notch fraction from the host loop; None -> derive from the AI
         speed setpoint.
 
@@ -475,14 +520,34 @@ class ShipGlowController:
             alpha = (1.0 - math.exp(-dt / IMPULSE_EASE_TAU)
                      if IMPULSE_EASE_TAU > 0.0 else 1.0)
             self._eased_frac += (target - self._eased_frac) * alpha
+        if target == 0.0 and self._eased_frac < IMPULSE_SETTLE_EPS:
+            self._eased_frac = 0.0
         self._last_now = now
 
         for reg in self._regions:
             sub = reg["sub"]
             state = glow_state(sub)
-            etime = glow_edge(reg["prev"], state, reg["etime"], now)
-            dim, flick = dim_and_flicker(state)
-            self._r.set_glow_region_dim(self._iid, reg["idx"], dim, etime, flick)
+            cond = _condition_frac(sub)
+            if cond is not None:
+                last = reg["cond"]
+                if last is not None and cond < last:
+                    if now >= reg["dmg_until"]:   # no flicker running: start one
+                        reg["dmg_start"] = reg["dmg_until"] = now
+                    reg["dmg_until"] += damage_flicker_secs(last - cond)
+                reg["cond"] = cond
+            if state == HEALTHY and now < reg["dmg_until"]:
+                # Recently damaged: the disabled flicker, phased from the
+                # start of this window so a further hit doesn't restart it.
+                state = DAMAGED
+                etime = reg["dmg_start"]
+                dim, flick = dim_and_flicker(DISABLED)
+            else:
+                etime = glow_edge(reg["prev"], state, reg["etime"], now)
+                dim, flick = dim_and_flicker(state)
+            if (dim, etime, flick) != reg["pushed_dim"]:
+                self._r.set_glow_region_dim(
+                    self._iid, reg["idx"], dim, etime, flick)
+                reg["pushed_dim"] = (dim, etime, flick)
             reg["prev"] = state
             reg["etime"] = etime
             if reg["boost"]:
@@ -492,8 +557,10 @@ class ShipGlowController:
                 active = (state == HEALTHY)
                 frac = self._eased_frac if active else 0.0
                 gain = impulse_gain(frac, now, active)
-                self._r.set_glow_region_gain(self._iid, reg["idx"], gain,
-                                             IMPULSE_AFT_AXIS)
+                if gain != reg["pushed_gain"]:
+                    self._r.set_glow_region_gain(self._iid, reg["idx"], gain,
+                                                 IMPULSE_AFT_AXIS)
+                    reg["pushed_gain"] = gain
             elif reg["warp"]:
                 # Same health gate as the impulse boost: the dim state machine
                 # owns disabled/destroyed pods, so a blown nacelle never

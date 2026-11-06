@@ -39,6 +39,7 @@ from engine.appc.windows import TacticalControlWindow
 from engine.bridge_officers import configure_bridge_officers
 from engine.core.game import Game, Episode, Mission, _set_current_game
 from engine.core.loop import GameLoop, TICK_RATE
+from tests.helpers.subsystem_stage import tick_subsystems
 from engine.sdk_ui.widgets.ship_display import (
     _reset_create_count as _reset_ship_display,
 )
@@ -113,7 +114,7 @@ def engineer_world(monkeypatch):
     hull._parent_ship = player
     player.SetHull(hull)
 
-    # Repair bay: seed teams + points so RepairSubsystem.Update actually runs
+    # Repair bay: seed teams + points so the native repair piece actually runs
     # (a bare bay has 0 teams / 0 points and no-ops) — the repair-completed
     # emitter needs a real completion to fire ET_REPAIR_COMPLETED.
     from engine.appc.properties import RepairSubsystemProperty
@@ -267,8 +268,8 @@ def test_repair_completed_event_runs_stock_handler_cleanly(engineer_world):
     before = list(spoken)
 
     # Integration: driving the repair bay to completion fires ET_REPAIR_COMPLETED
-    # through the live broadcast path (RepairSubsystem.Update -> AddEvent).
-    ship.GetRepairSubsystem().Update(10.0)
+    # through the live broadcast path (the native repair piece -> AddEvent).
+    tick_subsystems([ship], 10.0)
     _advance(0.2)
 
     # Direct: the real stock handler runs cleanly on a hand-built event.

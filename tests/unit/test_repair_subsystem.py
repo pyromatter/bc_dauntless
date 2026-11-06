@@ -1,5 +1,6 @@
 """RepairSubsystem queue/tick + ShipSubsystem repair surface."""
 import App
+from engine.appc import effect_queue
 from engine.appc.subsystems import ShipSubsystem
 
 
@@ -53,6 +54,7 @@ def test_setup_properties_seeds_repair_complexity():
 # ── Task 4: RepairSubsystem queue core ──────────────────────────────────────
 
 from engine.appc.subsystems import RepairSubsystem
+from tests.helpers.subsystem_stage import tick_subsystem
 
 
 def _bay(points=50.0, teams=3):
@@ -140,15 +142,43 @@ def test_damage_auto_enqueues_subsystem():
     ship = _damaged_ship()
     sensors = ship.GetSensorSubsystem()
     sensors.SetCondition(4000.0)                      # damage
+    effect_queue.boundary()             # the tick boundary
     assert ship.GetRepairSubsystem().IsBeingRepaired(sensors) == 1
 
 
-def test_repair_increase_does_not_enqueue():
+def test_raise_that_stays_below_max_rejoins_queue():
+    # Any condition below max is a damaged subsystem, however it got there
+    # (Mark, 2026-10-23), so an increase that stays below max queues it too.
     ship = _damaged_ship()
     sensors = ship.GetSensorSubsystem()
     sensors.SetCondition(4000.0)
+    effect_queue.boundary()             # the tick boundary
     ship.GetRepairSubsystem()._queue.clear()
     sensors.Repair(100.0)                             # increase only
+    effect_queue.boundary()             # the tick boundary
+    assert ship.GetRepairSubsystem().IsBeingRepaired(sensors) == 1
+
+
+def test_raise_from_destroyed_acts_like_damaged():
+    # A script raising a destroyed subsystem part way back leaves it simply
+    # damaged: it joins the queue and is repaired the rest of the way.
+    ship = _damaged_ship()
+    sensors = ship.GetSensorSubsystem()
+    sensors.SetCondition(0.0)                         # destroyed: not queued
+    effect_queue.boundary()             # the tick boundary
+    sensors.SetCondition(4000.0)                      # raised to half
+    effect_queue.boundary()             # the tick boundary
+    assert ship.GetRepairSubsystem().IsBeingRepaired(sensors) == 1
+
+
+def test_raise_to_max_does_not_enqueue():
+    ship = _damaged_ship()
+    sensors = ship.GetSensorSubsystem()
+    sensors.SetCondition(4000.0)
+    effect_queue.boundary()             # the tick boundary
+    ship.GetRepairSubsystem()._queue.clear()
+    sensors.SetCondition(sensors.GetMaxCondition())
+    effect_queue.boundary()             # the tick boundary
     assert ship.GetRepairSubsystem()._queue == []
 
 
@@ -156,6 +186,7 @@ def test_destroying_hit_does_not_enqueue():
     ship = _damaged_ship()
     sensors = ship.GetSensorSubsystem()
     sensors.SetCondition(0.0)                         # straight to destroyed
+    effect_queue.boundary()             # the tick boundary
     assert ship.GetRepairSubsystem()._queue == []
 
 
@@ -164,12 +195,44 @@ def test_bay_enqueues_itself_when_damaged():
     bay = ship.GetRepairSubsystem()
     bay.SetMaxCondition(8000.0)
     bay.SetCondition(4000.0)
+    effect_queue.boundary()             # the tick boundary
     assert any(s is bay for s in bay._queue)
 
 
 def test_orphan_subsystem_damage_is_safe():
     s = _sub(condition=500.0)     # no ship anywhere
     s.SetCondition(100.0)         # must not raise
+
+
+def test_set_hull_damage_auto_enqueues_hull():
+    from engine.appc.subsystems import HullSubsystem
+    ship = _damaged_ship()
+    hull = HullSubsystem("Hull")
+    hull.SetMaxCondition(15000.0)
+    ship.SetHull(hull)
+    hull.SetCondition(7500.0)
+    effect_queue.boundary()             # the tick boundary
+    assert ship.GetRepairSubsystem().IsBeingRepaired(hull) == 1
+
+
+def test_setup_properties_hull_and_its_children_auto_enqueue():
+    # The primary hull and a further HullProperty under it (galaxy.py's
+    # "Bridge") both reach the repair queue when damaged.
+    from engine.appc.properties import HullProperty
+    ship = _damaged_ship()
+    for name in ("Hull", "Bridge"):
+        prop = HullProperty(name)
+        prop.SetMaxCondition(1000.0)
+        ship.GetPropertySet().AddToSet("Scene Root", prop)
+    ship.SetupProperties()
+    hull = ship.GetHull()
+    bridge = hull.GetChildSubsystem("Bridge")
+    hull.SetCondition(500.0)
+    bridge.SetCondition(500.0)
+    effect_queue.boundary()             # the tick boundary
+    bay = ship.GetRepairSubsystem()
+    assert bay.IsBeingRepaired(hull) == 1
+    assert bay.IsBeingRepaired(bridge) == 1
 
 
 # ── Task 6: Update(dt) — RE-verified tick, completion, cannot-complete ──────
@@ -184,7 +247,7 @@ def test_tick_formula_matches_re_worked_example():
                    complexity=7.0)
     bay.AddToRepairList(phaser)
     bay.AddToRepairList(tractor)
-    bay.Update(0.033)
+    tick_subsystem(bay, 0.033)
     assert abs(phaser.GetCondition()  - 500.275) < 1e-6
     assert abs(tractor.GetCondition() - (500.0 + 0.825 / 7.0)) < 1e-6
 
@@ -194,7 +257,7 @@ def test_bay_health_scales_output():
     bay.SetCondition(4000.0)                    # 50% bay health
     target = _sub(condition=500.0, complexity=1.0)
     bay.AddToRepairList(target)
-    bay.Update(1.0)
+    tick_subsystem(bay, 1.0)
     # raw = 50 * 0.5 * 1.0 = 25, one item -> +25
     assert abs(target.GetCondition() - 525.0) < 1e-6
 
@@ -204,7 +267,7 @@ def test_destroyed_bay_repairs_nothing():
     target = _sub(condition=500.0)
     bay.AddToRepairList(target)
     bay.SetCondition(0.0)
-    bay.Update(1.0)
+    tick_subsystem(bay, 1.0)
     assert target.GetCondition() == 500.0
 
 
@@ -214,7 +277,7 @@ def test_team_cap_and_divisor_with_queue_longer_than_teams():
             for i in range(3)]
     for s in subs:
         bay.AddToRepairList(s)
-    bay.Update(1.0)
+    tick_subsystem(bay, 1.0)
     # raw=60, divisor=min(3,2)=2, perItem=30: first two get +30, third waits
     assert abs(subs[0].GetCondition() - 130.0) < 1e-6
     assert abs(subs[1].GetCondition() - 130.0) < 1e-6
@@ -229,7 +292,7 @@ def test_completion_removes_and_fires(monkeypatch):
     bay = _bay(points=50.0, teams=3)
     nearly = _sub(condition=999.9, complexity=1.0)
     bay.AddToRepairList(nearly)
-    bay.Update(1.0)
+    tick_subsystem(bay, 1.0)
     assert nearly.GetCondition() == 1000.0
     assert not any(s is nearly for s in bay._queue)
     assert App.ET_REPAIR_COMPLETED in [e.GetEventType() for e in fired]
@@ -246,17 +309,47 @@ def test_destroyed_while_queued_skipped_notified_once(monkeypatch):
     bay.AddToRepairList(doomed)
     bay.AddToRepairList(other)
     doomed._condition = 0.0                     # destroyed in place, bypass hooks
-    bay.Update(1.0)
-    bay.Update(1.0)
+    tick_subsystem(bay, 1.0)
+    tick_subsystem(bay, 1.0)
     cannot = [e for e in fired
               if e.GetEventType() == App.ET_REPAIR_CANNOT_BE_COMPLETED]
     assert len(cannot) == 1                     # once, not per tick
     assert cannot[0].GetSource() is doomed
     assert any(s is doomed for s in bay._queue)  # skipped, NOT removed
-    # 'other' still got a full team's share on EACH tick (doomed consumes no
-    # team and doesn't shrink the divisor): raw=50*1*1=50, divisor=min(2,2)=2
-    # -> +25/tick, two ticks -> 500 + 25 + 25 = 550.
+    # A destroyed item does not slow the others (Mark, 2026-10-23): it holds
+    # no team and is left out of the split. raw=50*1*1=50, divisor=min(1,2)=1
+    # -> +50/tick, two ticks -> 500 + 50 + 50 = 600.
+    assert abs(other.GetCondition() - 600.0) < 1e-6
+
+
+def test_destroyed_head_holds_no_team():
+    # One team, a destroyed item at the head: the team goes to the next item,
+    # and "being repaired" says so too (matches the repair pane's REPAIR list).
+    bay = _bay(points=50.0, teams=1)
+    doomed = _sub(name="doomed", condition=500.0)
+    other = _sub(name="other", condition=500.0, complexity=1.0)
+    bay.AddToRepairList(doomed)
+    bay.AddToRepairList(other)
+    doomed._condition = 0.0                     # destroyed in place, bypass hooks
+    assert bay.IsBeingRepaired(doomed) == 0
+    assert bay.IsBeingRepaired(other) == 1
+    tick_subsystem(bay, 1.0)
     assert abs(other.GetCondition() - 550.0) < 1e-6
+
+
+def test_toggle_counts_teams_past_destroyed_items():
+    # The item actually being repaired behind a destroyed head is active, so
+    # a click demotes it rather than promoting it.
+    bay = _bay(teams=1)
+    doomed = _sub(name="doomed", condition=100.0)
+    working = _sub(name="working", condition=100.0)
+    waiting = _sub(name="waiting", condition=100.0)
+    for s in (doomed, working, waiting):
+        bay.AddToRepairList(s)
+    doomed._condition = 0.0
+    bay.HandleIncreasePriority(working)
+    assert bay._queue[-1] is working
+    assert bay.IsBeingRepaired(waiting) == 1
 
 
 def test_self_repair_bay_queued_on_itself():
@@ -264,7 +357,7 @@ def test_self_repair_bay_queued_on_itself():
     bay.SetCondition(4000.0)                    # auto-enqueue needs a ship; add manually
     bay.AddToRepairList(bay)
     before = bay.GetCondition()
-    bay.Update(1.0)
+    tick_subsystem(bay, 1.0)
     assert bay.GetCondition() > before
 
 
@@ -315,6 +408,7 @@ def test_repair_ship_fully_restores_everything_and_clears_queue():
     ship = _damaged_ship()
     sensors = ship.GetSensorSubsystem()
     sensors.SetCondition(100.0)              # damaged + auto-enqueued
+    effect_queue.boundary()             # the tick boundary
     bay = ship.GetRepairSubsystem()
     assert bay._queue
     repair_ship_fully(ship)

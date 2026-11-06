@@ -4,9 +4,17 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+
+#ifdef __APPLE__
+#include <OpenGL/OpenGL.h>   // CGLEnable / kCGLCEMPEngine (phase 5a experiment)
+#endif
 
 namespace renderer {
 
@@ -58,6 +66,23 @@ Window::Window(int width, int height, const std::string& title, bool visible) {
     }
 
     glfwMakeContextCurrent(handle_);
+
+#ifdef __APPLE__
+    // Apple's multithreaded GL engine moves driver work (the per-draw
+    // validation behind space.opaque, and the swap) onto a driver thread:
+    // ≈ 1 ms of main-thread render at 64 ships (perf register SIG-194).
+    // ON by default since 2026-11-05 at Mark's call, after his live check of
+    // the phase 5a build; DAUNTLESS_GL_MP_ENGINE=0 turns it off.
+    const char* mp = std::getenv("DAUNTLESS_GL_MP_ENGINE");
+    if (!(mp != nullptr && std::strcmp(mp, "0") == 0)) {
+        const CGLError err = CGLEnable(CGLGetCurrentContext(), kCGLCEMPEngine);
+        if (err == kCGLNoError)
+            std::fprintf(stderr, "[gl] multithreaded engine: on\n");
+        else
+            std::fprintf(stderr, "[gl] multithreaded engine: failed (%d)\n",
+                         static_cast<int>(err));
+    }
+#endif
 
     // The user pointer lets per-window callbacks (cursor, etc.) dispatch
     // back to this Window instance.
@@ -222,6 +247,73 @@ bool Window::key_state(int glfw_key) noexcept {
     if (!handle_) return false;
     polled_keys_.insert(glfw_key);
     return key_gate_.report(glfw_key, glfwGetKey(handle_, glfw_key) == GLFW_PRESS);
+}
+
+namespace {
+
+// The monitor the window overlaps most, so a full-screen toggle stays on the
+// screen the player put the window on. glfwGetPrimaryMonitor would always
+// yank it to the main display, which is wrong the moment a second monitor
+// exists -- and this project is developed across two.
+GLFWmonitor* monitor_for(GLFWwindow* win) {
+    int wx = 0, wy = 0, ww = 0, wh = 0;
+    glfwGetWindowPos(win, &wx, &wy);
+    glfwGetWindowSize(win, &ww, &wh);
+
+    int count = 0;
+    GLFWmonitor** monitors = glfwGetMonitors(&count);
+    GLFWmonitor* best = nullptr;
+    int best_area = -1;
+    for (int i = 0; i < count; ++i) {
+        int mx = 0, my = 0;
+        glfwGetMonitorPos(monitors[i], &mx, &my);
+        const GLFWvidmode* mode = glfwGetVideoMode(monitors[i]);
+        if (mode == nullptr) continue;
+        // Area of the window's intersection with this monitor.
+        const int ox = (std::min)(wx + ww, mx + mode->width)  - (std::max)(wx, mx);
+        const int oy = (std::min)(wy + wh, my + mode->height) - (std::max)(wy, my);
+        const int area = (ox > 0 && oy > 0) ? ox * oy : 0;
+        if (area > best_area) { best_area = area; best = monitors[i]; }
+    }
+    return best != nullptr ? best : glfwGetPrimaryMonitor();
+}
+
+}  // namespace
+
+void Window::set_fullscreen(bool on) {
+    if (handle_ == nullptr || on == is_fullscreen()) return;
+
+    if (on) {
+        // Remember where to come back to: glfwSetWindowMonitor(nullptr, ...)
+        // takes an explicit rectangle and GLFW keeps no history of its own.
+        glfwGetWindowPos(handle_, &windowed_x_, &windowed_y_);
+        glfwGetWindowSize(handle_, &windowed_w_, &windowed_h_);
+
+        GLFWmonitor* monitor = monitor_for(handle_);
+        const GLFWvidmode* mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+        if (monitor == nullptr || mode == nullptr) return;  // no display to go to
+        glfwSetWindowMonitor(handle_, monitor, 0, 0,
+                             mode->width, mode->height, mode->refreshRate);
+    } else {
+        // A zero stored size means we never recorded one (set_fullscreen(false)
+        // before any true). Fall back to the current framebuffer rather than
+        // restoring a 0x0 window that the player cannot see or grab.
+        if (windowed_w_ <= 0 || windowed_h_ <= 0) {
+            windowed_w_ = 1280;
+            windowed_h_ = 720;
+        }
+        glfwSetWindowMonitor(handle_, nullptr, windowed_x_, windowed_y_,
+                             windowed_w_, windowed_h_, 0);
+    }
+
+    // glfwSetWindowMonitor does not preserve the swap interval across the
+    // context's surface change on every driver, and a silently-unsynced
+    // window renders as a tearing, uncapped frame rate.
+    glfwSwapInterval(swap_interval_);
+}
+
+bool Window::is_fullscreen() const noexcept {
+    return handle_ != nullptr && glfwGetWindowMonitor(handle_) != nullptr;
 }
 
 void Window::set_key_capture(bool on) {

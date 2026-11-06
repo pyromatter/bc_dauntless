@@ -6,6 +6,7 @@ values."""
 import json
 
 import pytest
+from engine.appc import effect_queue
 
 
 @pytest.fixture
@@ -291,6 +292,7 @@ def test_quick_repair_action_repairs_the_current_player(panel, monkeypatch):
     ship.GetSensorSubsystem().SetMaxCondition(8000.0)
     sensors = ship.GetSensorSubsystem()
     sensors.SetCondition(100.0)              # damaged + auto-enqueued
+    effect_queue.boundary()             # the tick boundary
     assert ship.GetRepairSubsystem()._queue
 
     monkeypatch.setattr(App, "Game_GetCurrentPlayer", lambda: ship)
@@ -1088,3 +1090,23 @@ def test_every_setting_is_in_the_render_snapshot():
             "from render_payload's snapshot tuple, so the UI will never "
             "show it change")
         panel.render_payload()
+
+
+def test_reload_bridge_panels_ctrl_is_a_lighting_tab_focusable(panel):
+    p, _ = panel
+    p.open()
+    p.dispatch_event("tab:lighting")
+    assert ("ctrl", "reload_bridge_panels") in p._focusables()
+
+
+def test_reload_bridge_panels_action_calls_host_io(panel, monkeypatch, capsys):
+    from engine import host_io
+
+    calls = []
+    monkeypatch.setattr(host_io, "reload_bridge_panels", lambda: calls.append(True))
+    p, _ = panel
+    p.open()
+    p.dispatch_event("tab:lighting")
+    assert p.dispatch_event("action:reload_bridge_panels") is True
+    assert calls == [True]
+    assert "[bridge_lottie] panels reloaded" in capsys.readouterr().err
